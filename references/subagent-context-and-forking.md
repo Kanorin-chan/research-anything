@@ -58,11 +58,18 @@ Suppose `Subagent A` and `Subagent B` are both working on tasks inside a **Larav
 - Both need the **exact same base context**: Laravel framework conventions, project invariants (`INV-xxx`), and the mapped Auth/Queue workflow slice (`WORKFLOW_SLICE`).
 - Instead of `Subagent A` reading 25 files AND `Subagent B` re-reading the same 25 files:
   1. **Read Once $\rightarrow$ Create Shared Snapshot**:
-     - If your harness supports native session forking (`/fork` or `Workspace: share/branch`), warm up one base session and fork it into `Subagent_A` and `Subagent_B`.
-     - Using the RA disk harness (`ra_context_harness.py`), compile the shared snapshot once (`laravel_base` + `auth_workflow_slice`).
-  2. **Fork into Named Subagents**:
+     - Compile the shared snapshot once (`laravel_base` + `auth_workflow_slice`) via `ra_context_harness.py create`.
+  2. **Fork into Named Subagents Across All 3 Supported Harnesses (`opencode`, `claude`, `agy`)**:
+     - **`opencode` (OpenCode CLI)**:
+       `opencode run --session "<base_session_id>" --fork --title "Subagent_A" --auto -f "research/context_snapshots/forks/FORK_Subagent_A.md" "..."`
+     - **`claude` (Claude Code)**:
+       `claude --resume "<base_session_id>" --fork-session -p "..."` OR `Task(subagent_type="general-purpose", description="Subagent_A", prompt="Read research/context_snapshots/forks/FORK_Subagent_A.md ...")`
+     - **`agy` (`Antigravity` / `Gemini`)**:
+       `invoke_subagent(TypeName="self", Role="Subagent_A", Workspace="inherit", Prompt="Read research/context_snapshots/forks/FORK_Subagent_A.md ...")`
      - Fork 1 $\rightarrow$ **`Subagent_A`**: Inherits `laravel_base` + `auth_workflow_slice` + **Task A Delta Only**.
      - Fork 2 $\rightarrow$ **`Subagent_B`**: Inherits `laravel_base` + `auth_workflow_slice` + **Task B Delta Only**.
+  3. **Hard Gate in `ra_gate.py`**:
+     - `ra_gate.py advance` blocks leaving Stage 1 unless a shared snapshot (`BASE_FRAMEWORK` or `WORKFLOW_SLICE`) is created, and blocks leaving Stage 3 unless at least 1 context fork (`fork`) and baton return (`return-baton`) have completed!
 
 ---
 

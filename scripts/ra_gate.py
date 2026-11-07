@@ -51,7 +51,9 @@ STAGE_INSTRUCTIONS: Dict[str, str] = {
         "3. Lock all existing working behaviors in `WORKFLOW_MAP.md` (`BC-001`, `BC-002`...) to prevent whack-a-mole regressions.\n"
         "4. Fill out Section 4 of `WORKFLOW_MAP.md` (and Section 2 of `REPORT.md` if a hypothesis is active):\n"
         "   WHAT you are editing/creating, WHY edit this exact node, WHY create a new function (if any), and the N-hop blast radius.\n"
-        "5. Stamp the session snapshot with `ra_gate.py map-context --agent <id> --files <paths...>` and run `ra_gate.py advance`."
+        "5. Stamp the session snapshot (`ra_gate.py map-context --agent <id> --files <paths...>`) AND compile a reusable\n"
+        "   Context Snapshot for subagent `/fork` sharing (`ra_context_harness.py create --id <id> --tier WORKFLOW_SLICE --files <paths...> --summary \"...\"`).\n"
+        "6. Run `ra_gate.py advance`."
     ),
     "STAGE_2_HYPOTHESIS_FORMULATION": (
         "1. Edit `research/hypotheses/<active_hypothesis>/REPORT.md`.\n"
@@ -61,13 +63,16 @@ STAGE_INSTRUCTIONS: Dict[str, str] = {
         "4. Run `ra_gate.py advance` to unlock Stage 3 (Sandbox Prototype)."
     ),
     "STAGE_3_SANDBOX_PROTOTYPE": (
-        "1. Build the deployment-grade prototype inside `research/sandbox/<active_hypothesis>/`.\n"
-        "2. WIRE PRODUCTION `.log` TELEMETRY (`ra_log_engine.py`): Silent code and bare `print()` are BANNED.\n"
+        "1. LEAD-ORCHESTRATOR DELEGATION & CONTEXT FORKING (`ra_context_harness.py`):\n"
+        "   Fork the shared snapshot to a Subagent (`ra_context_harness.py fork --subagent Subagent_A --snapshots <snap_id> --task \"...\"`),\n"
+        "   let the Subagent build the prototype & write its report, then reclaim the baton (`ra_context_harness.py return-baton --subagent Subagent_A`).\n"
+        "2. Build the deployment-grade prototype inside `research/sandbox/<active_hypothesis>/`.\n"
+        "3. WIRE PRODUCTION `.log` TELEMETRY (`ra_log_engine.py`): Silent code and bare `print()` are BANNED.\n"
         "   Inject/import `RALogger` (`ra_log_engine.py inject-sdk --lang <python|js|ts|php> --dest research/sandbox/<active_hypothesis>`)\n"
         "   and log every flow hop (`flow=caller->callee`, `role`, `inputs`, `state_before`, `state_after`, `output`, `contract=BC-xxx`).\n"
-        "3. Keep the main codebase and all `PROTECTED_WORKING` functions 100% clean and untouched.\n"
-        "4. Place legitimate mathematical/structural axioms in a sealed `axioms` file (`ra_gate.py seal-axioms`).\n"
-        "5. Run `ra_gate.py advance` to unlock Stage 4 (Real-Environment `.log` & Stress Verification)."
+        "4. Keep the main codebase and all `PROTECTED_WORKING` functions 100% clean and untouched.\n"
+        "5. Place legitimate mathematical/structural axioms in a sealed `axioms` file (`ra_gate.py seal-axioms`).\n"
+        "6. Run `ra_gate.py advance` to unlock Stage 4 (Real-Environment `.log` & Stress Verification)."
     ),
     "STAGE_4_ADVERSARIAL_BREAK_TEST": (
         "1. Synthetic unit-test marathons (`test_xyz.py`) are BANNED. Verify in the REAL ENVIRONMENT via `.log` telemetry:\n"
@@ -498,6 +503,53 @@ def is_workflow_map_populated(rdir: Path) -> bool:
     return True
 
 
+def load_context_snapshot_registry(rdir: Path) -> Dict[str, Any]:
+    reg_path = rdir / "context_snapshots" / "SNAPSHOT_REGISTRY.json"
+    if not reg_path.exists():
+        return {}
+    try:
+        return json.loads(reg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def has_reusable_context_snapshot(rdir: Path) -> bool:
+    reg = load_context_snapshot_registry(rdir)
+    snaps = reg.get("snapshots", {})
+    return any(
+        s.get("status") == "ACTIVE" and s.get("tier") in ("BASE_FRAMEWORK", "WORKFLOW_SLICE")
+        for s in snaps.values()
+    )
+
+
+def verify_subagent_fork_and_baton(rdir: Path) -> List[str]:
+    issues: List[str] = []
+    reg = load_context_snapshot_registry(rdir)
+    if not reg:
+        issues.append(
+            "No Context Snapshot Registry found (`research/context_snapshots/SNAPSHOT_REGISTRY.json`). "
+            "Run `ra_context_harness.py create` and `ra_context_harness.py fork`!"
+        )
+        return issues
+    if reg.get("total_forks_dispatched", 0) < 1:
+        issues.append(
+            "Zero subagent context forks dispatched! Main Agent must fork context (`ra_context_harness.py fork "
+            "--subagent <name> --snapshots <id> --task \"...\"`) instead of doing all work in one monolithic context."
+        )
+    if reg.get("completed_subagent_relays", 0) < 1:
+        issues.append(
+            "No completed subagent baton relay recorded! After the forked subagent finishes its task, run "
+            "`ra_context_harness.py return-baton --subagent <name>`."
+        )
+    baton = reg.get("active_baton", "MAIN_ORCHESTRATOR")
+    if baton != "MAIN_ORCHESTRATOR":
+        issues.append(
+            f"1-Concurrency Baton is still held by `{baton}`! Run `ra_context_harness.py return-baton --subagent ...` "
+            "to return execution control to `MAIN_ORCHESTRATOR`."
+        )
+    return issues
+
+
 def cmd_new_hypothesis(args: argparse.Namespace) -> None:
     workspace = Path(args.workspace).resolve()
     state = load_state(workspace)
@@ -533,10 +585,10 @@ def cmd_new_hypothesis(args: argparse.Namespace) -> None:
         )
         report_path.write_text(content, encoding="utf-8")
 
-    # Always enter Stage 1 (Workflow & Context Mapping) first unless WORKFLOW_MAP.md is already populated
+    # Always enter Stage 1 (Workflow & Context Mapping) first unless WORKFLOW_MAP.md is populated AND a context snapshot exists
     next_stage = (
         "STAGE_2_HYPOTHESIS_FORMULATION"
-        if is_workflow_map_populated(rdir)
+        if (is_workflow_map_populated(rdir) and has_reusable_context_snapshot(rdir))
         else "STAGE_1_WORKFLOW_AND_CONTEXT_MAPPING"
     )
 
@@ -592,9 +644,17 @@ def cmd_advance(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+        if not has_reusable_context_snapshot(rdir):
+            print(
+                "[RA GATE] BLOCKED: You must compile a shared Context Snapshot for subagent `/fork` reuse before leaving Stage 1!\n"
+                "          Run: `python ra_context_harness.py create --workspace . --id <slice_id> --tier WORKFLOW_SLICE "
+                "--files <paths...> --summary \"...\"`",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         if not active_hyp:
             print(
-                "[RA GATE] `research/WORKFLOW_MAP.md` verified! Now run `ra_gate.py new-hypothesis --id H001 --slug <name>` "
+                "[RA GATE] `research/WORKFLOW_MAP.md` and Context Snapshot verified! Now run `ra_gate.py new-hypothesis --id H001 --slug <name>` "
                 "to open your hypothesis in Stage 2.",
                 file=sys.stderr,
             )
@@ -651,6 +711,12 @@ def cmd_advance(args: argparse.Namespace) -> None:
                 f"[RA GATE] BLOCKED: Sandbox `research/sandbox/{active_hyp}/` has no prototype code files!",
                 file=sys.stderr,
             )
+            sys.exit(1)
+        fork_issues = verify_subagent_fork_and_baton(rdir)
+        if fork_issues:
+            print("[RA GATE] BLOCKED: Context Forking & Subagent Baton Relay Gate failed:", file=sys.stderr)
+            for fi in fork_issues:
+                print(f"  - {fi}", file=sys.stderr)
             sys.exit(1)
         state["current_stage"] = "STAGE_4_ADVERSARIAL_BREAK_TEST"
 
@@ -898,6 +964,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_init = sub.add_parser("init", help="Initialize research/ directory and state machine")
     p_init.add_argument("--workspace", default=".", help="Workspace root directory")
     p_init.add_argument("--agent", default="PRIMARY_AGENT", help="Agent or session identifier")
+    p_init.add_argument("--name", "--project", dest="project_name", default=None, help="Optional project name")
     p_init.set_defaults(func=cmd_init)
 
     p_status = sub.add_parser("status", help="Display current stage, locked invariants, and active instructions")
@@ -933,6 +1000,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_adv = sub.add_parser("advance", help="Validate current stage artifacts and advance to the next stage")
     p_adv.add_argument("--workspace", default=".", help="Workspace root directory")
+    p_adv.add_argument("--to", default=None, help="Optional target stage name")
     p_adv.set_defaults(func=cmd_advance)
 
     p_conc = sub.add_parser("conclude", help="Conclude active hypothesis (PROVEN or FALSIFIED) and log self-learning")

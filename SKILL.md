@@ -48,12 +48,17 @@ To prevent the Main Agent's context window from bloating and decaying during dee
 3. **Prevent Long-Context Subagents (Task-Sizing Rule)**:
    - **Real R&D / Logic / Bug-Fix Tasks (`REAL_RD`)**: Strictly **1 atomic task per subagent** (never dump 7 tasks onto 1 subagent).
    - **Small Surface Tweaks (`TRIVIAL_BATCH`)**: Small cosmetic/surface tasks (*change CSS, swap icon, update text/labels*) can be batched together in a single subagent run.
-4. **Read Once $\rightarrow$ Fork Many (`/fork` Shared Context Snapshots)**:
-   - When `Subagent_A` and `Subagent_B` need the same framework/workflow context (e.g., both working on a Laravel subsystem), read and compile the context **once** into a snapshot (`ra_context_harness.py create`), then **fork** it (`ra_context_harness.py fork` or native `/fork`) into `Subagent_A` and `Subagent_B` so neither re-reads the codebase from scratch.
+4. **Read Once $\rightarrow$ Fork Many (`/fork` Shared Context Snapshots Across `opencode`, `claude`, and `agy`)**:
+   - First-class platform support is built into `ra_context_harness.py` (`--platform auto|opencode|claude|agy`):
+     - **`opencode`**: Generates `opencode run --session <id> --fork --title "<subagent>"` or standalone `-f research/context_snapshots/forks/FORK_<subagent>.md` dispatches.
+     - **`claude` (`claude-code`)**: Generates `claude --resume <id> --fork-session` and native `Task(subagent_type="general-purpose", ...)` dispatches.
+     - **`agy` (`antigravity` / `gemini`)**: Generates `invoke_subagent(TypeName="self", Role="...", Prompt="...")` dispatches.
+   - When `Subagent_A` and `Subagent_B` need the same framework/workflow context (e.g., both working on a Laravel subsystem), read and compile the context **once** into a snapshot (`ra_context_harness.py create`), then **fork** it (`ra_context_harness.py fork`) into `Subagent_A` and `Subagent_B` so neither re-reads the codebase from scratch.
 5. **3-Tier Snapshot Retention & Throw-Away (Eviction) Harness (`scripts/ra_context_harness.py`)**:
    - **`BASE_FRAMEWORK` (Tier 1)**: Domain/framework rules, `INVARIANTS.md`, crawled skills. Kept across the track; thrown away only when invariants or framework configs change.
    - **`WORKFLOW_SLICE` (Tier 2)**: Subsystem `-N` to `+N` hop map, `PROTECTED_WORKING` nodes, `BC-xxx` contracts, and file SHA-256 hashes. Forked across sibling subagents; **thrown away immediately** on `HASH_DRIFT` (any tracked file edited), `MAX_REUSE_EXCEEDED`, or `TTL_EXPIRED`.
    - **`TASK_EPHEMERAL` (Tier 3)**: 1-task delta (`max_reuses = 1`). **Thrown away immediately** after 1 fork or if the subagent fails/drifts.
+   - **Hard Gate**: `ra_gate.py advance` blocks leaving Stage 1 without an active `BASE_FRAMEWORK` or `WORKFLOW_SLICE` snapshot, and blocks leaving Stage 3 unless at least one subagent fork (`ra_context_harness.py fork`) and 1-concurrency baton return (`ra_context_harness.py return-baton`) have completed.
    - Read [subagent context and forking rules](references/subagent-context-and-forking.md).
 
 ---
@@ -131,6 +136,10 @@ Every time `ra_gate.py` runs, it echoes **the active stage instructions**, **Wor
   python "~/.gemini/skills/research-anything/scripts/ra_gate.py" map-context --agent "<agent-id>" --files <file1> <file2> --protected <module:func>
   ```
   Future agents read `WORKFLOW_MAP.md` so they do not need to re-discover the codebase from scratch, while `ra_gate.py status` warns them that the map is an **AI session snapshot** and flags any files whose SHA-256 hashes have been altered since the snapshot.
+- **Create Read-Once Shared Context Snapshot (`ra_context_harness.py create`)**: Before advancing to Stage 2, compile the workflow context once so downstream subagents can fork from it without re-reading the codebase:
+  ```bash
+  python "~/.gemini/skills/research-anything/scripts/ra_context_harness.py" create --workspace "." --id "SNAP_WORKFLOW" --tier "WORKFLOW_SLICE" --files <file1> <file2> --summary "<workflow-summary>"
+  ```
 - Read [workflow and context mapping rules](references/workflow-and-context-mapping.md).
 
 ### Stage 2: Hypothesis Formulation (`research/hypotheses/Hxxx_<slug>/`)
@@ -140,8 +149,17 @@ Every time `ra_gate.py` runs, it echoes **the active stage instructions**, **Wor
   ```
 - Complete both **Section 2 (Workflow Context, Culprit Proof & Pre-Edit/Pre-Creation Justification)** and **Section 3 (First-Principles Mathematical/Structural Formulation, Assumptions & Failure Boundaries)** in `research/hypotheses/Hxxx_<slug>/REPORT.md`.
 
-### Stage 3: Quarantined Sandbox Prototype & Production `.log` Wiring (`research/sandbox/Hxxx_<slug>/`)
+### Stage 3: Quarantined Sandbox Prototype, Context Forking & Production `.log` Wiring (`research/sandbox/Hxxx_<slug>/`)
 - **Protect the Main Codebase & Protected Nodes from Poisoning**: Build and test the prototype inside `research/sandbox/Hxxx_<slug>/` (or an isolated git branch/snapshot). Never pile unverified experiment code onto the main codebase, and never touch `PROTECTED_WORKING` functions.
+- **Mandatory Subagent Context Fork & 1-Concurrency Baton Relay (`scripts/ra_context_harness.py`)**:
+  - Fork the shared Stage 1 context snapshot (`WORKFLOW_SLICE` / `BASE_FRAMEWORK`) into an atomic subagent task (`REAL_RD` = strictly 1 task per subagent; `TRIVIAL_BATCH` = small surface tweaks only) across `opencode`, `claude`, or `agy`:
+    ```bash
+    python "~/.gemini/skills/research-anything/scripts/ra_context_harness.py" fork --workspace "." --id "SNAP_WORKFLOW" --subagent "Subagent_A" --task-type "REAL_RD" --platform "auto" --tasks "<single-atomic-task>"
+    ```
+  - Once the subagent completes its work and writes its report (`research/context_snapshots/reports/REPORT_Subagent_A.md`), return the 1-concurrency baton (which also auto-evicts any snapshots whose tracked files changed via `HASH_DRIFT`):
+    ```bash
+    python "~/.gemini/skills/research-anything/scripts/ra_context_harness.py" return-baton --workspace "." --subagent "Subagent_A" --status "COMPLETED" --report "research/context_snapshots/reports/REPORT_Subagent_A.md"
+    ```
 - **Mandatory Production `.log` Spine (`scripts/ra_log_engine.py`)**:
   - **Treat all prototype and production code as real deployment code**: Silent code, bare `print("ok")` statements, and isolated synthetic unit tests are **banned**.
   - Wire every function, branch decision, and state transition to `RALogger` (`ra_log_engine.py inject-sdk --lang <python|js|ts|php>`) so every hop emits structured `.log` records containing:

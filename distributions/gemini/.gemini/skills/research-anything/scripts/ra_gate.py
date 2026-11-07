@@ -35,7 +35,7 @@ STAGE_INSTRUCTIONS: Dict[str, str] = {
         "1. Run `check-question` and inspect all reference folders/images BEFORE asking the user anything.\n"
         "2. Gather user ideas 1-by-1 and synthesize into `research/VISION_AND_MISSION.md`.\n"
         "3. Lock non-negotiable rules in `research/INVARIANTS.md`.\n"
-        "4. Equip the R&D Arsenal (`ra_crawler.py`):\n"
+        "4. [OPTIONAL] Equip the R&D Arsenal (`ra_crawler.py` — only when the project benefits from external skills/papers/data):\n"
         "   - Priority #1 (Skill Crawler): `ra_crawler.py skill --query \"<domain>\"` (installs project-local skills).\n"
         "   - Priority #2 (Paper Crawler): `ra_crawler.py paper --query \"<topic>\"` (if prior art/equations needed).\n"
         "   - Priority #3 (Data Crawler) : `ra_crawler.py data --query \"<dataset>\"` (if test vectors needed).\n"

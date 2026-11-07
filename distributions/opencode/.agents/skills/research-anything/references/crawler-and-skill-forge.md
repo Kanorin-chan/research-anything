@@ -4,9 +4,9 @@
 
 ---
 
-## 1. The Autonomous R&D Crawler Suite (`scripts/ra_crawler.py`)
+## 1. The Autonomous R&D Crawler Suite (`scripts/ra_crawler.py` — Optional / On-Demand)
 
-Once the project domain is established in **Stage 0 (`VISION_AND_MISSION.md`)**, the agent must not operate blind. Use `ra_crawler.py` in strict priority order:
+Not every project requires external skills, research papers, or external datasets (for example, self-contained codebase debugging or pure internal logic fixes). However, when entering a specialized domain or when prior art / benchmark vectors are useful, use `ra_crawler.py` in priority order:
 
 ### Priority #1: Skill Crawler (`ra_crawler.py skill`)
 When entering a domain (e.g., Game Development, Shader/GPU Programming, Physics Simulation, Cryptography, Embedded Systems, Custom Compilers), first check if the workspace already has the required domain skill. If not, crawl it automatically:

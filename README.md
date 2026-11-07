@@ -30,7 +30,7 @@ When you ask an LLM to invent something new or debug a deep multi-hop pipeline, 
 | **3. Context Bloat & Subagent Re-Reading** | Either dumps 7 tasks onto 1 long-context agent (causing attention decay) or spawns subagents that each re-read the entire codebase from scratch. | **Multi-Platform `/fork` Context Controller (`ra_context_harness.py`)**: Enforces **Read-Once $\rightarrow$ Fork-Many** snapshots (`BASE_FRAMEWORK`, `WORKFLOW_SLICE`, `TASK_EPHEMERAL`), **1-Concurrency Baton Relay**, **1 atomic task per R&D subagent**, and auto-eviction on SHA-256 hash drift across **OpenCode**, **Claude Code**, and **Antigravity/Gemini**. |
 | **4. 30-Minute Trash Unit-Test Marathons** | Wastes 30 minutes running mocked `test_xyz.py` suites that pass in a synthetic bubble while the real deployment breaks or hangs. | **Production `.log` Spine & Watchdog (`ra_log_engine.py`)**: Bans synthetic unit tests; wires deployment code to `RALogger` (`Python`/`JS`/`TS`/`PHP`) logging `flow=caller->callee`, `inputs`, `state_before/after`, `delta`, `output`, `contract=BC-xxx`, and `[PASS]`/`[DECISION]`/`[STUCK]`/`[FAIL]` under a hard OS watchdog timer. |
 | **5. Code-Context Visual Blindness & Ignored/Misfitted Provided Assets** | Reads CSS/HTML/shader code and claims *"UI looks great!"* while ignoring the user's provided assets/icons (substituting bare CSS boxes, emoji, or `placehold.co`), hallucinating broken asset paths, or squishing/stretching assets into the wrong container aspect ratio. | **User-Eyes Visual & Provided-Asset Reality Gate (`ra_visual_audit.py`)**: Auto-discovers provided assets (`assets/`, `public/`, `icons/`, `sprites/`), extracts native `WxH` & aspect ratio (`W:H`), blocks ignored provided assets (`[IGNORED_PROVIDED_ASSETS]`) or broken asset paths (`[BROKEN_ASSET_PATH]`), verifies real screenshots (`>= 64x64`, Shannon entropy `>= 2.2`), and audits container fit in `VISUAL_AUDIT.md`. |
-| **6. Missing Domain Knowledge / Unverified Equations** | Hallucinates domain APIs or math formulas instead of pulling verified skills, peer-reviewed papers, or real benchmark vectors. | **Autonomous R&D Crawler Suite (`ra_crawler.py`)**: Priority #1: **Skill Crawler** (quarantine-audits & installs skills **project-locally** to `.claude/skills/` & `.agents/skills/`); Priority #2: **Paper Crawler** (arXiv & Semantic Scholar); Priority #3: **Data Crawler** (real test vectors). |
+| **6. Missing Domain Knowledge / Unverified Equations** | Hallucinates domain APIs or math formulas when working in specialized domains instead of pulling verified skills, papers, or benchmark vectors. | **Optional R&D Crawler Suite (`ra_crawler.py`)**: On-demand when a project benefits from external knowledge — Priority #1: **Skill Crawler** (quarantine-audits & installs skills **project-locally** to `.claude/skills/` & `.agents/skills/`); Priority #2: **Paper Crawler** (arXiv & Semantic Scholar); Priority #3: **Data Crawler** (real test vectors). |
 | **7. No Project-Specific Guardrails or Cold Review** | Uses generic prompts with no automated pre/post-edit hooks or independent reviewer to catch subtle regressions. | **Self-Forging Project Skill, `.py` Hooks & Reviewer (`ra_forge.py`)**: Generates a custom project skill, executable `research/harness/project_harness.py` (CLI + Claude Code `PreToolUse`/`PostToolUse`/`Stop` hooks), and a cold-eyes `ra-reviewer` agent. |
 | **8. The Boilerplate Reflex** | Forces textbook patterns onto novel ideas whose mechanics and connections are fundamentally different. | **First-Principles Mandate (Stage 2)**: Forbids pattern-matching; requires explicit mathematical/structural derivation and Pre-Edit/Pre-Creation justification in `REPORT.md` before coding. |
 | **9. The "Hardcoded Data" Slippery Slope** | Sees legitimate math/syntax symbols (like `=`) labeled `# hardcoded` and uses that as an excuse to dump lookup tables or `if input == X: return Y` branches when stuck. | **Axiom Seal + AST Cheese Auditor (`ra_cheese_audit.py`)**: Separates SHA-256 sealed `AXIOMATIC_PRIMITIVES` from forbidden data cheesing; fails Stage 5 if tampered with. |
@@ -46,7 +46,7 @@ Every research or debugging track is deterministically governed by [`scripts/ra_
 [STAGE 0: INTAKE_AND_SYNC]
   ├── Conversational 1-by-1 Idea Intake -> research/VISION_AND_MISSION.md & INVARIANTS.md
   ├── Mandatory Pre-Question Search Gate (ra_gate.py check-question)
-  ├── Autonomous R&D Crawler Suite (ra_crawler.py: 1. Skills -> 2. Papers -> 3. Data)
+  ├── [Optional] R&D Crawler Suite (ra_crawler.py: 1. Skills -> 2. Papers -> 3. Data)
   └── Self-Forging Project Skill, .py Hooks & Review Agent (ra_forge.py)
        │
        ▼
@@ -120,8 +120,8 @@ Prevents Main-Agent context pollution and stops sibling subagents from redundant
 - **Hard Watchdog Execution (`ra_log_engine.py run --timeout-sec 60`)**: Terminates hung processes automatically and appends a `[STUCK]` record so the agent can immediately see which hop stalled and what values it held.
 - **Automated `.log` Auditor (`ra_log_engine.py audit`)**: Verifies `>= 1` `[PASS]` hop, `0` `[STUCK]`/`[FAIL]` hops, non-empty variable telemetry, and `100%` of `BC-xxx` behavioral contracts from `WORKFLOW_MAP.md`.
 
-### 4. Autonomous R&D Crawler Suite ([`scripts/ra_crawler.py`](./scripts/ra_crawler.py))
-Equips the workspace in strict priority order:
+### 4. Autonomous R&D Crawler Suite — Optional / On-Demand ([`scripts/ra_crawler.py`](./scripts/ra_crawler.py))
+Not every project needs external skills, papers, or datasets—use this on-demand when a project benefits from specialized domain tooling, prior art, or external test vectors, in priority order:
 1. **Priority #1 — Skill Crawler (`ra_crawler.py skill`)**: Searches GitHub and skill registries, runs a quarantine security audit (blocking `curl|bash`, `eval()`, obfuscated payloads), and installs skills **strictly project-locally** (`.claude/skills/<slug>/` and `.agents/skills/<slug>/`—never polluting global skills).
 2. **Priority #2 — Research Paper Crawler (`ra_crawler.py paper`)**: Queries arXiv and Semantic Scholar APIs and indexes peer-reviewed formulations into `research/library/PAPERS_<slug>.md` (`[EXTERNAL_VERIFIED_LAW]`).
 3. **Priority #3 — Data & Test-Vector Crawler (`ra_crawler.py data`)**: Pulls real-world benchmark datasets and edge-case test vectors into `research/arsenal/data/`.
@@ -278,7 +278,7 @@ python scripts/ra_log_engine.py run --workspace . --hypothesis "H001_retry_fix" 
 python scripts/ra_log_engine.py audit --workspace . --hypothesis "H001_retry_fix"
 ```
 
-### 4. `ra_crawler.py` — Autonomous Skill, Paper & Data Crawler
+### 4. `ra_crawler.py` — Optional On-Demand Skill, Paper & Data Crawler
 ```bash
 # Priority #1: Crawl & quarantine-audit domain skills into project-local .claude/skills/ & .agents/skills/
 python scripts/ra_crawler.py skill --workspace . --query "game-development"

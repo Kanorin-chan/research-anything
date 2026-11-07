@@ -129,7 +129,7 @@ def audit_file(fpath: Path, sealed_rel_paths: set[str], workspace: Path) -> List
     issues: List[str] = []
     rel = fpath.resolve().relative_to(workspace.resolve()).as_posix()
     is_sealed = rel in sealed_rel_paths
-    is_break_test = any(k in fpath.name.lower() for k in ("break", "stress", "adversar", "test"))
+    is_sdk_helper = fpath.name.lower() in {"ra_logger.py", "ra_logger.js", "ralogger.php"}
 
     try:
         text = fpath.read_text(encoding="utf-8")
@@ -145,7 +145,7 @@ def audit_file(fpath: Path, sealed_rel_paths: set[str], workspace: Path) -> List
                 issues.append(f"{rel}:{idx}: {msg} -> `{line.strip()}`")
 
     if fpath.suffix.lower() == ".py" and not is_sealed:
-        issues.extend(audit_python_ast(fpath, text, is_break_test))
+        issues.extend(audit_python_ast(fpath, text, is_sdk_helper))
 
     return issues
 
@@ -224,7 +224,7 @@ def main() -> None:
     state["cheese_audit_passed"] = True
     state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print("  [PASS] Zero cheese, zero band-aids, and all axiom seals verified!")
-    print("         You may now run `ra_gate.py advance` to proceed to Stage 5.")
+    print("         Ensure `ra_log_engine.py audit` and `ra_visual_audit.py audit` also pass, then run `ra_gate.py advance` to proceed to Stage 6.")
     print("=" * 78)
 
 

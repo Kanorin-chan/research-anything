@@ -37,7 +37,7 @@ You **must immediately** log an entry in `research/library/REFERENCES_INDEX.md` 
 ### Rule B: Mandatory Search Gate Before Asking Any Question
 Before you are permitted to ask the user **any** question during research, implementation, or debugging, you **must** execute all four checks:
 1. Read `research/VISION_AND_MISSION.md` and `research/INVARIANTS.md`.
-2. Read `research/library/REFERENCES_INDEX.md` and scan all directories named `reference/`, `references/`, `assets/`, `docs/`, and `research/library/`. **If image files exist, open and view them with your file-reading tool.**
+2. Read `research/WORKFLOW_MAP.md`, `research/library/REFERENCES_INDEX.md`, and scan all directories named `reference/`, `references/`, `assets/`, `docs/`, and `research/library/`. **If image files exist, open and view them with your file-reading tool.**
 3. Read `research/LAB_LOG.md` and `research/SELF_LEARNING.md`.
 4. Ask yourself: *"Can I answer this question myself by inspecting the workspace or running a 10-second verification script?"*
    - If **YES**, you are **strictly forbidden** from asking the user. Run the check yourself.
@@ -61,4 +61,4 @@ To prevent this, **RA enforces a hard firewall between `research/hypotheses/` an
 2. **Every file in `research/library/` must carry a Provenance Tag** at the top:
    - `[USER_GROUND_TRUTH]`: Provided directly by the user (e.g., reference diagrams, target specs, lab measurements).
    - `[EXTERNAL_VERIFIED_LAW]`: Established mathematical theorem, physical law, or official hardware/API specification (with exact source citation).
-   - `[GRADUATED_LAB_TRUTH]`: Internal discovery that survived Stage 3 (Adversarial Break-Testing), Stage 4 (Anti-Cheese Audit), and Stage 6 (User Graduation Sign-Off).
+   - `[GRADUATED_LAB_TRUTH]`: Internal discovery that survived Stage 1 (Workflow Mapping), Stage 4 (Adversarial Break-Testing), Stage 5 (Anti-Cheese Audit), and Stage 7 (User Graduation Sign-Off).

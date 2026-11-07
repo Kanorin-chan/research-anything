@@ -3,4 +3,5 @@
 When researching or inventing zero-shot algorithms, neural networks, custom encryption, games, hardware/CPU layouts, materials, or novel systems:
 1. Activate the `research-anything` (`RA`) skill (`/research-anything`).
 2. Drive every step through `python ~/.claude/skills/research-anything/scripts/ra_gate.py`.
-3. Never use hardcoded domain data ("cheese") or symptom-level band-aid patches.
+3. Use `ra_context_harness.py` (`--platform claude`) to create read-once context snapshots and `/fork` subagent tasks (`claude --resume <id> --fork-session` / `Task`).
+4. Never use hardcoded domain data ("cheese") or symptom-level band-aid patches.

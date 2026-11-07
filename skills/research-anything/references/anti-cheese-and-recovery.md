@@ -81,6 +81,6 @@ The following are classified as **Illicit Band-Aids** and will fail `ra_cheese_a
 - Adding post-processing patches to fix corrupted output instead of fixing the generator.
 
 ### Mandatory Pipe-Replacement Protocol
-1. **Symptom $\neq$ Cause**: A leak at line 300 means the pipe pressure or joint design failed upstream at line 50.
-2. **Trace Upstream to the Broken Invariant**: Identify which mathematical assumption or state transition allowed the invalid state to exist.
-3. **Rip Out & Replace the Pipe**: If the underlying mechanism is flawed, quarantine it, formulate a recovery hypothesis (`Hxxx_fix_<mechanism>`), redesign the upstream mechanism so the invalid state is structurally impossible, and subject it to Stage 3 Adversarial Break-Testing.
+1. **Symptom $\neq$ Cause (Protect Innocent Functions)**: A leak at `Function A` (line 300) often means the pipe pressure or state producer failed upstream at `Function C` (line 50). Never blindly mutate `Function A` if it is working properly—lock `Function A` as `PROTECTED_WORKING` in `research/WORKFLOW_MAP.md`.
+2. **Trace the Full Multi-Hop Workflow (`Stage 1`)**: Map upstream producers, shared state, and $N$-hop downstream consumers in `research/WORKFLOW_MAP.md` and lock all existing behavioral contracts (`BC-xxx`) so your fix does not trigger whack-a-mole regressions.
+3. **Rip Out & Replace the Pipe**: If the underlying mechanism is flawed, quarantine it, formulate a recovery hypothesis (`Hxxx_fix_<mechanism>`), redesign the upstream mechanism so the invalid state is structurally impossible, and subject it to Stage 4 Adversarial & Regression Break-Testing.

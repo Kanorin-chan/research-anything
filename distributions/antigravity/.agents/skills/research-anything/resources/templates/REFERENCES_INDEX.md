@@ -30,4 +30,4 @@
 
 | Discovery ID | Source Hypothesis | File in `research/library/` | Verified Mechanism & Boundaries |
 | :--- | :--- | :--- | :--- |
-| `GRAD-001` | `H001_<slug>` | `research/library/<file.md>` | `<Proven mechanism that survived Stage 3, 4, and 6>` |
+| `GRAD-001` | `H001_<slug>` | `research/library/<file.md>` | `<Proven mechanism that survived Stage 1, 4, 5, and 7>` |

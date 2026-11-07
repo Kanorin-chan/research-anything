@@ -1,0 +1,7 @@
+# RA (Research Anything) Integration for OpenCode
+
+When researching or inventing zero-shot algorithms, neural networks, custom encryption, games, hardware/CPU layouts, materials, or debugging multi-hop systems:
+1. Activate the `research-anything` (`RA`) skill (`SKILL.md`).
+2. Drive every stage through `python ~/.agents/skills/research-anything/scripts/ra_gate.py`.
+3. Use `ra_context_harness.py` (`--platform opencode`) to create read-once context snapshots and `/fork` subagent tasks (`opencode run --session <id> --fork`).
+4. Verify in the real environment with `ra_log_engine.py` (no synthetic unit-test marathons) and `ra_cheese_audit.py`.

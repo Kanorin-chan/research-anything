@@ -1,69 +1,75 @@
-# Adversarial & Boundary Verification Playbooks (Stage 3)
+# Real-Environment `.log` Telemetry, Watchdog & Boundary Verification (Stages 3 & 4)
 
-In **RA (`research-anything`)**, standard AI "unit tests" (happy-path assertions that confirm the model's own assumptions) are **worthless**. Passing a basic test only proves that the code runs on a toy input—it does **not** prove that the invention actually works.
+In **RA (`research-anything`)**, standard AI "unit tests" (`test_xyz.py`, mocked unit tests, or isolated synthetic test runners that run for 30 minutes in a fantasy bubble) are **strictly banned**. Synthetic tests pass in isolation while the real system immediately breaks or hangs in production.
 
-**Stage 3 requires you to act as an adversary trying to destroy your own prototype.** If your breaking test does not find a failure boundary or extreme stress limit, your test is too weak.
-
----
-
-## Universal Adversarial Verification Rules
-
-1. **No Mocking the Core Mechanism**: Never mock, stub, or simplify the mathematical, physical, or algorithmic core being tested.
-2. **Push Until It Breaks (Boundary Mapping)**: Sweep parameters (scale, noise, step count, temperature, frequency, dimensionality) across orders of magnitude until you locate the exact breakdown threshold.
-3. **Structural Prevention over Symptom Patching**: When you discover what breaks the prototype, do not add a special-case `if` guard. Modify the underlying equation, invariant, topology, or architecture so that class of failure is structurally prevented.
+Instead, **RA treats every piece of code as real deployment code wired to a structured `.log` spine (`scripts/ra_log_engine.py`)**, verifying behavior directly from **real-environment `.log` traces**.
 
 ---
 
-## Domain-Specific Breaking Playbooks
+## 1. Why Synthetic Tests Are Trash vs. Real-Environment `.log` Truth
 
-### 1. Machine Learning, Neural Networks & Novel Architectures
-- **Gradient Flow & Numerical Stability**:
-  - Verify non-zero, non-exploding gradients across **every** learnable parameter (`0 < ||grad|| < threshold`).
-  - Test deep stacking / recurrent rollout over $10^3 - 10^4$ steps to detect vanishing/exploding activations or floating-point drift.
-- **Degenerate & Pathological Inputs**:
-  - Zero tensors, constant tensors, high-variance spikes, NaN/Inf boundary probes, batch size = 1, prime/unaligned sequence lengths.
-- **Generalization vs. Memorization Probe**:
-  - Test on **out-of-distribution (OOD)** shifts, permuted token/feature orderings, and extrapolate beyond training sequence length/scale.
-  - Verify the network cannot solve the task when target labels are randomized in a control sanity check (or verify how capacity scales).
-- **Ablation Proof**:
-  - Disable or identity-replace the novel component and prove empirically that performance/convergence degrades without it.
+| Failure Mode of AI Unit Tests | The RA Production `.log` Solution (`ra_log_engine.py`) |
+| :--- | :--- |
+| Spends 30 minutes writing & running mocked tests that don't reflect the real environment. | **Hard Watchdog Runner (`ra_log_engine.py run --timeout-sec 60`)**: Runs the actual environment/workflow and kills/logs `[STUCK]` immediately if any step hangs. |
+| Logs bare `"PASS"` or `"test ok"` with zero insight into actual runtime values or flow. | **Mandatory Functional + Value `.log` Schema**: Every hop logs `flow=caller->callee`, `role="..."`, `inputs={...}`, `state_before={...}`, `state_after={...}`, `delta={...}`, `output={...}`, `contract=BC-xxx`, and `elapsed_ms`. |
+| Hangs silently when a loop, recognition step, or async wait fails to resolve. | **Built-in `[STUCK]` Telemetry**: Logs the exact condition being waited on (`waiting_on`), current live variable values, and state snapshot at the exact hop where execution stalled. |
 
-### 2. Novel Algorithms, Frameworks & Game Mechanics
-- **Pathological Topologies & Edge Inputs**:
-  - Cyclic graphs, disconnected components, adversarial worst-case sorting/hashing distributions, degenerate zero-area/collinear geometries.
-- **Long-Horizon State Invariant Drift**:
-  - Simulate $10,000+$ ticks/frames of randomized and adversarial state transitions. Verify conservation laws, state synchronization, memory bounds, and determinism.
-- **Scale & Concurrency Stress**:
-  - Measure empirical time/space complexity across $N = 10, 10^2, 10^3, 10^4, 10^5$ to verify asymptotic behavior matches theoretical claims.
+---
 
-### 3. Custom Encryption, Hashing & Security Primitives
-- **Avalanche & Diffusion Test**:
-  - Flip 1 bit in the input/key across $10,000$ random trials; verify output bit-flip probability is centered at $50\% \pm \epsilon$ with no dead bit positions.
-- **Statistical Bias & Entropy Suite**:
-  - Run byte-frequency, chi-square, serial correlation, and run-length tests on ciphertext/output streams generated from low-entropy plaintexts (e.g., all zeros, repeating patterns).
-- **Differential & Chosen-Input Probing**:
-  - Feed related inputs ($P, P \oplus \Delta$) and verify zero detectable correlation in output differences.
-- **Invertibility & Collision Hunting**:
-  - Prove round-trip lossless decryption ($D_k(E_k(P)) == P$) across boundary bit lengths, and birthday-bound collision resistance on reduced-bit variants.
+## 2. Mandatory Stage 3 Rule: Wire Production `.log` Telemetry Into Every Flow Hop
 
-### 4. Hardware / CPU Re-Positioning, Thermal & System Layouts
-- **Worst-Case Workload & Thermal Envelope**:
-  - Simulate sustained peak power density (TDP spikes), asymmetric core/unit loading, and transient current ($dI/dt$) droop.
-- **Signal Integrity & Latency Bounds**:
-  - Verify critical-path wirelength, propagation delay, clock skew, and crosstalk under worst-case routing congestion.
-- **Geometric & Manufacturing Constraints**:
-  - Check keep-out zones, minimum pitch/clearance violations, aspect-ratio extremes, and pin/pad accessibility.
+When writing or modifying code in Stage 3, **silent code and lazy `print("ok")` statements are forbidden**. Inject or import `RALogger`:
 
-### 5. New Materials, Lab Data Analysis & Physical Systems
-- **Conservation & Physical Law Audits**:
-  - Verify mass, energy, charge, momentum, and thermodynamic entropy constraints across the entire operating domain.
-- **Sensitivity & Perturbation Analysis**:
-  - Inject realistic sensor noise, impurity variance, and temperature/pressure fluctuations ($\pm 1\%, \pm 5\%, \pm 20\%$) to test whether the predicted property is stable or a razor-thin mathematical artifact.
-- **Cross-Validation Against Ground-Truth Library**:
-  - Compare boundary behavior against known reference materials/laws in `research/library/` at limiting regimes ($T \to 0$, $P \to \infty$, concentration $\to 0$).
+```bash
+python "~/.gemini/skills/research-anything/scripts/ra_log_engine.py" inject-sdk \
+  --workspace "." \
+  --lang python \
+  --dest "research/sandbox/H001_slug"
+```
+*(Supports `--lang python | js | ts | php | laravel`)*
 
-### 6. Redesigning Shapes, Geometries & Mathematical Objects
-- **Singularity & Degeneracy Stress**:
-  - Test extreme aspect ratios, sharp curvature spikes, self-intersection boundaries, non-manifold edges, and topological genus transitions.
-- **Invariance Verification**:
-  - Verify expected behavior under rigid transformations (rotation, translation, reflection), uniform/non-uniform scaling, and discretization mesh resolution changes.
+Every function, branch decision, and state mutation along the workflow must log:
+1. **`[PASS]` (`logger.log_pass(...)` or `@logger.trace_step(...)`)**:
+   - Exact `flow` (`caller_file:func:line->curr_file:func:line`)
+   - Exact `role` (functional purpose of this step)
+   - Exact `inputs`, `state_before`, `state_after` (auto-computing `delta`), and `output`
+   - `contract` (`BC-001`, etc., or `logger.assert_contract("BC-001", ...)`)
+2. **`[DECISION]` (`logger.log_decision(...)`)**:
+   - Exact branch condition, evaluated threshold values, and which branch was taken.
+3. **`[STUCK]` (`logger.log_stuck(...)`)**:
+   - Emitted whenever a polling/retry/recognition step exceeds its millisecond threshold or iteration cap—recording *what* it is waiting on and *current live values*.
+4. **`[FAIL]` (`logger.log_fail(...)`)**:
+   - Emitted with the upstream caller, broken invariant reason, and full variable snapshot.
+
+---
+
+## 3. Mandatory Stage 4 Rule: Real-Environment Execution & `.log` Audit
+
+1. **Execute in the Real Environment Under the Watchdog Timer**:
+   ```bash
+   python "~/.gemini/skills/research-anything/scripts/ra_log_engine.py" run \
+     --workspace "." \
+     --hypothesis "H001_slug" \
+     --timeout-sec 60 \
+     --cmd "<real-environment-execution-command>"
+   ```
+2. **Audit the Real `.log` File (`ra_log_engine.py audit`)**:
+   ```bash
+   python "~/.gemini/skills/research-anything/scripts/ra_log_engine.py" audit \
+     --workspace "." \
+     --hypothesis "H001_slug"
+   ```
+   `ra_log_engine.py audit` automatically rejects the run if:
+   - Any `[PASS]` line is "AI slop" (missing `flow=caller->callee`, missing functional `role`, or missing runtime `inputs`/`state_before`/`state_after` values).
+   - Any hop recorded `[STUCK]` or `[FAIL]`.
+   - Any Existing Behavioral Contract (`BC-xxx` in `research/WORKFLOW_MAP.md`) was not verified in the `.log`.
+
+---
+
+## 4. Domain-Specific Real-Environment Stress Vectors (Logged to `.log`)
+
+While running in the real environment, stress-test boundary conditions and log the exact runtime values into `.log`:
+- **Algorithms / Bots / Game Loops / Systems**: Multi-cycle runs verifying state resets, recognition thresholds, idempotency (`BC-xxx` once-per-cycle guarantees), and watchdog `[STUCK]` recovery.
+- **Web / Backend / Laravel / APIs**: Real request-to-database-to-queue-to-response flow with live payload values and state diffs logged at every hop.
+- **ML / Neural Networks**: Per-layer gradient norms, activation ranges, and loss transitions logged as structured `[PASS]`/`[FAIL]` telemetry over real batches.
+- **Encryption / Security / Hardware**: Real test-vector inputs, entropy/avalanche metrics, and thermal/timing envelopes logged with exact numerical values.

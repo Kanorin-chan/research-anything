@@ -14,13 +14,24 @@ description: >-
   novel mechanisms or building R&D projects where standard boilerplate fails.
 metadata:
   short_name: RA
-  version: "1.2.0"
-allowed-tools: "Read, Write, Edit, Grep, Glob, Bash, Task"
+  version: "1.3.0"
 ---
 
-# RA — Research Anything
+# RA — Research Anything (Super-Skill & Composable Suite)
 
-Use **RA (`research-anything`)** when tackling a novel idea, zero-shot/zero-day problem, brand-new algorithm, neural network architecture, custom encryption, game system, hardware/CPU layout, material model, or geometric/system design where standard off-the-shelf boilerplate fails.
+Use **RA (`research-anything`)** as either the **Full 8-Stage Autonomous R&D Super-Skill** OR invoke any of its **Composable Partial Skills** when you only need one part of the workflow (such as just talking through a project, mapping a multi-hop workflow, or fixing a hard bug from root cause without band-aids):
+
+| Mode / Skill | When to Use | How It Runs |
+| :--- | :--- | :--- |
+| **`/ra-ask`** *(Router)* | Not sure which partial skill or flow fits your current situation. | Routes you to the right partial or full RA flow. |
+| **`/ra-talk`** *(Conversation Only)* | **Just want to talk through the project**, sharpen a design, or align on domain language (`GLOSSARY.md` + `VISION_AND_MISSION.md`) without writing code yet. | Runs `ra_gate.py check-question`, then calls `"ra-grilling"` and `"ra-domain-modeling"`. |
+| **`ra-systemic-debug`** (`/ra-debug`) | **Something is broken/slow**: diagnose and fix from root cause (`Symptom != Culprit`, `-N` to `+N` hop trace, real `.log` loop, **zero band-aids**). | Runs the 6-phase systemic root-cause debugger without forcing all 8 R&D stages. |
+| **`ra-workflow-map`** (`/ra-map`) | **Only map context & blast radius**: trace `-N` to `+N` hops, lock `PROTECTED_WORKING` functions and `BC-xxx` behavioral contracts in `WORKFLOW_MAP.md`. | Runs Stage 1 mapping & SHA-256 file stamping (`ra_gate.py map-context`). |
+| **`ra-context-fork`** (`/ra-fork`) | **Read-Once $\rightarrow$ Fork-Many snapshots, 1-concurrency baton, or portable `/handoff`** across **OpenCode**, **Claude Code**, **Codex**, and **Antigravity/Gemini**. | Drives `ra_context_harness.py` (`create`, `fork`, `return-baton`, `handoff`, `evict`). |
+| **`ra-log-verify`** (`/ra-log`) | **Verify in the real environment via `.log` telemetry** (no 30-minute synthetic unit-test marathons). | Wires `RALogger` and runs `ra_log_engine.py run` + `audit`. |
+| **`ra-visual-audit`** (`/ra-visual`) | **Verify real UI screenshots & provided-asset fit** (catch ignored assets, broken paths, or stretched aspect ratios). | Runs `ra_visual_audit.py scan-assets`, `init`, and `audit`. |
+| **`ra-anti-cheese`** (`/ra-cheese`) | **Seal axioms, scan for hardcoded lookup tables/band-aids, or forge project hooks & `ra-reviewer`**. | Runs `ra_cheese_audit.py` and `ra_forge.py`. |
+| **`research-anything`** *(Full Super-Skill)* | **Full 8-Stage zero-shot invention, novel algorithm/architecture/game/hardware R&D**. | Drives the complete `STAGE_0` $\rightarrow$ `STAGE_7` state machine via `ra_gate.py`. |
 
 Standard AI coding fails on novel inventions and complex systems because models read only surface data, fix 1-hop symptoms without checking the downstream blast radius, mutate innocent working functions, pattern-match against training data ("boilerplate reflex"), write useless happy-path unit tests, slap duct-tape band-aids over bugs, or sneak hardcoded data ("cheese") into the system when stuck. **RA overrides those reflexes with a strict, state-machine-enforced Scientific Method.**
 
@@ -49,10 +60,11 @@ To prevent the Main Agent's context window from bloating and decaying during dee
 3. **Prevent Long-Context Subagents (Task-Sizing Rule)**:
    - **Real R&D / Logic / Bug-Fix Tasks (`REAL_RD`)**: Strictly **1 atomic task per subagent** (never dump 7 tasks onto 1 subagent).
    - **Small Surface Tweaks (`TRIVIAL_BATCH`)**: Small cosmetic/surface tasks (*change CSS, swap icon, update text/labels*) can be batched together in a single subagent run.
-4. **Read Once $\rightarrow$ Fork Many (`/fork` Shared Context Snapshots Across `opencode`, `claude`, and `agy`)**:
-   - First-class platform support is built into `ra_context_harness.py` (`--platform auto|opencode|claude|agy`):
+4. **Read Once $\rightarrow$ Fork Many (`/fork` Shared Context Snapshots Across `opencode`, `claude`, `codex`, and `agy`)**:
+   - First-class platform support is built into `ra_context_harness.py` (`--platform auto|opencode|claude|codex|agy`):
      - **`opencode`**: Generates `opencode run --session <id> --fork --title "<subagent>"` or standalone `-f research/context_snapshots/forks/FORK_<subagent>.md` dispatches.
      - **`claude` (`claude-code`)**: Generates `claude --resume <id> --fork-session` and native `Task(subagent_type="general-purpose", ...)` dispatches.
+     - **`codex`**: Generates `codex exec resume <id> --full-auto` and `codex exec --full-auto` dispatches.
      - **`agy` (`antigravity` / `gemini`)**: Generates `invoke_subagent(TypeName="self", Role="...", Prompt="...")` dispatches.
    - When `Subagent_A` and `Subagent_B` need the same framework/workflow context (e.g., both working on a Laravel subsystem), read and compile the context **once** into a snapshot (`ra_context_harness.py create`), then **fork** it (`ra_context_harness.py fork`) into `Subagent_A` and `Subagent_B` so neither re-reads the codebase from scratch.
 5. **3-Tier Snapshot Retention & Throw-Away (Eviction) Harness (`scripts/ra_context_harness.py`)**:

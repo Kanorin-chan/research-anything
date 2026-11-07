@@ -1,0 +1,3 @@
+interface:
+  display_name: "RA Domain Modeling (Glossary, Invariants & ADRs)"
+  short_description: "Sharpen project terminology in GLOSSARY.md and lock invariants in INVARIANTS.md"

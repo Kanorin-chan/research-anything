@@ -130,9 +130,66 @@ def get_state_path(workspace: Path) -> Path:
     return get_research_dir(workspace) / ".ra_state.json"
 
 
-def load_state(workspace: Path) -> Dict[str, Any]:
+def ensure_initialized(workspace: Path, agent_id: str = "PRIMARY_AGENT") -> Dict[str, Any]:
+    rdir = get_research_dir(workspace)
+    templates_dir = get_skill_root() / "resources" / "templates"
+    for subdir in ["hypotheses", "sandbox", "graveyard", "library"]:
+        (rdir / subdir).mkdir(parents=True, exist_ok=True)
+
+    ts = now_iso()
+    template_map = {
+        "VISION_AND_MISSION.md": rdir / "VISION_AND_MISSION.md",
+        "INVARIANTS.md": rdir / "INVARIANTS.md",
+        "WORKFLOW_MAP.md": rdir / "WORKFLOW_MAP.md",
+        "LAB_LOG.md": rdir / "LAB_LOG.md",
+        "SELF_LEARNING.md": rdir / "SELF_LEARNING.md",
+        "REFERENCES_INDEX.md": rdir / "library" / "REFERENCES_INDEX.md",
+    }
+    for tname, dest in template_map.items():
+        if not dest.exists():
+            src = templates_dir / tname
+            content = src.read_text(encoding="utf-8") if src.exists() else f"# {tname}\n"
+            content = content.replace("<ISO-8601>", ts).replace("<YYYY-MM-DD>", ts[:10]).replace("<agent-id>", agent_id)
+            dest.write_text(content, encoding="utf-8")
+
+    state_path = get_state_path(workspace)
+    if not state_path.exists():
+        state = {
+            "version": "1.3.0",
+            "created_at": ts,
+            "updated_at": ts,
+            "current_stage": "STAGE_0_INTAKE_AND_SYNC",
+            "active_hypothesis": None,
+            "consecutive_falsifications": 0,
+            "cheese_audit_passed": False,
+            "visual_audit_passed": False,
+            "log_audit_passed": False,
+            "sealed_axioms": {},
+            "protected_nodes": [],
+            "context_map_snapshot": {
+                "agent": None,
+                "timestamp": None,
+                "tracked_files": {},
+            },
+            "history": [
+                {
+                    "timestamp": ts,
+                    "agent": agent_id,
+                    "event": "INIT",
+                    "details": "Initialized RA research structure.",
+                }
+            ],
+        }
+        save_state(workspace, state)
+        return state
+    return json.loads(state_path.read_text(encoding="utf-8"))
+
+
+def load_state(workspace: Path, auto_init: bool = False) -> Dict[str, Any]:
     sp = get_state_path(workspace)
     if not sp.exists():
+        if auto_init:
+            return ensure_initialized(workspace)
         print(
             "[RA GATE] ERROR: Research repository not initialized. Run `ra_gate.py init --workspace .` first.",
             file=sys.stderr,
@@ -312,69 +369,15 @@ def print_context_refresh(workspace: Path, state: Dict[str, Any]) -> None:
 def cmd_init(args: argparse.Namespace) -> None:
     workspace = Path(args.workspace).resolve()
     rdir = get_research_dir(workspace)
-    templates_dir = get_skill_root() / "resources" / "templates"
-
-    for subdir in ["hypotheses", "sandbox", "graveyard", "library"]:
-        (rdir / subdir).mkdir(parents=True, exist_ok=True)
-
-    ts = now_iso()
     agent_id = args.agent or "PRIMARY_AGENT"
-
-    template_map = {
-        "VISION_AND_MISSION.md": rdir / "VISION_AND_MISSION.md",
-        "INVARIANTS.md": rdir / "INVARIANTS.md",
-        "WORKFLOW_MAP.md": rdir / "WORKFLOW_MAP.md",
-        "LAB_LOG.md": rdir / "LAB_LOG.md",
-        "SELF_LEARNING.md": rdir / "SELF_LEARNING.md",
-        "REFERENCES_INDEX.md": rdir / "library" / "REFERENCES_INDEX.md",
-    }
-
-    for tname, dest in template_map.items():
-        if not dest.exists():
-            src = templates_dir / tname
-            content = src.read_text(encoding="utf-8") if src.exists() else f"# {tname}\n"
-            content = content.replace("<ISO-8601>", ts).replace("<YYYY-MM-DD>", ts[:10]).replace("<agent-id>", agent_id)
-            dest.write_text(content, encoding="utf-8")
-
-    state_path = get_state_path(workspace)
-    if not state_path.exists():
-        state = {
-            "version": "1.2.0",
-            "created_at": ts,
-            "updated_at": ts,
-            "current_stage": "STAGE_0_INTAKE_AND_SYNC",
-            "active_hypothesis": None,
-            "consecutive_falsifications": 0,
-            "cheese_audit_passed": False,
-            "visual_audit_passed": False,
-            "log_audit_passed": False,
-            "sealed_axioms": {},
-            "protected_nodes": [],
-            "context_map_snapshot": {
-                "agent": None,
-                "timestamp": None,
-                "tracked_files": {},
-            },
-            "history": [
-                {
-                    "timestamp": ts,
-                    "agent": agent_id,
-                    "event": "INIT",
-                    "details": "Initialized RA research structure with Stage 1 Workflow & Context Mapping.",
-                }
-            ],
-        }
-        save_state(workspace, state)
-    else:
-        state = load_state(workspace)
-
+    state = ensure_initialized(workspace, agent_id=agent_id)
     print(f"[RA GATE] Initialized research repository at: {rdir}")
     print_context_refresh(workspace, state)
 
 
 def cmd_status(args: argparse.Namespace) -> None:
     workspace = Path(args.workspace).resolve()
-    state = load_state(workspace)
+    state = load_state(workspace, auto_init=True)
     print_context_refresh(workspace, state)
 
 
@@ -395,6 +398,10 @@ def cmd_check_question(args: argparse.Namespace) -> None:
         rdir / "library",
     ]
     found_files: List[Path] = []
+    for root_doc in ("GLOSSARY.md", "GLOSSARY-MAP.md", "CONTEXT.md"):
+        rp = workspace / root_doc
+        if rp.exists() and rp.is_file():
+            found_files.append(rp)
     for cdir in candidate_dirs:
         if cdir.exists() and cdir.is_dir():
             for f in sorted(cdir.rglob("*")):
@@ -402,14 +409,21 @@ def cmd_check_question(args: argparse.Namespace) -> None:
                     found_files.append(f)
 
     if found_files:
-        print("  DISCOVERED REFERENCE / ASSET / LIBRARY FILES ON DISK:")
+        print("  DISCOVERED REFERENCE / GLOSSARY / ASSET / LIBRARY FILES ON DISK:")
         for f in found_files[:60]:
             rel = f.relative_to(workspace)
             print(f"    - {rel} ({f.stat().st_size} bytes)")
         print("  [RULE] If any image (.png/.jpg/.webp) or doc above relates to your question,")
         print("         you MUST open and view it BEFORE asking the user!")
     else:
-        print("  (No files found in reference/, references/, assets/, docs/, or research/library/)")
+        print("  (No files found in GLOSSARY.md, reference/, references/, assets/, docs/, or research/library/)")
+
+    glossary_path = workspace / "GLOSSARY.md"
+    if glossary_path.exists():
+        print("-" * 78)
+        print("  PROJECT SHARED LANGUAGE (`GLOSSARY.md`):")
+        for line in glossary_path.read_text(encoding="utf-8", errors="ignore").splitlines()[:30]:
+            print(f"    {line}")
 
     ref_idx = rdir / "library" / "REFERENCES_INDEX.md"
     if ref_idx.exists():
@@ -430,7 +444,7 @@ def cmd_check_question(args: argparse.Namespace) -> None:
 
 def cmd_map_context(args: argparse.Namespace) -> None:
     workspace = Path(args.workspace).resolve()
-    state = load_state(workspace)
+    state = load_state(workspace, auto_init=True)
     rdir = get_research_dir(workspace)
     wmap_path = rdir / "WORKFLOW_MAP.md"
 
@@ -925,7 +939,7 @@ def cmd_graduate(args: argparse.Namespace) -> None:
 
 def cmd_seal_axioms(args: argparse.Namespace) -> None:
     workspace = Path(args.workspace).resolve()
-    state = load_state(workspace)
+    state = load_state(workspace, auto_init=True)
     fpath = (workspace / args.file).resolve()
     if not fpath.exists():
         print(f"[RA GATE] ERROR: Axiom file not found: {fpath}", file=sys.stderr)

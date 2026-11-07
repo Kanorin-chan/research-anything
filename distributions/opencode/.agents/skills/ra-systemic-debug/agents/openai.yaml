@@ -1,0 +1,3 @@
+interface:
+  display_name: "RA Systemic Debug (Root-Cause & Anti-Band-Aid)"
+  short_description: "Multi-hop root-cause debugging with real .log loops, PROTECTED_WORKING locks, and zero band-aids"

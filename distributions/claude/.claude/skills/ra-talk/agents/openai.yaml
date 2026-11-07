@@ -1,0 +1,5 @@
+interface:
+  display_name: "RA Talk (Project Conversation & Grilling)"
+  short_description: "Talk through a project, sharpen design decisions, and update GLOSSARY.md & INVARIANTS.md without coding"
+policy:
+  allow_implicit_invocation: false

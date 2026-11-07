@@ -829,13 +829,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_init = sub.add_parser("init", help="Initialize visual_captures/ folder and VISUAL_AUDIT.md for a hypothesis")
     p_init.add_argument("--workspace", default=".", help="Workspace root")
-    p_init.add_argument("--hypothesis", required=True, help="Hypothesis folder name (e.g., H001_slug)")
+    p_init.add_argument("--hypothesis", default="STANDALONE", help="Hypothesis folder name (e.g., H001_slug) or STANDALONE")
     p_init.add_argument("--assets-dir", nargs="*", default=[], help="Additional asset directories to scan")
     p_init.set_defaults(func=cmd_init_audit)
 
     p_audit = sub.add_parser("audit", help="Verify provided-asset usage/fit, captured screenshots, and VISUAL_AUDIT.md")
     p_audit.add_argument("--workspace", default=".", help="Workspace root")
-    p_audit.add_argument("--hypothesis", required=True, help="Hypothesis folder name (e.g., H001_slug)")
+    p_audit.add_argument("--hypothesis", default="STANDALONE", help="Hypothesis folder name (e.g., H001_slug) or STANDALONE")
     p_audit.add_argument("--require-visual", action="store_true", help="Force visual audit even if no UI extensions detected")
     p_audit.add_argument("--assets-dir", nargs="*", default=[], help="Additional asset directories to scan")
     p_audit.add_argument("--require-assets", nargs="*", default=[], help="Specific asset filenames that must be wired")

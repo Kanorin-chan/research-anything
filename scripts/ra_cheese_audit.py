@@ -153,18 +153,21 @@ def audit_file(fpath: Path, sealed_rel_paths: set[str], workspace: Path) -> List
 def main() -> None:
     parser = argparse.ArgumentParser(description="RA Automated Anti-Cheese & Axiom Seal Auditor")
     parser.add_argument("--workspace", default=".", help="Workspace root directory")
-    parser.add_argument("--hypothesis", required=True, help="Active hypothesis folder name (e.g., H001_slug)")
+    parser.add_argument(
+        "--hypothesis",
+        default="STANDALONE",
+        help="Active hypothesis folder name (e.g., H001_slug) or STANDALONE for partial mode",
+    )
+    parser.add_argument("--files", nargs="*", default=[], help="Optional explicit files to audit in standalone mode")
     args = parser.parse_args()
 
     workspace = Path(args.workspace).resolve()
     rdir = workspace / "research"
     state_path = rdir / ".ra_state.json"
 
-    if not state_path.exists():
-        print("[RA CHEESE AUDIT] ERROR: `research/.ra_state.json` not found. Run `ra_gate.py init` first.", file=sys.stderr)
-        sys.exit(1)
-
-    state: Dict[str, Any] = json.loads(state_path.read_text(encoding="utf-8"))
+    state: Dict[str, Any] = (
+        json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+    )
     sealed_axioms: Dict[str, Any] = state.get("sealed_axioms", {})
     sealed_set = set(sealed_axioms.keys())
 
@@ -184,15 +187,26 @@ def main() -> None:
                     f"got {actual[:12]}... Never sneak hardcoded data into sealed axioms!"
                 )
 
-    # 2. Scan sandbox files for the target hypothesis
+    # 2. Scan sandbox files for the target hypothesis (or explicit/tracked files in standalone mode)
     sandbox_dir = rdir / "sandbox" / args.hypothesis
-    if not sandbox_dir.exists():
+    code_files: List[Path] = []
+    if args.files:
+        for fstr in args.files:
+            fp = (workspace / fstr).resolve()
+            if fp.exists() and fp.is_file():
+                code_files.append(fp)
+    elif sandbox_dir.exists():
+        code_files = [
+            f for f in sorted(sandbox_dir.rglob("*")) if f.is_file() and f.suffix.lower() in CODE_EXTENSIONS
+        ]
+    elif args.hypothesis == "STANDALONE":
+        for rel_t in state.get("context_map_snapshot", {}).get("tracked_files", {}).keys():
+            fp = (workspace / rel_t).resolve()
+            if fp.exists() and fp.is_file() and fp.suffix.lower() in CODE_EXTENSIONS:
+                code_files.append(fp)
+    else:
         print(f"[RA CHEESE AUDIT] ERROR: Sandbox directory not found: {sandbox_dir}", file=sys.stderr)
         sys.exit(1)
-
-    code_files = [
-        f for f in sorted(sandbox_dir.rglob("*")) if f.is_file() and f.suffix.lower() in CODE_EXTENSIONS
-    ]
     if not code_files:
         violations.append(f"No code files found inside `research/sandbox/{args.hypothesis}/` to audit.")
 
@@ -208,8 +222,9 @@ def main() -> None:
     print("-" * 78)
 
     if violations:
-        state["cheese_audit_passed"] = False
-        state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        if state_path.exists():
+            state["cheese_audit_passed"] = False
+            state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         print("  [FAIL] AUDIT REJECTED THE PROTOTYPE FOR THE FOLLOWING REASONS:")
         for v in violations:
             print(f"    - {v}")
@@ -221,8 +236,9 @@ def main() -> None:
         print("=" * 78)
         sys.exit(1)
 
-    state["cheese_audit_passed"] = True
-    state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    if state_path.exists():
+        state["cheese_audit_passed"] = True
+        state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print("  [PASS] Zero cheese, zero band-aids, and all axiom seals verified!")
     print("         Ensure `ra_log_engine.py audit` and `ra_visual_audit.py audit` also pass, then run `ra_gate.py advance` to proceed to Stage 6.")
     print("=" * 78)

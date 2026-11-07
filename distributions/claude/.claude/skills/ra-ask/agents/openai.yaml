@@ -1,0 +1,5 @@
+interface:
+  display_name: "Ask RA (Skill & Workflow Router)"
+  short_description: "Find the right partial or full RA skill for your task"
+policy:
+  allow_implicit_invocation: false

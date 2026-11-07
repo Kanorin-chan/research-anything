@@ -5,7 +5,8 @@ ra_context_harness.py — Multi-Platform Subagent Context Controller, `/fork` Ma
 First-Class Platform Support:
   1. `opencode` (OpenCode CLI: `opencode run --session <id> --fork` & `-f FORK_<subagent>.md`)
   2. `claude`   (Claude Code: `claude --resume <id> --fork-session`, `/fork`, & `Task` subagent tool)
-  3. `agy`      (Antigravity / Gemini: `invoke_subagent` with `Workspace: share/branch/inherit` & Gemini CLI)
+  3. `codex`    (OpenAI Codex CLI: `codex exec --full-auto` & `codex resume <id>`)
+  4. `agy`      (Antigravity / Gemini: `invoke_subagent` with `Workspace: share/branch/inherit` & Gemini CLI)
 
 Enforces RA's Lead-Orchestrator & Context-Control Protocol:
   1. Main Agent = Lead Orchestrator / Compiler (delegates execution to Subagents even at 1-concurrency baton-pass).
@@ -46,7 +47,7 @@ TIER_DEFAULTS = {
     "TASK_EPHEMERAL": {"max_reuses": 1, "ttl_minutes": 30},
 }
 
-SUPPORTED_PLATFORMS = ("auto", "opencode", "claude", "agy")
+SUPPORTED_PLATFORMS = ("auto", "opencode", "claude", "codex", "agy")
 
 
 def now_utc() -> dt.datetime:
@@ -72,18 +73,22 @@ def sha256_file(path: Path) -> str:
 
 def detect_platform(requested: str = "auto") -> str:
     req = requested.lower()
-    if req in ("opencode", "claude", "agy"):
+    if req in ("opencode", "claude", "codex", "agy"):
         return req
     if os.environ.get("OPENCODE") or os.environ.get("OPENCODE_SESSION"):
         return "opencode"
     if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_ENTRYPOINT"):
         return "claude"
+    if os.environ.get("CODEX_HOME") or os.environ.get("CODEX_SANDBOX"):
+        return "codex"
     if os.environ.get("ANTIGRAVITY_CLI") or os.environ.get("GEMINI_CLI"):
         return "agy"
     if shutil.which("opencode"):
         return "opencode"
     if shutil.which("claude"):
         return "claude"
+    if shutil.which("codex"):
+        return "codex"
     return "agy"
 
 
@@ -196,8 +201,9 @@ def build_platform_fork_instructions(
     base_session_id: Optional[str],
     model: Optional[str],
 ) -> Dict[str, str]:
-    """Generate exact context-forking commands/calls for OpenCode, Claude Code, and Antigravity/Gemini."""
+    """Generate exact context-forking commands/calls for OpenCode, Claude Code, Codex, and Antigravity/Gemini."""
     oc_model_flag = f'--model "{model}" ' if model else ""
+    codex_model_flag = f'-m "{model}" ' if model else ""
     if base_session_id:
         opencode_cmd = (
             f'opencode run --session "{base_session_id}" --fork --title "{subagent_name}" '
@@ -208,6 +214,11 @@ def build_platform_fork_instructions(
             f'claude --resume "{base_session_id}" --fork-session '
             f'-p "Read {rel_fork_file}, execute ONLY the bounded task, and write your report to {rel_report_file}."'
         )
+        codex_cmd = (
+            f'codex exec resume "{base_session_id}" {codex_model_flag}--full-auto '
+            f'"Read {rel_fork_file} (shared forked context snapshot). Do NOT re-read already-summarized files. '
+            f'Execute ONLY the bounded task and write your report to {rel_report_file}."'
+        )
     else:
         opencode_cmd = (
             f'opencode run --title "{subagent_name}" {oc_model_flag}--auto -f "{rel_fork_file}" '
@@ -217,6 +228,11 @@ def build_platform_fork_instructions(
             f'Task(subagent_type="general-purpose", description="{subagent_name}", '
             f'prompt="Read {rel_fork_file} (shared forked context snapshot). Do NOT re-read already-summarized files. '
             f'Execute ONLY the bounded task and write your report to {rel_report_file}.")'
+        )
+        codex_cmd = (
+            f'codex exec {codex_model_flag}--full-auto '
+            f'"Read {rel_fork_file} (shared forked context snapshot). Do NOT re-read already-summarized files. '
+            f'Execute ONLY the bounded task and write your report to {rel_report_file}."'
         )
 
     agy_cmd = (
@@ -229,6 +245,7 @@ def build_platform_fork_instructions(
         "active_platform": platform,
         "opencode": opencode_cmd,
         "claude": claude_cmd,
+        "codex": codex_cmd,
         "agy": agy_cmd,
     }
 
@@ -403,7 +420,7 @@ def cmd_fork(args: argparse.Namespace) -> None:
     fork_packet = (
         f"# Forked Subagent Execution Brief — `{subagent_name}`\n\n"
         f"- **Forked Timestamp**: `{now_iso()}`\n"
-        f"- **Target Platform**: `{platform}` (`opencode` | `claude` | `agy`)\n"
+        f"- **Target Platform**: `{platform}` (`opencode` | `claude` | `codex` | `agy`)\n"
         f"- **Concurrency / Baton Mode**: `1-CONCURRENCY BATON PASS` (Main Agent is IDLE waiting for your report)\n"
         f"- **Task Classification**: `{task_type}`\n"
         f"- **Inherited Context Snapshots**: {', '.join(f'`{s}`' for s in requested_ids)}\n"
@@ -433,6 +450,7 @@ def cmd_fork(args: argparse.Namespace) -> None:
     print("  MULTI-PLATFORM SUBAGENT DISPATCH COMMANDS:")
     print(f"    [opencode]    : {dispatch_cmds['opencode']}")
     print(f"    [claude-code] : {dispatch_cmds['claude']}")
+    print(f"    [codex]       : {dispatch_cmds['codex']}")
     print(f"    [agy/gemini]  : {dispatch_cmds['agy']}")
     print("-" * 78)
     print(
@@ -589,6 +607,70 @@ def cmd_status(args: argparse.Namespace) -> None:
     print("=" * 78)
 
 
+def cmd_handoff(args: argparse.Namespace) -> None:
+    """Write a portable cross-harness handoff document (like `/handoff`) with RA artifact pointers."""
+    import tempfile
+
+    workspace = Path(args.workspace).resolve()
+    reg = load_registry(workspace)
+    snaps = list(reg.get("snapshots", {}).keys())
+
+    # Collect existing RA and domain artifacts by path (never duplicating their full text)
+    artifact_pointers: List[str] = []
+    for candidate in (
+        "GLOSSARY.md",
+        "research/VISION_AND_MISSION.md",
+        "research/INVARIANTS.md",
+        "research/WORKFLOW_MAP.md",
+        "research/LAB_LOG.md",
+        "research/SELF_LEARNING.md",
+    ):
+        fp = workspace / candidate
+        if fp.exists():
+            artifact_pointers.append(f"- `{ (workspace / candidate).as_posix() }`")
+
+    for sid in snaps:
+        sfile = reg["snapshots"][sid].get("file")
+        if sfile:
+            artifact_pointers.append(f"- Context Snapshot `{sid}`: `{ (workspace / sfile).as_posix() }`")
+
+    suggested_skills = args.suggested_skills or ["ra-ask", "ra-systemic-debug", "research-anything"]
+    skills_bullets = "\n".join(f'- Call the Skill tool with `"{s}"`' for s in suggested_skills)
+
+    ts_slug = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    if args.output:
+        out_path = Path(args.output).resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        tmp_dir = Path(tempfile.gettempdir())
+        out_path = tmp_dir / f"RA_HANDOFF_{workspace.name}_{ts_slug}.md"
+
+    doc = (
+        f"# RA Portable Session Handoff — `{workspace.name}`\n\n"
+        f"- **Created Timestamp**: `{now_iso()}`\n"
+        f"- **Workspace Path**: `{workspace.as_posix()}`\n"
+        f"- **Next Session Focus**: {args.focus or 'Continue active R&D / systemic engineering work'}\n\n"
+        f"---\n\n"
+        f"## 1. Conversation & State Summary\n"
+        f"{args.summary}\n\n"
+        f"---\n\n"
+        f"## 2. Primary Source Artifacts on Disk (Read by Path — Do Not Duplicate)\n"
+        + ("\n".join(artifact_pointers) if artifact_pointers else "- *(No RA artifacts initialized yet)*")
+        + "\n\n---\n\n"
+        f"## 3. Suggested Skills for Next Session\n"
+        f"{skills_bullets}\n"
+    )
+    out_path.write_text(doc, encoding="utf-8")
+
+    print("=" * 78)
+    print("  RA PORTABLE HANDOFF DOCUMENT CREATED")
+    print("=" * 78)
+    print(f"  Handoff File     : {out_path.as_posix()}")
+    print(f"  Next Focus       : {args.focus or 'Continue active work'}")
+    print(f"  Suggested Skills : {', '.join(suggested_skills)}")
+    print("=" * 78)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="RA Multi-Platform Subagent Context Controller & `/fork` Snapshot Harness")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -699,6 +781,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="Show active snapshots, fork reuse counts, staleness, and baton state")
     p_status.add_argument("--workspace", default=".", help="Workspace root")
     p_status.set_defaults(func=cmd_status)
+
+    p_handoff = sub.add_parser(
+        "handoff",
+        help="Write a portable cross-harness handoff document with RA artifact pointers and suggested skills",
+    )
+    p_handoff.add_argument("--workspace", default=".", help="Workspace root")
+    p_handoff.add_argument("--summary", required=True, help="Summary of the current conversation and decisions")
+    p_handoff.add_argument("--focus", default="", help="What the next session will focus on")
+    p_handoff.add_argument("--suggested-skills", nargs="*", default=[], help="Skills the next agent should invoke")
+    p_handoff.add_argument("--output", default=None, help="Optional custom output path (defaults to OS temp dir)")
+    p_handoff.set_defaults(func=cmd_handoff)
 
     return p
 

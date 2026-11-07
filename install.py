@@ -1,53 +1,72 @@
 #!/usr/bin/env python3
 """
-install.py — Multi-Platform Distribution Builder & Installer for RA (research-anything).
+install.py — Multi-Platform Distribution Builder & Composable Suite Installer for RA (research-anything).
 
 Supports:
-  - OpenCode         (~/.agents/skills/research-anything & ~/.config/opencode/skills/research-anything)
-  - Claude Code      (~/.claude/skills/research-anything)
-  - Antigravity      (~/.agents/skills/research-anything & ~/.gemini/config/skills/research-anything)
-  - Gemini CLI       (~/.gemini/skills/research-anything)
-  - Local Workspace  (<workspace>/.agents/skills/research-anything & <workspace>/.claude/skills/research-anything)
+  - OpenCode         (~/.agents/skills/* & ~/.config/opencode/skills/*)
+  - Claude Code      (~/.claude/skills/*)
+  - Codex            (~/.agents/skills/* & ~/.codex/skills/*)
+  - Antigravity      (~/.agents/skills/* & ~/.gemini/config/skills/*)
+  - Gemini CLI       (~/.gemini/skills/*)
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
+import stat
 from pathlib import Path
 
-SKILL_PARTS = ("SKILL.md", "scripts", "references", "resources")
 
-OPENCODE_SNIPPET = """# RA (Research Anything) Integration for OpenCode
+def _on_rm_error(func, path, exc_info):
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
 
-When researching or inventing zero-shot algorithms, neural networks, custom encryption, games, hardware/CPU layouts, materials, or debugging multi-hop systems:
-1. Activate the `research-anything` (`RA`) skill (`SKILL.md`).
-2. Drive every stage through `python ~/.agents/skills/research-anything/scripts/ra_gate.py`.
-3. Use `ra_context_harness.py` (`--platform opencode`) to create read-once context snapshots and `/fork` subagent tasks (`opencode run --session <id> --fork`).
-4. Verify in the real environment with `ra_log_engine.py` (no synthetic unit-test marathons) and `ra_cheese_audit.py`.
+
+def rmtree_force(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path, onerror=_on_rm_error)
+
+ROOT_SKILL_PARTS = ("SKILL.md", "agents", "scripts", "references", "resources")
+
+ALL_SKILLS = (
+    "research-anything",
+    "ra-ask",
+    "ra-talk",
+    "ra-systemic-debug",
+    "ra-workflow-map",
+    "ra-context-fork",
+    "ra-log-verify",
+    "ra-visual-audit",
+    "ra-anti-cheese",
+    "ra-grilling",
+    "ra-domain-modeling",
+)
+
+OPENCODE_SNIPPET = """# RA (Research Anything) Composable Suite for OpenCode
+
+- Use `/ra-ask` to pick the right flow, `/ra-talk` to talk through a project without coding, `/ra-systemic-debug` for root-cause debugging without band-aids, `/ra-context-fork` for `/fork` subagent snapshots, or `/research-anything` for full 8-stage R&D.
 """
 
-CLAUDE_SNIPPET = """# RA (Research Anything) Integration for Claude Code
+CLAUDE_SNIPPET = """# RA (Research Anything) Composable Suite for Claude Code
 
-When researching or inventing zero-shot algorithms, neural networks, custom encryption, games, hardware/CPU layouts, materials, or novel systems:
-1. Activate the `research-anything` (`RA`) skill (`/research-anything`).
-2. Drive every step through `python ~/.claude/skills/research-anything/scripts/ra_gate.py`.
-3. Use `ra_context_harness.py` (`--platform claude`) to create read-once context snapshots and `/fork` subagent tasks (`claude --resume <id> --fork-session` / `Task`).
-4. Never use hardcoded domain data ("cheese") or symptom-level band-aid patches.
+- Use `/ra-ask` to pick the right flow, `/ra-talk` to talk through a project without coding, `/ra-systemic-debug` for root-cause debugging without band-aids, `/ra-context-fork` for `/fork` subagent snapshots, or `/research-anything` for full 8-stage R&D.
 """
 
-ANTIGRAVITY_SNIPPET = """# RA (Research Anything) Integration for Antigravity
+CODEX_SNIPPET = """# RA (Research Anything) Composable Suite for OpenAI Codex
 
-When tackling novel ideas, zero-shot/zero-day problems, brand-new algorithms, neural networks, encryption, hardware/CPU layouts, or material/shape systems:
-1. Read and follow the `research-anything` (`RA`) skill (`SKILL.md`).
-2. Enforce the 8-stage state machine via `scripts/ra_gate.py`, `scripts/ra_context_harness.py` (`--platform agy`), `scripts/ra_log_engine.py`, and `scripts/ra_cheese_audit.py`.
-3. Never ask repeated questions without running `ra_gate.py check-question` first.
+- Use `$ra-ask` to pick the right flow, `$ra-talk` to talk through a project without coding, `$ra-systemic-debug` for root-cause debugging without band-aids, `$ra-context-fork` for subagent context snapshots, or `$research-anything` for full 8-stage R&D.
 """
 
-GEMINI_SNIPPET = """# RA (Research Anything) Integration for Gemini CLI
+ANTIGRAVITY_SNIPPET = """# RA (Research Anything) Composable Suite for Antigravity
 
-Use the `research-anything` (`RA`) skill for first-principles invention and research-style engineering.
-Always run `ra_gate.py status --workspace .` before transitioning stages, use `ra_context_harness.py` to fork shared context snapshots to subagents, and run `ra_log_engine.py audit` + `ra_cheese_audit.py` before marking any hypothesis proven.
+- Use `ra-ask` to pick the right flow, `ra-talk` to talk through a project without coding, `ra-systemic-debug` for root-cause debugging without band-aids, `ra-context-fork` for subagent snapshots, or `research-anything` for full 8-stage R&D.
+"""
+
+GEMINI_SNIPPET = """# RA (Research Anything) Composable Suite for Gemini CLI
+
+- Use `ra-ask` to pick the right flow, `ra-talk` to talk through a project without coding, `ra-systemic-debug` for root-cause debugging without band-aids, `ra-context-fork` for subagent snapshots, or `research-anything` for full 8-stage R&D.
 """
 
 
@@ -57,14 +76,14 @@ def sync_root_to_canonical_skill(repo_root: Path) -> Path:
     root_skill_md = repo_root / "SKILL.md"
     if root_skill_md.exists():
         canonical.mkdir(parents=True, exist_ok=True)
-        for part in SKILL_PARTS:
+        for part in ROOT_SKILL_PARTS:
             src = repo_root / part
             dst = canonical / part
             if not src.exists():
                 continue
             if dst.exists():
                 if dst.is_dir():
-                    shutil.rmtree(dst)
+                    rmtree_force(dst)
                 else:
                     dst.unlink()
             if src.is_dir():
@@ -78,75 +97,82 @@ def copy_skill_tree(src_skill: Path, dest_skill: Path) -> None:
     if src_skill.resolve() == dest_skill.resolve():
         return
     if dest_skill.exists():
-        shutil.rmtree(dest_skill)
+        rmtree_force(dest_skill)
     dest_skill.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src_skill, dest_skill)
 
 
+def rewrite_skill_paths(skill_dir: Path, target_base_path: str) -> None:
+    skill_md = skill_dir / "SKILL.md"
+    if not skill_md.exists():
+        return
+    txt = skill_md.read_text(encoding="utf-8")
+    txt = txt.replace("~/.gemini/skills/research-anything", target_base_path)
+    skill_md.write_text(txt, encoding="utf-8")
+
+
 def build_distributions(repo_root: Path) -> None:
-    src_skill = sync_root_to_canonical_skill(repo_root)
+    sync_root_to_canonical_skill(repo_root)
+    skills_root = repo_root / "skills"
     dist_root = repo_root / "distributions"
 
-    # 1. OpenCode distribution
-    oc_dir = dist_root / "opencode"
-    copy_skill_tree(src_skill, oc_dir / ".agents" / "skills" / "research-anything")
-    oc_skill_md = oc_dir / ".agents" / "skills" / "research-anything" / "SKILL.md"
-    txt_oc = oc_skill_md.read_text(encoding="utf-8").replace(
-        "~/.gemini/skills/research-anything", "~/.agents/skills/research-anything"
+    platforms = [
+        ("opencode", ".agents/skills", "~/.agents/skills/research-anything", "AGENTS.md.snippet", OPENCODE_SNIPPET),
+        ("claude", ".claude/skills", "~/.claude/skills/research-anything", "CLAUDE.md.snippet", CLAUDE_SNIPPET),
+        ("codex", ".agents/skills", "~/.agents/skills/research-anything", "AGENTS.md.snippet", CODEX_SNIPPET),
+        ("antigravity", ".agents/skills", "~/.agents/skills/research-anything", "AGENTS.md.snippet", ANTIGRAVITY_SNIPPET),
+        ("gemini", ".gemini/skills", "~/.gemini/skills/research-anything", "GEMINI.md.snippet", GEMINI_SNIPPET),
+    ]
+
+    for plat_name, rel_skills_dir, script_base, snippet_name, snippet_body in platforms:
+        plat_dir = dist_root / plat_name
+        dest_skills_base = plat_dir / rel_skills_dir
+        for sname in ALL_SKILLS:
+            src_s = skills_root / sname
+            if not src_s.exists():
+                continue
+            dst_s = dest_skills_base / sname
+            copy_skill_tree(src_s, dst_s)
+            rewrite_skill_paths(dst_s, script_base)
+        (plat_dir / snippet_name).write_text(snippet_body, encoding="utf-8")
+
+    print(
+        f"[RA INSTALLER] Synchronized {len(ALL_SKILLS)} skills and built multi-platform distributions under: {dist_root}"
     )
-    oc_skill_md.write_text(txt_oc, encoding="utf-8")
-    (oc_dir / "AGENTS.md.snippet").write_text(OPENCODE_SNIPPET, encoding="utf-8")
-
-    # 2. Claude Code distribution
-    claude_dir = dist_root / "claude"
-    copy_skill_tree(src_skill, claude_dir / ".claude" / "skills" / "research-anything")
-    claude_skill_md = claude_dir / ".claude" / "skills" / "research-anything" / "SKILL.md"
-    txt = claude_skill_md.read_text(encoding="utf-8")
-    txt = txt.replace(
-        '  version: "1.2.0"\n---',
-        '  version: "1.2.0"\nallowed-tools: "Read, Write, Edit, Grep, Glob, Bash, Task"\n---',
-    )
-    txt = txt.replace("~/.gemini/skills/research-anything", "~/.claude/skills/research-anything")
-    claude_skill_md.write_text(txt, encoding="utf-8")
-    (claude_dir / "CLAUDE.md.snippet").write_text(CLAUDE_SNIPPET, encoding="utf-8")
-
-    # 3. Antigravity distribution
-    agy_dir = dist_root / "antigravity"
-    copy_skill_tree(src_skill, agy_dir / ".agents" / "skills" / "research-anything")
-    agy_skill_md = agy_dir / ".agents" / "skills" / "research-anything" / "SKILL.md"
-    txt_agy = agy_skill_md.read_text(encoding="utf-8").replace(
-        "~/.gemini/skills/research-anything", "~/.agents/skills/research-anything"
-    )
-    agy_skill_md.write_text(txt_agy, encoding="utf-8")
-    (agy_dir / "AGENTS.md.snippet").write_text(ANTIGRAVITY_SNIPPET, encoding="utf-8")
-
-    # 4. Gemini CLI distribution
-    gem_dir = dist_root / "gemini"
-    copy_skill_tree(src_skill, gem_dir / ".gemini" / "skills" / "research-anything")
-    (gem_dir / "GEMINI.md.snippet").write_text(GEMINI_SNIPPET, encoding="utf-8")
-
-    print(f"[RA INSTALLER] Synchronized `skills/research-anything/` and built distributions under: {dist_root}")
 
 
-def copy_parts_only(src_skill: Path, dst_skill: Path) -> None:
-    """Safely update skill files inside an existing directory (even if dst_skill is a git repo root)."""
-    dst_skill.mkdir(parents=True, exist_ok=True)
-    for part in SKILL_PARTS:
-        s = src_skill / part
-        d = dst_skill / part
-        if not s.exists():
-            continue
-        if s.resolve() == d.resolve():
-            continue
-        if d.exists():
-            if d.is_dir():
-                shutil.rmtree(d)
+def install_skill_dir_safe(src_skill: Path, dst_skill: Path, is_repo_root: bool = False) -> None:
+    if src_skill.resolve() == dst_skill.resolve():
+        return
+    if is_repo_root or (dst_skill / ".git").exists():
+        dst_skill.mkdir(parents=True, exist_ok=True)
+        for part in ROOT_SKILL_PARTS:
+            s = src_skill / part
+            d = dst_skill / part
+            if not s.exists() or s.resolve() == d.resolve():
+                continue
+            if d.exists():
+                if d.is_dir():
+                    rmtree_force(d)
+                else:
+                    d.unlink()
+            if s.is_dir():
+                shutil.copytree(s, d)
             else:
-                d.unlink()
-        if s.is_dir():
-            shutil.copytree(s, d)
-        else:
-            shutil.copy2(s, d)
+                shutil.copy2(s, d)
+    else:
+        copy_skill_tree(src_skill, dst_skill)
+
+
+def install_suite_to_base(dist_skills_base: Path, target_skills_base: Path, repo_root: Path) -> None:
+    target_skills_base.mkdir(parents=True, exist_ok=True)
+    for sname in ALL_SKILLS:
+        src_s = dist_skills_base / sname
+        if not src_s.exists():
+            continue
+        dst_s = target_skills_base / sname
+        is_root = dst_s.resolve() == repo_root.resolve()
+        install_skill_dir_safe(src_s, dst_s, is_repo_root=is_root)
 
 
 def install_global(repo_root: Path, target: str) -> None:
@@ -154,41 +180,49 @@ def install_global(repo_root: Path, target: str) -> None:
     dist_root = repo_root / "distributions"
 
     if target in ("opencode", "all"):
-        src = dist_root / "opencode" / ".agents" / "skills" / "research-anything"
-        dst1 = home / ".agents" / "skills" / "research-anything"
-        dst2 = home / ".config" / "opencode" / "skills" / "research-anything"
-        copy_parts_only(src, dst1)
-        copy_parts_only(src, dst2)
-        print(f"[RA INSTALLER] Installed for OpenCode      -> {dst1}")
-        print(f"[RA INSTALLER] Installed for OpenCode Cfg  -> {dst2}")
+        src_base = dist_root / "opencode" / ".agents" / "skills"
+        dst1 = home / ".agents" / "skills"
+        dst2 = home / ".config" / "opencode" / "skills"
+        install_suite_to_base(src_base, dst1, repo_root)
+        install_suite_to_base(src_base, dst2, repo_root)
+        print(f"[RA INSTALLER] Installed {len(ALL_SKILLS)} skills for OpenCode     -> {dst1} & {dst2}")
 
     if target in ("claude", "all"):
-        src = dist_root / "claude" / ".claude" / "skills" / "research-anything"
-        dst = home / ".claude" / "skills" / "research-anything"
-        copy_parts_only(src, dst)
-        print(f"[RA INSTALLER] Installed for Claude Code   -> {dst}")
+        src_base = dist_root / "claude" / ".claude" / "skills"
+        dst = home / ".claude" / "skills"
+        install_suite_to_base(src_base, dst, repo_root)
+        print(f"[RA INSTALLER] Installed {len(ALL_SKILLS)} skills for Claude Code  -> {dst}")
+
+    if target in ("codex", "all"):
+        src_base = dist_root / "codex" / ".agents" / "skills"
+        dst1 = home / ".agents" / "skills"
+        dst2 = home / ".codex" / "skills"
+        install_suite_to_base(src_base, dst1, repo_root)
+        install_suite_to_base(src_base, dst2, repo_root)
+        print(f"[RA INSTALLER] Installed {len(ALL_SKILLS)} skills for Codex        -> {dst1} & {dst2}")
 
     if target in ("antigravity", "all"):
-        src = dist_root / "antigravity" / ".agents" / "skills" / "research-anything"
-        dst1 = home / ".agents" / "skills" / "research-anything"
-        dst2 = home / ".gemini" / "config" / "skills" / "research-anything"
-        copy_parts_only(src, dst1)
-        copy_parts_only(src, dst2)
-        print(f"[RA INSTALLER] Installed for Antigravity   -> {dst1}")
-        print(f"[RA INSTALLER] Installed for AGY Global    -> {dst2}")
+        src_base = dist_root / "antigravity" / ".agents" / "skills"
+        dst1 = home / ".agents" / "skills"
+        dst2 = home / ".gemini" / "config" / "skills"
+        install_suite_to_base(src_base, dst1, repo_root)
+        install_suite_to_base(src_base, dst2, repo_root)
+        print(f"[RA INSTALLER] Installed {len(ALL_SKILLS)} skills for Antigravity  -> {dst1} & {dst2}")
 
     if target in ("gemini", "all"):
-        src = dist_root / "gemini" / ".gemini" / "skills" / "research-anything"
-        dst = home / ".gemini" / "skills" / "research-anything"
-        copy_parts_only(src, dst)
-        print(f"[RA INSTALLER] Installed for Gemini CLI    -> {dst}")
+        src_base = dist_root / "gemini" / ".gemini" / "skills"
+        dst = home / ".gemini" / "skills"
+        install_suite_to_base(src_base, dst, repo_root)
+        print(f"[RA INSTALLER] Installed {len(ALL_SKILLS)} skills for Gemini CLI   -> {dst}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build and install RA (research-anything) across agent platforms.")
+    parser = argparse.ArgumentParser(
+        description="Build and install the RA (research-anything) Composable Skill Suite across agent platforms."
+    )
     parser.add_argument(
         "--target",
-        choices=["all", "opencode", "claude", "antigravity", "gemini", "dist-only"],
+        choices=["all", "opencode", "claude", "codex", "antigravity", "gemini", "dist-only"],
         default="all",
         help="Target agent platform to install globally (or dist-only to just build distributions/)",
     )

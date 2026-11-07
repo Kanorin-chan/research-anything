@@ -1,0 +1,3 @@
+interface:
+  display_name: "RA Visual & Provided-Asset Reality Gate"
+  short_description: "Scan provided assets & aspect ratios, block ignored/broken assets, and audit real screenshots"

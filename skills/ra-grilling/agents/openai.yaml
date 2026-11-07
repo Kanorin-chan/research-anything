@@ -1,0 +1,3 @@
+interface:
+  display_name: "RA Grilling (Design-Tree Interview)"
+  short_description: "Interview the user in frontier rounds until every design branch is resolved"

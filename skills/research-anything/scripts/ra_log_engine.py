@@ -800,7 +800,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_run = sub.add_parser("run", help="Run real-environment command under a strict watchdog timer and log `[STUCK]` on hang")
     p_run.add_argument("--workspace", default=".", help="Workspace root")
-    p_run.add_argument("--hypothesis", required=True, help="Active hypothesis folder (e.g., H001_slug)")
+    p_run.add_argument("--hypothesis", default="STANDALONE", help="Active hypothesis folder (e.g., H001_slug) or STANDALONE")
     p_run.add_argument("--cmd", required=True, help="Command to execute in the real environment")
     p_run.add_argument("--timeout-sec", type=int, default=60, help="Hard watchdog timeout in seconds (prevents 30m hangs)")
     p_run.add_argument("--log-file", default=None, help="Optional custom `.log` file path")
@@ -808,7 +808,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_audit = sub.add_parser("audit", help="Audit real-environment `.log` files for flow, values, `[PASS]`/`[STUCK]`/`[FAIL]`, and contracts")
     p_audit.add_argument("--workspace", default=".", help="Workspace root")
-    p_audit.add_argument("--hypothesis", required=True, help="Active hypothesis folder (e.g., H001_slug)")
+    p_audit.add_argument("--hypothesis", default="STANDALONE", help="Active hypothesis folder (e.g., H001_slug) or STANDALONE")
     p_audit.add_argument("--log-file", default=None, help="Optional explicit `.log` file path to audit")
     p_audit.set_defaults(func=cmd_audit)
 

@@ -194,9 +194,10 @@ Every time `ra_gate.py` runs, it echoes **the active stage instructions**, **Wor
   2. Suspicious lookup tables, hardcoded output dicts/lists, or specific-value `if input == X: return Y` branches inside algorithmic/model code.
   3. Band-aid symptom suppression (`try/except: pass`, arbitrary `clamp`/`nan_to_num` masking upstream corruption).
   4. Poison/lazy comments (`# hardcoded`, `# hack`, `# temporary`, `# workaround`, `# untrusted` without evidence).
-- **User-Eyes Visual & Experiential Reality Auditor (`ra_visual_audit.py`)**:
+- **User-Eyes Visual, Provided-Asset & Experiential Reality Auditor (`ra_visual_audit.py`)**:
   - Whenever visual, UI, CSS, game, shader, or chart files are touched, **never trust code/DOM context alone**.
-  - Capture real screenshots into `research/sandbox/Hxxx_<slug>/visual_captures/`, open and inspect every screenshot with your vision tool (`read_file`), and interrogate the pixels from the **User's View** in `VISUAL_AUDIT.md` (checking for wrong CSS alignment, displaced icons/data, unloaded assets, and wrong function/image display).
+  - **Detect & Fit Provided Assets (`ra_visual_audit.py scan-assets`)**: Automatically scans workspace/sandbox asset folders (`assets/`, `public/`, `static/`, `icons/`, `images/`, `sprites/`, `reference/`) for provided assets, extracts their native `WxH` dimensions and aspect ratios (`W:H`), and blocks the stage if the AI ignored the provided assets (`[IGNORED_PROVIDED_ASSETS]`), hallucinated broken asset paths (`[BROKEN_ASSET_PATH]`), or used dummy placeholder URLs (`placehold.co`).
+  - Capture real screenshots into `research/sandbox/Hxxx_<slug>/visual_captures/`, open and inspect every screenshot with your vision tool (`read_file`), and interrogate the pixels from the **User's View** in `VISUAL_AUDIT.md` (checking for wrong CSS alignment, misfitted/stretched provided assets or icons, displaced data, unloaded assets, and wrong function/image display).
   - Read [visual and user-perspective validation rules](references/visual-and-user-perspective-validation.md).
 
 ### Stage 6: Lab Report, Clean-Slate Recovery & Self-Learning

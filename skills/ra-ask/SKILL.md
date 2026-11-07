@@ -12,6 +12,23 @@ Before stating what a skill does or skipping a step, read that skill's `SKILL.md
 
 ---
 
+## 0. Joining a Mid-Flight, Vibe-Coded, or Polluted Project (`--scan-project` Truth-Path Recovery)
+
+Most projects don't start with RA from day 1 — they arrive half-finished, vibe-coded across multiple AI sessions, or full of hidden band-aids, mocked/fake data, and silent bypasses.
+Whenever you are dropped into an **existing project** where the user isn't sure why things are failing or what previous AI sessions broke, **first run the Truth-Path Project Scanner**:
+```bash
+python "~/.gemini/skills/research-anything/scripts/ra_cheese_audit.py" --workspace "." --scan-project
+```
+This classifies the project (`FRESH_GREENFIELD`, `POLLUTED_VIBE_CODE_NEEDS_TRUTH_PATH`, `UNFINISHED_HALF_WIRED`, or `CLEAN_PRODUCTION_TIER`) and generates **`research/TRUTH_PATH_AUDIT.md`**, exposing:
+1. **Hidden Band-Aids (`[EXPOSED_BANDAID]`)**: `except: pass`, empty `catch {}`, `@ts-ignore` / `type: ignore`, and `setTimeout` race-condition hacks.
+2. **Fake / Mocked / Hardcoded Data (`[EXPOSED_FAKE_DATA]`)**: `mockData`, `fake_data`, `dummyData`, or placeholder arrays left inside production code.
+3. **Data Pollution & Silent Coercion (`[DATA_POLLUTION_*]`)**: Silent `nan_to_num` / `fillna(0)` masking upstream corruption or ground-truth leakage.
+4. **Unfinished Stubs (`[EXPOSED_UNFINISHED_STUB]`)**: `TODO`, `FIXME`, `NotImplementedError`.
+
+Then chain **`/ra-workflow-map`** (lock innocent working functions) $\rightarrow$ **`/ra-systemic-debug`** (replace every exposed band-aid and fake data stub with a real production pipe).
+
+---
+
 ## 1. Just Talk About the Project (No Code Yet)
 
 - **`/ra-talk`** *(User-invoked)* — **Stateful Project Conversation, Grilling & Shared Language**:

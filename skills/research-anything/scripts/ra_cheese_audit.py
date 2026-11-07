@@ -66,6 +66,35 @@ DATA_POLLUTION_PATTERNS = [
     ),
 ]
 
+VIBE_CODE_POLLUTION_PATTERNS = [
+    (
+        re.compile(r"\b(mock_?data|fake_?data|dummy_?data|sample_?data|placeholder_?data|MOCK_[A-Z0-9_]+|FAKE_[A-Z0-9_]+)\b", re.IGNORECASE),
+        "[EXPOSED_FAKE_DATA] Fake/mock/dummy data identifier found in non-test project code. Replace with a real upstream data pipe.",
+    ),
+    (
+        re.compile(r"(#|//)\s*(TODO|FIXME|XXX)\b", re.IGNORECASE),
+        "[EXPOSED_UNFINISHED_STUB] Unfinished `TODO`/`FIXME` stub left in codebase.",
+    ),
+    (
+        re.compile(r"\bNotImplementedError\b"),
+        "[EXPOSED_UNFINISHED_STUB] Hollow `NotImplementedError` stub — wire the real implementation.",
+    ),
+    (
+        re.compile(r"(#\s*type:\s*ignore|//\s*@ts-ignore|//\s*@ts-expect-error)\b"),
+        "[EXPOSED_BANDAID] Type-check bypass (`@ts-ignore` / `type: ignore`) masking broken interface contract.",
+    ),
+    (
+        re.compile(r"\bsetTimeout\s*\([^,]+,\s*\d+\s*\)"),
+        "[EXPOSED_BANDAID] Suspicious `setTimeout(..., delay)` timing band-aid — verify whether this is masking an async race condition.",
+    ),
+]
+
+EXCLUDED_PROJECT_SCAN_DIRS = {
+    ".git", "node_modules", "venv", ".venv", "env", "__pycache__", "dist", "build",
+    "out", ".next", ".nuxt", "target", "vendor", "research", ".agents", ".claude",
+    ".codex", ".gemini", "coverage"
+}
+
 
 def compute_protected_symbol_hash(workspace: Path, spec: str) -> str | None:
     """Compute a deterministic SHA-256 hash of a protected `file:symbol` (or entire file if `:symbol` is omitted)."""
@@ -240,6 +269,105 @@ def emit_cold_eyes_review_brief(
     return brief_path
 
 
+def scan_existing_project_truth_path(workspace: Path, sealed_set: set[str]) -> None:
+    """
+    Scan an existing brownfield / mid-flight / vibe-coded project to expose:
+      1. Symptom-swallowing band-aids (`except: pass`, `@ts-ignore`, timing hacks)
+      2. Fake / mocked / hardcoded data left inside non-test code
+      3. Unfinished hollow stubs (`TODO`, `FIXME`, `NotImplementedError`)
+      4. Data pollution (`nan_to_num`, `fillna(0)`, ground-truth leakage)
+    Writes `research/TRUTH_PATH_AUDIT.md` with a step-by-step Truth-Path Recovery Plan.
+    """
+    rdir = workspace / "research"
+    rdir.mkdir(parents=True, exist_ok=True)
+    report_path = rdir / "TRUTH_PATH_AUDIT.md"
+
+    project_files: List[Path] = []
+    for f in sorted(workspace.rglob("*")):
+        if not f.is_file() or f.suffix.lower() not in CODE_EXTENSIONS:
+            continue
+        try:
+            rel_parts = f.resolve().relative_to(workspace.resolve()).parts
+        except ValueError:
+            continue
+        if any(p in EXCLUDED_PROJECT_SCAN_DIRS for p in rel_parts):
+            continue
+        fname_l = f.name.lower()
+        if fname_l.startswith("test_") or fname_l.endswith(("_test.py", ".test.ts", ".test.js", ".spec.ts", ".spec.js")):
+            continue
+        project_files.append(f)
+
+    exposed_bandaids: List[str] = []
+    exposed_fake_data: List[str] = []
+    exposed_stubs: List[str] = []
+    exposed_pollution: List[str] = []
+
+    for pf in project_files:
+        rel = pf.resolve().relative_to(workspace.resolve()).as_posix()
+        for issue in audit_file(pf, sealed_set, workspace):
+            if "DATA_POLLUTION" in issue:
+                exposed_pollution.append(issue)
+            else:
+                exposed_bandaids.append(issue)
+        try:
+            lines = pf.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            continue
+        for idx, line in enumerate(lines, start=1):
+            for regex, msg in VIBE_CODE_POLLUTION_PATTERNS:
+                if regex.search(line):
+                    entry = f"`{rel}:{idx}`: {msg} -> `{line.strip()}`"
+                    if "EXPOSED_FAKE_DATA" in msg:
+                        exposed_fake_data.append(entry)
+                    elif "EXPOSED_UNFINISHED_STUB" in msg:
+                        exposed_stubs.append(entry)
+                    else:
+                        exposed_bandaids.append(entry)
+
+    total_findings = len(exposed_bandaids) + len(exposed_fake_data) + len(exposed_stubs) + len(exposed_pollution)
+    if not project_files:
+        project_tier = "FRESH_GREENFIELD"
+    elif exposed_bandaids or exposed_fake_data or exposed_pollution:
+        project_tier = "POLLUTED_VIBE_CODE_NEEDS_TRUTH_PATH"
+    elif exposed_stubs:
+        project_tier = "UNFINISHED_HALF_WIRED"
+    else:
+        project_tier = "CLEAN_PRODUCTION_TIER"
+
+    md = (
+        "# RA Truth-Path Project Intake & Pollution Audit (`TRUTH_PATH_AUDIT.md`)\n\n"
+        f"- **Project Health Classification**: `{project_tier}`\n"
+        f"- **Scanned Production Code Files**: `{len(project_files)}`\n"
+        f"- **Total Obstacles Exposed**: `{total_findings}`\n\n"
+        "---\n\n"
+        "## 1. Exposed Band-Aids & Symptom Bypasses (Replace with Upstream Root-Cause Fixes)\n"
+        + ("\n".join(f"- {x}" for x in exposed_bandaids) or "- Zero band-aids detected.")
+        + "\n\n## 2. Exposed Fake / Mocked / Hardcoded Data in Production Code\n"
+        + ("\n".join(f"- {x}" for x in exposed_fake_data) or "- Zero fake/mocked data identifiers detected.")
+        + "\n\n## 3. Exposed Data Pollution & Silent NaN/Null Coercion\n"
+        + ("\n".join(f"- {x}" for x in exposed_pollution) or "- Zero data-pollution patterns detected.")
+        + "\n\n## 4. Exposed Unfinished / Hollow Stubs (`TODO` / `FIXME` / `NotImplementedError`)\n"
+        + ("\n".join(f"- {x}" for x in exposed_stubs) or "- Zero unfinished stubs detected.")
+        + "\n\n---\n\n"
+        "## 5. Truth-Path Recovery Protocol (How the AI Must Fix This Project)\n"
+        "1. **Lock Innocent Working Modules First (`/ra-workflow-map`)**: Before fixing any exposed band-aid, trace `-N` to `+N` hops and register working functions via `ra_gate.py map-context --protected <file:func>`.\n"
+        "2. **Remove Band-Aids & Wire Real Upstream Pipes (`/ra-systemic-debug`)**: Delete every `except: pass`, `@ts-ignore`, and fake data constant above and replace the broken upstream producer at its root cause.\n"
+        "3. **Prove Execution with Deterministic `.log` Traces (`/ra-log-verify`)**: Verify each recovered pipe with `ra_log_engine.py run` and `ra_cheese_audit.py`.\n"
+    )
+    report_path.write_text(md, encoding="utf-8")
+
+    print("=" * 78)
+    print(f"  RA TRUTH-PATH PROJECT INTAKE AUDIT — TIER: {project_tier}")
+    print("=" * 78)
+    print(f"  Scanned Production Files : {len(project_files)}")
+    print(f"  Exposed Band-Aids/Cheese : {len(exposed_bandaids)}")
+    print(f"  Exposed Fake/Mocked Data : {len(exposed_fake_data)}")
+    print(f"  Exposed Data Pollution   : {len(exposed_pollution)}")
+    print(f"  Exposed Unfinished Stubs : {len(exposed_stubs)}")
+    print(f"  Truth-Path Recovery Plan : {report_path.relative_to(workspace).as_posix()}")
+    print("=" * 78)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="RA Automated Anti-Cheese, Data-Pollution & Axiom Seal Auditor")
     parser.add_argument("--workspace", default=".", help="Workspace root directory")
@@ -254,6 +382,11 @@ def main() -> None:
         action="store_true",
         help="Emit research/DATA_POLLUTION_REVIEW_BRIEF.md for a cold-eyes reviewer subagent",
     )
+    parser.add_argument(
+        "--scan-project",
+        action="store_true",
+        help="Scan an existing/mid-flight/vibe-coded project to expose band-aids, fake data, and polluted pipes into research/TRUTH_PATH_AUDIT.md",
+    )
     args = parser.parse_args()
 
     workspace = Path(args.workspace).resolve()
@@ -266,6 +399,10 @@ def main() -> None:
     sealed_axioms: Dict[str, Any] = state.get("sealed_axioms", {})
     sealed_set = set(sealed_axioms.keys())
     protected_hashes: Dict[str, str] = state.get("protected_node_hashes", {})
+
+    if args.scan_project:
+        scan_existing_project_truth_path(workspace, sealed_set)
+        return
 
     violations: List[str] = []
 

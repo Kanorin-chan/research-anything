@@ -442,6 +442,39 @@ def cmd_check_question(args: argparse.Namespace) -> None:
     print("=" * 78)
 
 
+def compute_protected_symbol_hash(workspace: Path, spec: str) -> Optional[str]:
+    """Compute a deterministic SHA-256 hash of a protected `file:symbol` (or entire file if `:symbol` is omitted)."""
+    if ":" in spec:
+        file_part, sym_name = spec.rsplit(":", 1)
+    else:
+        file_part, sym_name = spec, ""
+    fpath = (workspace / file_part).resolve()
+    if not fpath.exists() or not fpath.is_file():
+        return None
+    if not sym_name:
+        return sha256_file(fpath)
+    try:
+        src = fpath.read_text(encoding="utf-8")
+    except Exception:
+        return None
+    if fpath.suffix.lower() == ".py":
+        try:
+            import ast as _ast
+
+            tree = _ast.parse(src)
+            for node in _ast.walk(tree):
+                if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)) and node.name == sym_name:
+                    seg = _ast.get_source_segment(src, node) or _ast.dump(node)
+                    return hashlib.sha256(seg.strip().encode("utf-8")).hexdigest()
+        except Exception:
+            pass
+    pat = re.compile(rf"\b(?:def|function|fn|class|struct)\s+{re.escape(sym_name)}\b.*?(?=\n(?:def|function|fn|class|struct)\s+|\Z)", re.DOTALL)
+    m = pat.search(src)
+    if m:
+        return hashlib.sha256(m.group(0).strip().encode("utf-8")).hexdigest()
+    return None
+
+
 def cmd_map_context(args: argparse.Namespace) -> None:
     workspace = Path(args.workspace).resolve()
     state = load_state(workspace, auto_init=True)
@@ -462,12 +495,17 @@ def cmd_map_context(args: argparse.Namespace) -> None:
             tracked[rel] = sha256_file(fpath)
 
     protected: List[str] = state.get("protected_nodes", [])
+    protected_hashes: Dict[str, str] = state.get("protected_node_hashes", {})
     if args.protected:
         for pnode in args.protected:
             if pnode not in protected:
                 protected.append(pnode)
+            phash = compute_protected_symbol_hash(workspace, pnode)
+            if phash:
+                protected_hashes[pnode] = phash
 
     state["protected_nodes"] = protected
+    state["protected_node_hashes"] = protected_hashes
     state["context_map_snapshot"] = {
         "agent": agent_id,
         "timestamp": ts,

@@ -164,55 +164,55 @@ def install_skill_dir_safe(src_skill: Path, dst_skill: Path, is_repo_root: bool 
         copy_skill_tree(src_skill, dst_skill)
 
 
-def install_suite_to_base(dist_skills_base: Path, target_skills_base: Path, repo_root: Path) -> None:
+def install_suite_to_base(
+    skills_root: Path, target_skills_base: Path, repo_root: Path, script_base: str
+) -> None:
     target_skills_base.mkdir(parents=True, exist_ok=True)
     for sname in ALL_SKILLS:
-        src_s = dist_skills_base / sname
+        src_s = skills_root / sname
         if not src_s.exists():
             continue
         dst_s = target_skills_base / sname
         is_root = dst_s.resolve() == repo_root.resolve()
         install_skill_dir_safe(src_s, dst_s, is_repo_root=is_root)
+        if not is_root and not (dst_s / ".git").exists():
+            rewrite_skill_paths(dst_s, script_base)
 
 
 def install_global(repo_root: Path, target: str) -> None:
+    sync_root_to_canonical_skill(repo_root)
     home = Path.home()
-    dist_root = repo_root / "distributions"
+    skills_root = repo_root / "skills"
 
     if target in ("opencode", "all"):
-        src_base = dist_root / "opencode" / ".agents" / "skills"
         dst1 = home / ".agents" / "skills"
         dst2 = home / ".config" / "opencode" / "skills"
-        install_suite_to_base(src_base, dst1, repo_root)
-        install_suite_to_base(src_base, dst2, repo_root)
+        install_suite_to_base(skills_root, dst1, repo_root, "~/.agents/skills/research-anything")
+        install_suite_to_base(skills_root, dst2, repo_root, "~/.agents/skills/research-anything")
         print(f"[RA INSTALLER] Installed {len(ALL_SKILLS)} skills for OpenCode     -> {dst1} & {dst2}")
 
     if target in ("claude", "all"):
-        src_base = dist_root / "claude" / ".claude" / "skills"
         dst = home / ".claude" / "skills"
-        install_suite_to_base(src_base, dst, repo_root)
+        install_suite_to_base(skills_root, dst, repo_root, "~/.claude/skills/research-anything")
         print(f"[RA INSTALLER] Installed {len(ALL_SKILLS)} skills for Claude Code  -> {dst}")
 
     if target in ("codex", "all"):
-        src_base = dist_root / "codex" / ".agents" / "skills"
         dst1 = home / ".agents" / "skills"
         dst2 = home / ".codex" / "skills"
-        install_suite_to_base(src_base, dst1, repo_root)
-        install_suite_to_base(src_base, dst2, repo_root)
+        install_suite_to_base(skills_root, dst1, repo_root, "~/.agents/skills/research-anything")
+        install_suite_to_base(skills_root, dst2, repo_root, "~/.agents/skills/research-anything")
         print(f"[RA INSTALLER] Installed {len(ALL_SKILLS)} skills for Codex        -> {dst1} & {dst2}")
 
     if target in ("antigravity", "all"):
-        src_base = dist_root / "antigravity" / ".agents" / "skills"
         dst1 = home / ".agents" / "skills"
         dst2 = home / ".gemini" / "config" / "skills"
-        install_suite_to_base(src_base, dst1, repo_root)
-        install_suite_to_base(src_base, dst2, repo_root)
+        install_suite_to_base(skills_root, dst1, repo_root, "~/.agents/skills/research-anything")
+        install_suite_to_base(skills_root, dst2, repo_root, "~/.agents/skills/research-anything")
         print(f"[RA INSTALLER] Installed {len(ALL_SKILLS)} skills for Antigravity  -> {dst1} & {dst2}")
 
     if target in ("gemini", "all"):
-        src_base = dist_root / "gemini" / ".gemini" / "skills"
         dst = home / ".gemini" / "skills"
-        install_suite_to_base(src_base, dst, repo_root)
+        install_suite_to_base(skills_root, dst, repo_root, "~/.gemini/skills/research-anything")
         print(f"[RA INSTALLER] Installed {len(ALL_SKILLS)} skills for Gemini CLI   -> {dst}")
 
 
@@ -224,13 +224,14 @@ def main() -> None:
         "--target",
         choices=["all", "opencode", "claude", "codex", "antigravity", "gemini", "dist-only"],
         default="all",
-        help="Target agent platform to install globally (or dist-only to just build distributions/)",
+        help="Target agent platform to install globally (or dist-only to build optional distributions/)",
     )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent
-    build_distributions(repo_root)
-    if args.target != "dist-only":
+    if args.target == "dist-only":
+        build_distributions(repo_root)
+    else:
         install_global(repo_root, args.target)
 
 

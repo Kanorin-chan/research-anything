@@ -9,6 +9,7 @@ __pycache__/
 Thumbs.db
 Desktop.ini
 
-# Local test artifacts
+# Local test artifacts & generated distributions
 research/
 .scratch/
+distributions/

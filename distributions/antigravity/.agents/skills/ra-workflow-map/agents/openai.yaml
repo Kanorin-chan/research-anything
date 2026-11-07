@@ -1,3 +1,0 @@
-interface:
-  display_name: "RA Workflow & Blast-Radius Mapper"
-  short_description: "Map -N to +N hop workflows, lock PROTECTED_WORKING nodes and BC-xxx contracts in WORKFLOW_MAP.md"

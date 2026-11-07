@@ -1,3 +1,0 @@
-interface:
-  display_name: "RA Anti-Cheese, Axiom Seal & Guardrail Forge"
-  short_description: "Seal axioms, scan for hardcoded lookup tables/band-aids, and forge project_harness.py + ra-reviewer"

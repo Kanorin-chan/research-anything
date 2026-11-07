@@ -55,6 +55,48 @@ BANDAID_REGEX_PATTERNS = [
     ),
 ]
 
+DATA_POLLUTION_PATTERNS = [
+    (
+        re.compile(r"\b(ground_truth|golden_output|expected_results|benchmark_answers|eval_labels)\b", re.IGNORECASE),
+        "[DATA_POLLUTION_LEAK] Production/model code references ground-truth or evaluation answer identifiers. Keep eval ground truth strictly inside break-test harnesses (`break_tests.*`).",
+    ),
+    (
+        re.compile(r"\b(nan_to_num|fillna\s*\(\s*0)\b"),
+        "[DATA_POLLUTION_MASKING] Silent `nan_to_num` / `fillna(0)` coerces corrupted upstream NaN/Null values into synthetic zeros, polluting downstream data. Fix the upstream producer instead.",
+    ),
+]
+
+
+def compute_protected_symbol_hash(workspace: Path, spec: str) -> str | None:
+    """Compute a deterministic SHA-256 hash of a protected `file:symbol` (or entire file if `:symbol` is omitted)."""
+    if ":" in spec:
+        file_part, sym_name = spec.rsplit(":", 1)
+    else:
+        file_part, sym_name = spec, ""
+    fpath = (workspace / file_part).resolve()
+    if not fpath.exists() or not fpath.is_file():
+        return None
+    if not sym_name:
+        return sha256_file(fpath)
+    try:
+        src = fpath.read_text(encoding="utf-8")
+    except Exception:
+        return None
+    if fpath.suffix.lower() == ".py":
+        try:
+            tree = ast.parse(src)
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == sym_name:
+                    seg = ast.get_source_segment(src, node) or ast.dump(node)
+                    return hashlib.sha256(seg.strip().encode("utf-8")).hexdigest()
+        except Exception:
+            pass
+    pat = re.compile(rf"\b(?:def|function|fn|class|struct)\s+{re.escape(sym_name)}\b.*?(?=\n(?:def|function|fn|class|struct)\s+|\Z)", re.DOTALL)
+    m = pat.search(src)
+    if m:
+        return hashlib.sha256(m.group(0).strip().encode("utf-8")).hexdigest()
+    return None
+
 
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -129,7 +171,9 @@ def audit_file(fpath: Path, sealed_rel_paths: set[str], workspace: Path) -> List
     issues: List[str] = []
     rel = fpath.resolve().relative_to(workspace.resolve()).as_posix()
     is_sealed = rel in sealed_rel_paths
-    is_sdk_helper = fpath.name.lower() in {"ra_logger.py", "ra_logger.js", "ralogger.php"}
+    fname_lower = fpath.name.lower()
+    is_sdk_helper = fname_lower in {"ra_logger.py", "ra_logger.js", "ralogger.php"}
+    is_break_test = is_sdk_helper or "break_test" in fname_lower or fname_lower.startswith("test_")
 
     try:
         text = fpath.read_text(encoding="utf-8")
@@ -143,15 +187,61 @@ def audit_file(fpath: Path, sealed_rel_paths: set[str], workspace: Path) -> List
         for regex, msg in BANDAID_REGEX_PATTERNS:
             if regex.search(line):
                 issues.append(f"{rel}:{idx}: {msg} -> `{line.strip()}`")
+        if not is_break_test and not is_sealed:
+            for regex, msg in DATA_POLLUTION_PATTERNS:
+                if regex.search(line):
+                    issues.append(f"{rel}:{idx}: {msg} -> `{line.strip()}`")
 
     if fpath.suffix.lower() == ".py" and not is_sealed:
-        issues.extend(audit_python_ast(fpath, text, is_sdk_helper))
+        issues.extend(audit_python_ast(fpath, text, is_break_test))
 
     return issues
 
 
+def emit_cold_eyes_review_brief(
+    workspace: Path, code_files: List[Path], protected_hashes: Dict[str, str], violations: List[str]
+) -> Path:
+    rdir = workspace / "research"
+    rdir.mkdir(parents=True, exist_ok=True)
+    brief_path = rdir / "DATA_POLLUTION_REVIEW_BRIEF.md"
+
+    clamp_re = re.compile(r"\b(np\.clip|torch\.clamp|Math\.clamp|min\s*\(|max\s*\(|fillna|nan_to_num)\b")
+    mutation_re = re.compile(r"\b(global\s+\w+|\w+\[[^\]]+\]\s*=|\.pop\s*\(|\.clear\s*\()")
+
+    clamp_hits: List[str] = []
+    mutation_hits: List[str] = []
+
+    for cf in code_files:
+        rel = cf.resolve().relative_to(workspace.resolve()).as_posix()
+        try:
+            lines = cf.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            continue
+        for idx, line in enumerate(lines, start=1):
+            if clamp_re.search(line):
+                clamp_hits.append(f"- `{rel}:{idx}`: `{line.strip()}`")
+            if mutation_re.search(line):
+                mutation_hits.append(f"- `{rel}:{idx}`: `{line.strip()}`")
+
+    brief_md = (
+        "# Cold-Eyes Semantic & Data-Pollution Review Brief\n\n"
+        "> **Reviewer Mandate**: Inspect the hotspots below for **semantic band-aids** (rescaling/clamping outputs to hide upstream bugs) and **polluted data** (mutating shared input structures, leaking eval/test distributions, or silently coercing `NaN`/`Null` into `0`).\n\n"
+        "## 1. Protected Working Nodes (`Symptom != Culprit` Lock)\n"
+        + ("\n".join(f"- `{k}` (`SHA-256: {v[:12]}...`)" for k, v in protected_hashes.items()) or "- None registered")
+        + "\n\n## 2. Numeric Clamping / Rescaling / Coercion Hotspots (Check for Semantic Band-Aids)\n"
+        + ("\n".join(clamp_hits[:40]) or "- None detected")
+        + "\n\n## 3. State & In-Place Input Mutation Hotspots (Check for Upstream Data Pollution)\n"
+        + ("\n".join(mutation_hits[:40]) or "- None detected")
+        + "\n\n## 4. Automated AST & Axiom Violations\n"
+        + ("\n".join(f"- {v}" for v in violations) or "- Zero syntactic/AST violations")
+        + "\n"
+    )
+    brief_path.write_text(brief_md, encoding="utf-8")
+    return brief_path
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="RA Automated Anti-Cheese & Axiom Seal Auditor")
+    parser = argparse.ArgumentParser(description="RA Automated Anti-Cheese, Data-Pollution & Axiom Seal Auditor")
     parser.add_argument("--workspace", default=".", help="Workspace root directory")
     parser.add_argument(
         "--hypothesis",
@@ -159,6 +249,11 @@ def main() -> None:
         help="Active hypothesis folder name (e.g., H001_slug) or STANDALONE for partial mode",
     )
     parser.add_argument("--files", nargs="*", default=[], help="Optional explicit files to audit in standalone mode")
+    parser.add_argument(
+        "--emit-review-brief",
+        action="store_true",
+        help="Emit research/DATA_POLLUTION_REVIEW_BRIEF.md for a cold-eyes reviewer subagent",
+    )
     args = parser.parse_args()
 
     workspace = Path(args.workspace).resolve()
@@ -170,6 +265,7 @@ def main() -> None:
     )
     sealed_axioms: Dict[str, Any] = state.get("sealed_axioms", {})
     sealed_set = set(sealed_axioms.keys())
+    protected_hashes: Dict[str, str] = state.get("protected_node_hashes", {})
 
     violations: List[str] = []
 
@@ -186,6 +282,20 @@ def main() -> None:
                     f"AXIOM SEAL VIOLATION: `{rel_path}` was modified! Expected SHA-256 {expected[:12]}..., "
                     f"got {actual[:12]}... Never sneak hardcoded data into sealed axioms!"
                 )
+
+    # 1b. Verify cryptographic lock on all PROTECTED_WORKING innocent nodes (`Symptom != Culprit`)
+    for pnode, expected_phash in protected_hashes.items():
+        actual_phash = compute_protected_symbol_hash(workspace, pnode)
+        if actual_phash is None:
+            violations.append(
+                f"[PROTECTED_NODE_TAMPERED] Innocent `PROTECTED_WORKING` node `{pnode}` was deleted or renamed!"
+            )
+        elif actual_phash != expected_phash:
+            violations.append(
+                f"[PROTECTED_NODE_TAMPERED] Innocent `PROTECTED_WORKING` node `{pnode}` was modified "
+                f"(expected SHA-256 {expected_phash[:12]}..., got {actual_phash[:12]}...)! "
+                f"Symptom != Culprit: revert `{pnode}` and fix the upstream culprit instead."
+            )
 
     # 2. Scan sandbox files for the target hypothesis (or explicit/tracked files in standalone mode)
     sandbox_dir = rdir / "sandbox" / args.hypothesis
@@ -213,12 +323,19 @@ def main() -> None:
     for cf in code_files:
         violations.extend(audit_file(cf, sealed_set, workspace))
 
+    brief_path = None
+    if args.emit_review_brief:
+        brief_path = emit_cold_eyes_review_brief(workspace, code_files, protected_hashes, violations)
+
     print("=" * 78)
-    print(f"  RA ANTI-CHEESE & AXIOM SEAL AUDIT — HYPOTHESIS: {args.hypothesis}")
+    print(f"  RA ANTI-CHEESE, DATA-POLLUTION & AXIOM SEAL AUDIT — HYPOTHESIS: {args.hypothesis}")
     print("=" * 78)
     print(f"  Audited Code Files  : {len(code_files)}")
+    print(f"  Protected Nodes     : {len(protected_hashes)}")
     print(f"  Sealed Axiom Files  : {len(sealed_axioms)}")
     print(f"  Violations Found    : {len(violations)}")
+    if brief_path:
+        print(f"  Review Brief Out    : {brief_path.relative_to(workspace).as_posix()}")
     print("-" * 78)
 
     if violations:

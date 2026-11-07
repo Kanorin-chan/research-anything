@@ -193,6 +193,82 @@ def evict_snapshot_internal(workspace: Path, reg: Dict[str, Any], snap_id: str, 
         src_md.rename(dest_md)
 
 
+def auto_discover_native_session_id(workspace: Path, platform: str) -> Optional[str]:
+    """
+    Auto-discover the active native session ID for OpenCode, Claude Code, or Codex
+    when `--base-session` is not explicitly provided, enabling true native `/fork`
+    (`opencode run --session <id> --fork`, `claude --resume <id> --fork-session`,
+    `codex exec resume <id>`) without manual copy-paste.
+    """
+    # 1. Check explicit environment variables first
+    for env_key in ("OPENCODE_SESSION_ID", "OPENCODE_SESSION", "CLAUDE_SESSION_ID", "CODEX_SESSION_ID"):
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            return val
+
+    home = Path.home()
+    ws_str = str(workspace.resolve())
+
+    # 2. OpenCode CLI session auto-discovery (`opencode session list --format json -n 5`)
+    if platform == "opencode" and shutil.which("opencode"):
+        try:
+            proc = subprocess.run(
+                ["opencode", "session", "list", "--format", "json", "-n", "5"],
+                cwd=ws_str,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=3.0,
+            )
+            if proc.returncode == 0 and proc.stdout.strip().startswith("["):
+                items = json.loads(proc.stdout)
+                for item in items:
+                    if isinstance(item, dict) and item.get("id"):
+                        item_dir = str(item.get("directory", ""))
+                        if not item_dir or Path(item_dir).resolve() == workspace.resolve():
+                            return str(item["id"])
+                if items and isinstance(items[0], dict) and items[0].get("id"):
+                    return str(items[0]["id"])
+        except Exception:
+            pass
+
+    # 3. Claude Code session auto-discovery (`~/.claude/projects/<encoded-workspace>/<uuid>.jsonl`)
+    if platform == "claude":
+        claude_projects = home / ".claude" / "projects"
+        if claude_projects.exists():
+            encoded_ws = re.sub(r"[^a-zA-Z0-9]", "-", ws_str)
+            candidate_dirs = [claude_projects / encoded_ws]
+            if not candidate_dirs[0].exists():
+                ws_name = workspace.name.lower()
+                candidate_dirs = [
+                    d for d in claude_projects.iterdir() if d.is_dir() and ws_name in d.name.lower()
+                ]
+            jsonl_files: List[Path] = []
+            for cdir in candidate_dirs:
+                if cdir.exists():
+                    jsonl_files.extend(f for f in cdir.glob("*.jsonl") if f.is_file())
+            if jsonl_files:
+                newest = max(jsonl_files, key=lambda p: p.stat().st_mtime)
+                return newest.stem
+
+    # 4. OpenAI Codex rollout session auto-discovery (`~/.codex/sessions/**/rollout-*-<uuid>.jsonl`)
+    if platform == "codex":
+        codex_sessions = home / ".codex" / "sessions"
+        if codex_sessions.exists():
+            rollouts = list(codex_sessions.rglob("rollout-*.jsonl"))
+            if rollouts:
+                newest = max(rollouts, key=lambda p: p.stat().st_mtime)
+                m = re.search(
+                    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$",
+                    newest.stem,
+                )
+                if m:
+                    return m.group(1)
+
+    return None
+
+
 def build_platform_fork_instructions(
     platform: str,
     subagent_name: str,
@@ -200,49 +276,62 @@ def build_platform_fork_instructions(
     rel_report_file: str,
     base_session_id: Optional[str],
     model: Optional[str],
+    workspace: Optional[Path] = None,
 ) -> Dict[str, str]:
     """Generate exact context-forking commands/calls for OpenCode, Claude Code, Codex, and Antigravity/Gemini."""
     oc_model_flag = f'--model "{model}" ' if model else ""
     codex_model_flag = f'-m "{model}" ' if model else ""
-    if base_session_id:
+
+    oc_session = base_session_id or (auto_discover_native_session_id(workspace, "opencode") if workspace else None)
+    claude_session = base_session_id or (auto_discover_native_session_id(workspace, "claude") if workspace else None)
+    codex_session = base_session_id or (auto_discover_native_session_id(workspace, "codex") if workspace else None)
+
+    if oc_session:
         opencode_cmd = (
-            f'opencode run --session "{base_session_id}" --fork --title "{subagent_name}" '
+            f'opencode run --session "{oc_session}" --fork --title "{subagent_name}" '
             f'{oc_model_flag}--auto -f "{rel_fork_file}" '
             f'"Execute the bounded task in {rel_fork_file} and write your findings to {rel_report_file}."'
-        )
-        claude_cmd = (
-            f'claude --resume "{base_session_id}" --fork-session '
-            f'-p "Read {rel_fork_file}, execute ONLY the bounded task, and write your report to {rel_report_file}."'
-        )
-        codex_cmd = (
-            f'codex exec resume "{base_session_id}" {codex_model_flag}--full-auto '
-            f'"Read {rel_fork_file} (shared forked context snapshot). Do NOT re-read already-summarized files. '
-            f'Execute ONLY the bounded task and write your report to {rel_report_file}."'
         )
     else:
         opencode_cmd = (
             f'opencode run --title "{subagent_name}" {oc_model_flag}--auto -f "{rel_fork_file}" '
             f'"Execute the bounded task in {rel_fork_file} and write your findings to {rel_report_file}."'
         )
+
+    if claude_session:
+        claude_cmd = (
+            f'claude --resume "{claude_session}" --fork-session '
+            f'-p "Read {rel_fork_file}, execute ONLY the bounded task, and write your report to {rel_report_file}."'
+        )
+    else:
         claude_cmd = (
             f'Task(subagent_type="general-purpose", description="{subagent_name}", '
-            f'prompt="Read {rel_fork_file} (shared forked context snapshot). Do NOT re-read already-summarized files. '
+            f'prompt="Read {rel_fork_file} (KV-cache prefix-aligned snapshot). Do NOT re-read already-summarized files. '
             f'Execute ONLY the bounded task and write your report to {rel_report_file}.")'
         )
+
+    if codex_session:
         codex_cmd = (
-            f'codex exec {codex_model_flag}--full-auto '
+            f'codex exec resume "{codex_session}" {codex_model_flag}--full-auto '
+            f'"Read {rel_fork_file} (shared forked context snapshot). Do NOT re-read already-summarized files. '
+            f'Execute ONLY the bounded task and write your report to {rel_report_file}."'
+        )
+    else:
+        codex_cmd = (
+            f'codex exec resume --last {codex_model_flag}--full-auto '
             f'"Read {rel_fork_file} (shared forked context snapshot). Do NOT re-read already-summarized files. '
             f'Execute ONLY the bounded task and write your report to {rel_report_file}."'
         )
 
     agy_cmd = (
         f'invoke_subagent(TypeName="self", Role="{subagent_name}", Workspace="inherit", '
-        f'Prompt="Read {rel_fork_file} (shared forked context snapshot). Do NOT re-read already-summarized files. '
+        f'Prompt="Read {rel_fork_file} (KV-cache prefix-aligned snapshot). Do NOT re-read already-summarized files. '
         f'Execute ONLY the bounded task and write your report to {rel_report_file}.")'
     )
 
     return {
         "active_platform": platform,
+        "discovered_session_id": base_session_id or oc_session or claude_session or codex_session or "KV_PREFIX_ALIGNED",
         "opencode": opencode_cmd,
         "claude": claude_cmd,
         "codex": codex_cmd,
@@ -414,35 +503,42 @@ def cmd_fork(args: argparse.Namespace) -> None:
     rel_report = report_file.relative_to(workspace).as_posix()
 
     dispatch_cmds = build_platform_fork_instructions(
-        platform, subagent_name, rel_fork, rel_report, base_session_id, args.model
+        platform, subagent_name, rel_fork, rel_report, base_session_id, args.model, workspace=workspace
     )
 
+    # IMPORTANT HARDWARE KV-CACHE PREFIX OPTIMIZATION:
+    # Section 1 (Token 0..N) MUST be 100% byte-identical across Subagent_A, Subagent_B, etc.
+    # so that llama.cpp (`--cache-reuse`), OpenAI Prefix Caching, Anthropic Prompt Caching,
+    # and Gemini Context Caching reuse the pre-computed GPU KV-cache without recomputation.
+    # All dynamic per-subagent fields (subagent_name, timestamp, task_desc) go in Section 2 at the suffix!
     fork_packet = (
-        f"# Forked Subagent Execution Brief — `{subagent_name}`\n\n"
+        "# RA SHARED CONTEXT SNAPSHOT PREFIX (IMMUTABLE KV-CACHE PREFIX)\n\n"
+        "> **Strict Subagent Context-Control Rules**:\n"
+        "> 1. **Do NOT re-read files already summarized in Section 1** — this context was forked to you so you do not waste tokens re-discovering the project.\n"
+        "> 2. **Do NOT touch any `PROTECTED_WORKING` function (`Symptom != Culprit`)**.\n"
+        "> 3. **Execute ONLY your bounded task in Section 2 and write your report to the required output path.**\n\n"
+        "## 1. Inherited Context Snapshots (`/fork` Shared State — Byte-Identical Prefix)\n\n"
+        + "\n\n---\n\n".join(compiled_sections)
+        + "\n\n---\n\n"
+        f"## 2. Ephemeral Subagent Task Suffix — `{subagent_name}`\n\n"
+        f"- **Subagent Identifier**: `{subagent_name}`\n"
         f"- **Forked Timestamp**: `{now_iso()}`\n"
         f"- **Target Platform**: `{platform}` (`opencode` | `claude` | `codex` | `agy`)\n"
         f"- **Concurrency / Baton Mode**: `1-CONCURRENCY BATON PASS` (Main Agent is IDLE waiting for your report)\n"
         f"- **Task Classification**: `{task_type}`\n"
         f"- **Inherited Context Snapshots**: {', '.join(f'`{s}`' for s in requested_ids)}\n"
         f"- **Required Report Output Path**: `{rel_report}`\n\n"
-        f"---\n\n"
-        f"## 1. Your Bounded Task Assignment\n"
-        f"{task_desc}\n\n"
-        f"> **Strict Subagent Context-Control Rules**:\n"
-        f"> 1. **Do NOT re-read files already summarized in Section 2** — this context was forked to you so you do not waste tokens re-discovering the project.\n"
-        f"> 2. **Do NOT touch any `PROTECTED_WORKING` function (`Symptom != Culprit`)**.\n"
-        f"> 3. **Write your concise evidence-backed report to `{rel_report}`** and stop immediately so the Main Agent can verify your work and reclaim the baton.\n\n"
-        f"---\n\n"
-        f"## 2. Inherited Context Snapshots (`/fork` Shared State)\n\n"
-        + "\n\n---\n\n".join(compiled_sections)
+        f"### Bounded Task Assignment\n"
+        f"{task_desc}\n"
     )
     fork_file.write_text(fork_packet, encoding="utf-8")
 
     print("=" * 78)
     print(f"  RA CONTEXT FORK READY -> SUBAGENT: `{subagent_name}` (PLATFORM: {platform.upper()})")
     print("=" * 78)
-    print(f"  Forked Brief File   : {rel_fork}")
+    print(f"  Forked Brief File   : {rel_fork} (Token 0..N Prefix-Cache Aligned)")
     print(f"  Subagent Report Out : {rel_report}")
+    print(f"  Native Session Fork : {dispatch_cmds['discovered_session_id']}")
     print(f"  Inherited Snapshots : {', '.join(requested_ids)}")
     print(f"  Task Classification : {task_type}")
     print(f"  Active Execution    : BATON PASSED TO `{subagent_name}` (Main Agent waits for report)")

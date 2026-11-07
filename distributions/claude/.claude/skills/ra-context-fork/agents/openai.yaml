@@ -1,3 +1,0 @@
-interface:
-  display_name: "RA Context Fork, Baton & Handoff"
-  short_description: "Read-Once -> Fork-Many snapshots, 1-concurrency subagent baton, and cross-harness handoff (opencode/claude/codex/agy)"

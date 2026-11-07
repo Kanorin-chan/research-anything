@@ -14,9 +14,16 @@ Never read only the target function and its immediate caller/callee. Trace the c
 - **Hop `0` (Target / Accused Node)**: The function under investigation.
 - **Hop `+1`..`+N` (Downstream Consumers & Multi-Cycle Loopback)**: What consumes the output and what happens on subsequent cycles/frames.
 
-## 2. Prove Culprit vs. Innocent Victim (`Symptom != Culprit`)
-- Verify whether working functions along the chain are innocent victims receiving corrupted upstream state.
-- Mark every verified innocent function as **`PROTECTED_WORKING`** so neither you nor any subagent modifies it.
+## 2. Prove Culprit vs. Innocent Victim (`Symptom != Culprit` — Zero-Trust Runtime Innocence)
+- **Never mark a function `PROTECTED_WORKING` by static code-reading alone** (disguised bugs and coupled illusions look clean in source code). Every node starts as **`SUSPECT`** until its runtime `[RA_LOG]` input $\rightarrow$ output boundary is verified.
+- Mark every runtime-verified innocent function as **`PROTECTED_WORKING`** (`--protected <file:func>`) so neither you nor any subagent modifies it.
+- **Forensic Lock Revocation (`--revoke-protected`)**: If `Function A` passed initially only because `Function B` fed it fake/simplified data, and after fixing `Function B` to pass **real production data**, `[RA_LOG]` proves `Function A` cannot handle the real data contract, unlock `Function A` with forensic evidence:
+  ```bash
+  python "~/.gemini/skills/research-anything/scripts/ra_gate.py" map-context \
+    --workspace "." \
+    --revoke-protected <file:Function_A> \
+    --revoke-reason "After fixing Function_B to pass real data, [RA_LOG] proves Function_A fails on real schema"
+  ```
 
 ## 3. Lock Existing Behavioral Contracts (`BC-001`, `BC-002`...)
 - Explicitly list every existing working guarantee in `research/WORKFLOW_MAP.md` (`- **BC-001**: ...`) so fixing or adding one feature never causes a whack-a-mole regression elsewhere.

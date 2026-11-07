@@ -33,15 +33,22 @@ When exploring the codebase, read `GLOSSARY.md`, `research/INVARIANTS.md`, and `
 Never inspect only the crash line or the function the user accused. Call the Skill tool with `"ra-workflow-map"` (or populate `research/WORKFLOW_MAP.md` directly) to trace:
 `Upstream Producers (-N hops) -> Shared State / Ledgers -> Accused Node (Hop 0) -> Downstream Consumers (+N hops) -> Multi-Cycle Loopback`.
 
-1. **Prove Culprit vs. Innocent Victim (`Symptom != Culprit`)**:
-   - Even if the user says *"Function A is broken!"*, verify via `.log` state deltas whether `Function A` is actually working properly and receiving corrupted state from `Function C` upstream.
-   - Lock every verified innocent function as **`PROTECTED_WORKING`** so you never mutate working code while fixing the culprit:
+1. **Prove Culprit vs. Innocent Victim (`Symptom != Culprit` — Zero-Trust Runtime Innocence)**:
+   - **Never mark a function `PROTECTED_WORKING` just by reading its code statically** (a subtle bug or backdoor always looks legit in source code). Every node starts as **`SUSPECT`** until its runtime `[RA_LOG]` input $\rightarrow$ output boundary and zero hidden side-effects are verified.
+   - Lock every runtime-verified innocent function as **`PROTECTED_WORKING`** (`ra_gate.py` hashes its AST and blocks any function containing internal band-aids or fake data):
      ```bash
      python "~/.gemini/skills/research-anything/scripts/ra_gate.py" map-context \
        --workspace "." \
        --agent "DEBUGGER" \
        --files <mapped_files...> \
        --protected <file:innocent_func...>
+     ```
+   - **Forensic Lock Revocation (`--revoke-protected`) for Coupled Illusions**: If `Function A` passed initially only because `Function B` was feeding it fake/simplified/clamped data, and after you fix `Function B` to send **real production data**, `[RA_LOG]` proves `Function A` cannot handle the real data contract, formally revoke `Function A`'s lock with `.log` evidence before repairing `Function A`:
+     ```bash
+     python "~/.gemini/skills/research-anything/scripts/ra_gate.py" map-context \
+       --workspace "." \
+       --revoke-protected <file:Function_A> \
+       --revoke-reason "After fixing Function_B to pass real data, [RA_LOG] proves Function_A fails on real schema"
      ```
 2. **Lock Existing Behavioral Contracts (`BC-001`, `BC-002`...)**:
    - Record all existing working behaviors connected to the flow in `research/WORKFLOW_MAP.md` so fixing this bug never causes a secondary whack-a-mole regression elsewhere.

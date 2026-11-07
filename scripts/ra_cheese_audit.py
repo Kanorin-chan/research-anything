@@ -425,13 +425,16 @@ def main() -> None:
         actual_phash = compute_protected_symbol_hash(workspace, pnode)
         if actual_phash is None:
             violations.append(
-                f"[PROTECTED_NODE_TAMPERED] Innocent `PROTECTED_WORKING` node `{pnode}` was deleted or renamed!"
+                f"[PROTECTED_NODE_TAMPERED] Innocent `PROTECTED_WORKING` node `{pnode}` was deleted or renamed! "
+                f"(If real data exposed `{pnode}` as corrupted, unlock it first via `ra_gate.py map-context --revoke-protected {pnode} --revoke-reason \"...\"`)."
             )
         elif actual_phash != expected_phash:
             violations.append(
                 f"[PROTECTED_NODE_TAMPERED] Innocent `PROTECTED_WORKING` node `{pnode}` was modified "
                 f"(expected SHA-256 {expected_phash[:12]}..., got {actual_phash[:12]}...)! "
-                f"Symptom != Culprit: revert `{pnode}` and fix the upstream culprit instead."
+                f"If `{pnode}` is an innocent bystander (`Symptom != Culprit`), revert it immediately. "
+                f"If fixing an upstream pipe to pass REAL data exposed that `{pnode}` could only handle old fake/band-aid data, "
+                f"forensically unlock it first via `ra_gate.py map-context --revoke-protected {pnode} --revoke-reason \"<[RA_LOG] proof>\"`."
             )
 
     # 2. Scan sandbox files for the target hypothesis (or explicit/tracked files in standalone mode)

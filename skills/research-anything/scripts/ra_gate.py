@@ -14,10 +14,11 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 STAGES = [
     "STAGE_0_INTAKE_AND_SYNC",
@@ -442,8 +443,8 @@ def cmd_check_question(args: argparse.Namespace) -> None:
     print("=" * 78)
 
 
-def compute_protected_symbol_hash(workspace: Path, spec: str) -> Optional[str]:
-    """Compute a deterministic SHA-256 hash of a protected `file:symbol` (or entire file if `:symbol` is omitted)."""
+def extract_symbol_source_segment(workspace: Path, spec: str) -> Optional[str]:
+    """Extract the source text of `file:symbol` (or entire file if `:symbol` is omitted)."""
     if ":" in spec:
         file_part, sym_name = spec.rsplit(":", 1)
     else:
@@ -451,12 +452,12 @@ def compute_protected_symbol_hash(workspace: Path, spec: str) -> Optional[str]:
     fpath = (workspace / file_part).resolve()
     if not fpath.exists() or not fpath.is_file():
         return None
-    if not sym_name:
-        return sha256_file(fpath)
     try:
         src = fpath.read_text(encoding="utf-8")
     except Exception:
         return None
+    if not sym_name:
+        return src
     if fpath.suffix.lower() == ".py":
         try:
             import ast as _ast
@@ -464,15 +465,33 @@ def compute_protected_symbol_hash(workspace: Path, spec: str) -> Optional[str]:
             tree = _ast.parse(src)
             for node in _ast.walk(tree):
                 if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)) and node.name == sym_name:
-                    seg = _ast.get_source_segment(src, node) or _ast.dump(node)
-                    return hashlib.sha256(seg.strip().encode("utf-8")).hexdigest()
+                    return _ast.get_source_segment(src, node) or _ast.dump(node)
         except Exception:
             pass
-    pat = re.compile(rf"\b(?:def|function|fn|class|struct)\s+{re.escape(sym_name)}\b.*?(?=\n(?:def|function|fn|class|struct)\s+|\Z)", re.DOTALL)
+    pat = re.compile(
+        rf"\b(?:def|function|fn|class|struct)\s+{re.escape(sym_name)}\b.*?(?=\n(?:def|function|fn|class|struct)\s+|\Z)",
+        re.DOTALL,
+    )
     m = pat.search(src)
     if m:
-        return hashlib.sha256(m.group(0).strip().encode("utf-8")).hexdigest()
+        return m.group(0)
     return None
+
+
+def compute_protected_symbol_hash(workspace: Path, spec: str) -> Optional[str]:
+    """Compute a deterministic SHA-256 hash of a protected `file:symbol` (or entire file if `:symbol` is omitted)."""
+    seg = extract_symbol_source_segment(workspace, spec)
+    if seg is None:
+        return None
+    return hashlib.sha256(seg.strip().encode("utf-8")).hexdigest()
+
+
+SUSPICIOUS_INNOCENCE_RE = re.compile(
+    r"(except\s*(?:Exception|BaseException)?\s*:\s*pass\b|catch\s*\([^)]*\)\s*\{\s*\}|"
+    r"\b(?:mock_?data|fake_?data|dummy_?data|nan_to_num|NotImplementedError)\b|"
+    r"(?:#|//)\s*(?:TODO|FIXME|hack|band-?aid|hardcoded)\b)",
+    re.IGNORECASE,
+)
 
 
 def cmd_map_context(args: argparse.Namespace) -> None:
@@ -496,8 +515,57 @@ def cmd_map_context(args: argparse.Namespace) -> None:
 
     protected: List[str] = state.get("protected_nodes", [])
     protected_hashes: Dict[str, str] = state.get("protected_node_hashes", {})
+
+    # 1. Handle Forensic Lock Revocation (`--revoke-protected`) when real data exposes a disguised culprit
+    if getattr(args, "revoke_protected", None):
+        reason = (getattr(args, "revoke_reason", None) or "").strip()
+        if len(reason) < 10:
+            print(
+                "[RA GATE BLOCKED] Forensic Lock Revocation (`--revoke-protected`) requires `--revoke-reason` "
+                "explaining the runtime `.log` or real-data pipe evidence that exposed the node as corrupted!",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        for rnode in args.revoke_protected:
+            if rnode in protected:
+                protected.remove(rnode)
+            protected_hashes.pop(rnode, None)
+            state.setdefault("revoked_protected_history", []).append(
+                {
+                    "node": rnode,
+                    "revoked_by": agent_id,
+                    "revoked_at": ts,
+                    "reason": reason,
+                }
+            )
+            append_self_learning(
+                rdir,
+                state.get("active_hypothesis") or "FORENSIC_REVOCATION",
+                agent_id,
+                f"Former `PROTECTED_WORKING` node `{rnode}` exposed as corrupted under real data / `.log` trace.",
+                "Static/initial pass masked a coupled bug that only surfaced after upstream sent real production data.",
+                f"Revoked `PROTECTED_WORKING` lock on `{rnode}` ({reason}) so root-cause repair can proceed.",
+            )
+            print(
+                f"[RA GATE FORENSIC REVOCATION] Unlocked `{rnode}` (Reason: {reason}). "
+                f"You may now repair `{rnode}` to handle the real data contract."
+            )
+
+    # 2. Handle Zero-Trust `--protected` registration
     if args.protected:
         for pnode in args.protected:
+            seg = extract_symbol_source_segment(workspace, pnode)
+            if seg is not None:
+                m_susp = SUSPICIOUS_INNOCENCE_RE.search(seg)
+                if m_susp:
+                    print(
+                        f"[RA GATE BLOCKED] Zero-Trust Innocence Check Failed for `{pnode}`!\n"
+                        f"  Cannot lock `{pnode}` as `PROTECTED_WORKING` because its source contains a suspicious "
+                        f"band-aid / fake-data / stub pattern: `{m_susp.group(0)}`.\n"
+                        f"  Only lock functions proven clean by runtime `[RA_LOG]` boundary traces!",
+                        file=sys.stderr,
+                    )
+                    sys.exit(2)
             if pnode not in protected:
                 protected.append(pnode)
             phash = compute_protected_symbol_hash(workspace, pnode)
@@ -1038,7 +1106,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--protected",
         nargs="*",
         default=[],
-        help="Working functions/modules verified as innocent (`file:func`) that must NOT be modified",
+        help="Working functions/modules verified as innocent by runtime `.log` boundaries (`file:func`) that must NOT be modified",
+    )
+    p_mc.add_argument(
+        "--revoke-protected",
+        nargs="*",
+        default=[],
+        help="Forensically unlock a former `PROTECTED_WORKING` node (`file:func`) after real data / `.log` traces expose it as corrupted",
+    )
+    p_mc.add_argument(
+        "--revoke-reason",
+        default="",
+        help="Required runtime `.log` or real-data pipe evidence explaining why `--revoke-protected` is unlocking the node",
     )
     p_mc.set_defaults(func=cmd_map_context)
 

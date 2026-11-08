@@ -1,4 +1,4 @@
-# RA — Research Anything (`research-anything`) v1.4.0
+# RA — Research Anything (`research-anything`) v1.5.0
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Version: 1.3.0](https://img.shields.io/badge/Version-1.3.0-orange.svg)](#)

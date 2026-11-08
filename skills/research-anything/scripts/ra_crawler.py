@@ -137,6 +137,16 @@ CURATED_SKILL_REPOS = [
 ]
 
 
+def _save_state_safe(state_path, state):
+    # Atomic, lab-aware write via ra_common so concurrent hook updates aren't lost.
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import ra_common
+        ra_common.write_state(Path(state_path).parent.parent, state)
+    except ImportError:
+        Path(state_path).write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
 
@@ -235,7 +245,7 @@ def update_state_arsenal(workspace: Path, category: str, item_meta: Dict[str, An
         entries.append(item_meta)
         arsenal[category] = entries
         state["updated_at"] = now_iso()
-        sp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        _save_state_safe(sp, state)
     except Exception as exc:
         print(f"  [WARN] Could not update `{sp}`: {exc}", file=sys.stderr)
 

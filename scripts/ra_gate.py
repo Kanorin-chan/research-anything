@@ -23,10 +23,15 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ra_common import (  # noqa: E402
     DEFAULT_MAX_ROUNDS_PER_APPROACH,
+    DIRECTIVES_HEADER,
     FAMILY_RE,
     HASH_ALGO,
+    RETIRED_STATUSES,
     approach_key,
+    can_reach,
     canonical_spec,
+    ceiling_block,
+    clear_reviews,
     code_fingerprint,
     describe_matches,
     extract_protected_node,
@@ -34,12 +39,19 @@ from ra_common import (  # noqa: E402
     find_ambiguous,
     fingerprint_files,
     fmt_score,
+    grant_manager_edit,
     hash_file,
     hash_protected_node,
+    lab_reviews,
     metric_rule,
+    pending_reviews_detail,
     quoted_score,
     raw_sha256,
+    read_directives,
     read_text_normalised,
+    record_review,
+    render_board,
+    rule_cap,
     rule_has_numbers,
     sb_all_scores,
     sb_get,
@@ -50,6 +62,7 @@ from ra_common import (  # noqa: E402
     unseen_target_met,
     verify_protected_node,
     verify_seal,
+    write_state,
 )
 
 STAGES = [
@@ -97,6 +110,8 @@ STAGE_INSTRUCTIONS: Dict[str, str] = {
         "   Otherwise target the brick's weakest link only.\n"
         "2. OPTION SWEEP in REPORT.md Section 3: >= 3 approach FAMILIES (parameter variants = one family),\n"
         "   each with expected ceiling, cost and the inventory assets it uses. Name the baseline to beat.\n"
+        "   Put each family's paper ceiling on the board: `ra_gate.py ceiling --approach <family> --estimate <x>\n"
+        "   --basis \"<math / simulation / small experiment>\"`. A ceiling that can't reach the target refuses runs.\n"
         "3. Write success criteria + plateau rule, and register them WITH NUMBERS:\n"
         "   `ra_gate.py stop-rule --component <slug> ... --metric \"<name>\" --target <x> --min-gain <g> [--lower-is-better]`.\n"
         "   Every R&D problem has a number; if nothing else, pass-rate over real cases (0..1).\n"
@@ -108,6 +123,8 @@ STAGE_INSTRUCTIONS: Dict[str, str] = {
         "1. LEAD-ORCHESTRATOR DELEGATION & CONTEXT FORKING (`ra_context_harness.py`):\n"
         "   Fork the shared snapshot to a Subagent (`ra_context_harness.py fork --subagent Subagent_A --snapshots <snap_id> --task \"...\"`),\n"
         "   let the Subagent build the prototype & write its report, then reclaim the baton (`ra_context_harness.py return-baton --subagent Subagent_A`).\n"
+        "   You are the lab MANAGER: every returned report gets a review meeting before the next fork\n"
+        "   (`ra_gate.py review --file research/reviews/REVIEW_<n>.md`: DECISION / LESSON / NEXT lines). `ra_gate.py board`.\n"
         "2. Build the prototype inside `research/sandbox/<active_hypothesis>/<family>/`. RACE the chosen families cheaply\n"
         "   on the SAME real data before polishing any one of them. Use the assets in `research/INVENTORY.md`.\n"
         "   Every program prints `RA_SCORE=<x>`; every `ra_log_engine.py run --approach <family>` is a scored round.\n"
@@ -127,9 +144,10 @@ STAGE_INSTRUCTIONS: Dict[str, str] = {
         "   capture live screenshots into `visual_captures/`, open & inspect the pixels (`read_file`), and complete `VISUAL_AUDIT.md`.\n"
         "4. If any hop is `[STUCK]` or `[FAIL]`, fix the upstream mechanism (NO `if/else` or `try/except` band-aids!).\n"
         "5. SCOREBOARD (mechanical, `ra_gate.py status --scoreboard`): each `run` records its `RA_SCORE=<x>`; pass\n"
-        "   `--unseen` on held-out data. No score x3 (BLIND), last 2 under min-gain (FLAT), baseline never beaten, or\n"
-        "   the per-approach round cap = PLATEAUED -> runs LOCK until a FRESH subagent's `ra_gate.py cold-review`\n"
-        "   says CONTINUE (one grace round), SWITCH (next family) or BRICK-FIRST. Target met on unseen = WON.\n"
+        "   `--unseen` on held-out data. No score x3 (BLIND), best of the last 3 under min-gain (FLAT), baseline never\n"
+        "   beaten, the per-approach round cap, or a trend that can't reach the target within the budget (TREND)\n"
+        "   = PLATEAUED -> runs LOCK until a FRESH subagent's `ra_gate.py cold-review` says CONTINUE (one grace round),\n"
+        "   SWITCH (next family) or BRICK-FIRST. Target met on unseen = WON.\n"
         "6. Once `ra_log_engine.py audit` passes, run `ra_gate.py advance` to unlock Stage 5."
     ),
     "STAGE_5_ANTI_CHEESE_AUDIT": (
@@ -185,7 +203,7 @@ def numbers_line(sr: Dict[str, Any]) -> str:
     return (
         f"`{sr.get('metric') or '?'}` target {fmt_score(sr.get('target'))}, min-gain {fmt_score(sr.get('min_gain'))}, "
         f"{'lower' if sr.get('lower_is_better') else 'higher'} is better, "
-        f"cap {sr.get('max_rounds_per_approach') or DEFAULT_MAX_ROUNDS_PER_APPROACH} rounds/approach"
+        f"cap {rule_cap(sr)} rounds/approach"
     )
 
 
@@ -261,7 +279,7 @@ def ensure_initialized(workspace: Path, agent_id: str = "PRIMARY_AGENT") -> Dict
     state_path = get_state_path(workspace)
     if not state_path.exists():
         state = {
-            "version": "1.4.0",
+            "version": "1.5.0",
             "created_at": ts,
             "updated_at": ts,
             "current_stage": "STAGE_0_INTAKE_AND_SYNC",
@@ -308,9 +326,8 @@ def load_state(workspace: Path, auto_init: bool = False) -> Dict[str, Any]:
 
 
 def save_state(workspace: Path, state: Dict[str, Any]) -> None:
-    sp = get_state_path(workspace)
     state["updated_at"] = now_iso()
-    sp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    write_state(workspace, state)
 
 
 PASS_FLAGS = {
@@ -1809,7 +1826,7 @@ def cmd_re_evaluate(args: argparse.Namespace) -> None:
     print(f"  New Calculation  : {new_calc}")
     print(f"  Why Deterministic: {why_diff}")
     print("  Next Step        : Implement it (changing the code SHA-256) before running `ra_log_engine.py run`.")
-    print("  Plateau check    : 2 rounds under the minimum gain = PLATEAUED. Switch family, don't tweak.")
+    print("  Plateau check    : best of 3 rounds under the minimum gain = PLATEAUED. Switch family, don't tweak.")
     print("=" * 78)
 
 
@@ -1824,6 +1841,22 @@ def _iso_ts(text: Optional[str]) -> float:
         return dt.datetime.fromisoformat(str(text)).timestamp()
     except (TypeError, ValueError):
         return 0.0
+
+
+def archive_family(workspace: Path, rdir: Path, hyp: str, family: str) -> str:
+    """Move research/sandbox/<hyp>/<family>/ to the graveyard; returns where it went ("" if there was no folder)."""
+    sandbox = safe_research_path(rdir, "sandbox", hyp)
+    src = next((d for d in sandbox.iterdir() if d.is_dir() and d.name.lower() == family), None) if sandbox.is_dir() else None
+    if src is None:
+        return ""
+    dest = safe_research_path(rdir, "graveyard", hyp, src.name)
+    suffix = 2
+    while dest.exists():
+        dest = safe_research_path(rdir, "graveyard", hyp, f"{src.name}__{suffix}")
+        suffix += 1
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dest))
+    return workspace_rel(workspace, dest) or str(dest)
 
 
 def cmd_cold_review(args: argparse.Namespace) -> None:
@@ -1842,9 +1875,10 @@ def cmd_cold_review(args: argparse.Namespace) -> None:
             "          To try another family voluntarily, just `run --approach <family>` (it must be in the Option Sweep)."
         )
     locked = lock.get("approach") or ""
-    if lock.get("rule") == "BRICK_FIRST":
+    if lock.get("rule") in ("BRICK_FIRST", "RESTART"):
+        said = "a cold review already said BRICK-FIRST" if lock.get("rule") == "BRICK_FIRST" else "your review decided RESTART"
         gate_error(
-            f"[RA GATE] REFUSED: a cold review already said BRICK-FIRST for `{hyp}`. Do not shop for another verdict:\n"
+            f"[RA GATE] REFUSED: {said} for `{hyp}`. Do not shop for another verdict:\n"
             "          " + "\n          ".join(sb_lock_instructions(state, hyp))
         )
 
@@ -1917,6 +1951,9 @@ def cmd_cold_review(args: argparse.Namespace) -> None:
         sb["lock"] = None
         sb["grace"][locked] = 1
         ap["status"] = "RACING"
+        ap["kept_at_round"] = len(ap.get("rounds", []))
+        if lock.get("rule") == "TREND" and lock.get("projected") is not None:
+            ap["trend_floor"] = lock["projected"]
     elif verdict == "SWITCH":
         if not nxt:
             gate_error("[RA GATE] REFUSED: a SWITCH verdict needs `--next-approach <family>` (a family from the Option Sweep).")
@@ -1924,23 +1961,17 @@ def cmd_cold_review(args: argparse.Namespace) -> None:
             gate_error(f"[RA GATE] REFUSED: `--next-approach {args.next_approach}` must be [A-Za-z0-9_-] (e.g. template-reader).")
         if nxt == locked:
             gate_error(f"[RA GATE] REFUSED: `--next-approach` must differ from the locked approach `{locked}`.")
-        if (sb["approaches"].get(nxt) or {}).get("status") == "SWITCHED":
-            gate_error(f"[RA GATE] REFUSED: `{nxt}` was already switched away from; pick a family that has not plateaued.")
+        nxt_status = (sb["approaches"].get(nxt) or {}).get("status")
+        if nxt_status in RETIRED_STATUSES:
+            gate_error(f"[RA GATE] REFUSED: `{nxt}` is already {nxt_status}; pick a family that is still in the race.")
         if not family_in_report(workspace, hyp, nxt):
             gate_error(f"[RA GATE] REFUSED: add `{nxt}` to the Option Sweep in REPORT.md Section 3 first.")
+        blocked = ceiling_block(state, hyp, nxt)
+        if blocked:
+            gate_error(f"[RA GATE] REFUSED: `{nxt}` can't be raced: {blocked}.")
         ap["status"] = "SWITCHED"
         sb["grace"].pop(locked, None)
-        sandbox = safe_research_path(rdir, "sandbox", hyp)
-        src = next((d for d in sandbox.iterdir() if d.is_dir() and d.name.lower() == locked), None) if sandbox.is_dir() else None
-        if src is not None:
-            dest = safe_research_path(rdir, "graveyard", hyp, src.name)
-            suffix = 2
-            while dest.exists():
-                dest = safe_research_path(rdir, "graveyard", hyp, f"{src.name}__{suffix}")
-                suffix += 1
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src), str(dest))
-            moved_to = workspace_rel(workspace, dest) or str(dest)
+        moved_to = archive_family(workspace, rdir, hyp, locked)
         sb["lock"] = None
         found = metric_rule(state, hyp)
         sr = found[1] if found else {}
@@ -2037,6 +2068,395 @@ def cmd_decide(args: argparse.Namespace) -> None:
             f.write(existing)
         f.write(entry)
     print(f"[RA GATE] Recorded D-{n:03d} in `research/DECISIONS.md`: {what}")
+    print("          An AI decision is a reversible suggestion, not law. If the user said it, record it with `directive`.")
+
+
+def cmd_directive(args: argparse.Namespace) -> None:
+    """Record (or list) the user's own words, verbatim: the only rules that are the user's."""
+    workspace = Path(args.workspace).resolve()
+    load_state(workspace, auto_init=True)
+    path = get_research_dir(workspace) / "DIRECTIVES.md"
+    if args.list:
+        if args.quote or args.source:
+            gate_error("[RA GATE] ERROR: `directive --list` takes no --quote / --source.")
+        dirs = read_directives(workspace)
+        print("=" * 78)
+        print(f"  USER DIRECTIVES - {len(dirs)} verbatim quote(s) in research/DIRECTIVES.md")
+        print("  Every other rule (DECISIONS.md, INVARIANTS.md, notes, docs) is an AI suggestion unless it is quoted here.")
+        print("-" * 78)
+        for d in dirs:
+            print(f"  {d['id']}  ({d['source'] or 'no source'})")
+            for ln in d["quote"].splitlines():
+                print(f"      > {ln}")
+        if not dirs:
+            print("  (none yet: `ra_gate.py directive --quote \"<the user's exact words>\" --source \"<when/where>\"`)")
+        print("=" * 78)
+        return
+    quote, source = (args.quote or "").strip(), (args.source or "").strip()
+    if len(quote) < 3:
+        gate_error("[RA GATE BLOCKED] directive: `--quote` must be the user's exact words (>= 3 chars), or use `--list`.")
+    if len(source) < 3:
+        gate_error("[RA GATE BLOCKED] directive: `--source` must say when/where the user said it (e.g. \"chat 2026-10-12\").")
+    if any(d["quote"] == quote for d in read_directives(workspace)):
+        print("[RA GATE] That directive is already recorded in `research/DIRECTIVES.md` (no change).")
+        return
+    existing = read_md(path) if path.exists() else ""
+    n = max((int(x) for x in re.findall(r"^## U-(\d+)", existing, re.MULTILINE)), default=0) + 1
+    entry = (
+        f"\n## U-{n:03d}\n"
+        + "".join(f"> {ln}".rstrip() + "\n" for ln in quote.splitlines())
+        + f"- **Source**: {source}\n- **Recorded**: `{now_iso()}` / `{args.agent or 'PRIMARY_AGENT'}`\n"
+    )
+    with path.open("a", encoding="utf-8") as f:
+        if not existing.strip():
+            f.write(DIRECTIVES_HEADER + "\n")
+        f.write(entry)
+    print(f"[RA GATE] Recorded U-{n:03d} in `research/DIRECTIVES.md` (the user's words, verbatim, from {source}).")
+
+
+def cmd_ceiling(args: argparse.Namespace) -> None:
+    """Put an approach family's paper ceiling on the board; one that can't reach the target refuses runs."""
+    workspace = Path(args.workspace).resolve()
+    state = load_state(workspace)
+    rdir = get_research_dir(workspace)
+    hyp = state.get("active_hypothesis")
+    if not hyp:
+        gate_error("[RA GATE] ERROR: No active hypothesis; a ceiling belongs to one of its approach families.", 1)
+    raw = (args.approach or "").strip()
+    if not FAMILY_RE.match(raw):
+        gate_error(f"[RA GATE] REFUSED: `--approach {raw}` must be [A-Za-z0-9_-] (e.g. template-reader).")
+    fam = approach_key(raw)
+    found = metric_rule(state, hyp)
+    if not found or found[1].get("target") is None:
+        gate_error(
+            f"[RA GATE] REFUSED: `{hyp}` has no numeric target to compare a ceiling with. Register it first:\n"
+            "          `ra_gate.py stop-rule --component <slug> ... --metric <name> --target <x> --min-gain <g>`"
+        )
+    comp, sr = found
+    if not family_in_report(workspace, hyp, fam):
+        gate_error(f"[RA GATE] REFUSED: add `{raw}` to the Option Sweep in REPORT.md Section 3 first.")
+    sb = sb_get(state, hyp)
+    ap = sb["approaches"].get(fam) or {}
+    if ap.get("status") in RETIRED_STATUSES:
+        gate_error(f"[RA GATE] REFUSED: `{fam}` is {ap.get('status')}; it is out of the race.")
+    old: Dict[str, Any] = dict(ap.get("ceiling") or {})
+    if args.estimate is None and not old:
+        gate_error(f"[RA GATE] REFUSED: `{fam}` has no ceiling yet: pass `--estimate <number>` and `--basis \"...\"`.")
+    est = float(args.estimate) if args.estimate is not None else float(old["estimate"])
+    basis = (args.basis or "").strip() or (old.get("basis", "") if args.estimate is None else "")
+    problem = reason_problem(basis, "--basis", min_len=20)
+    if problem:
+        gate_error(f"[RA GATE BLOCKED] ceiling: {problem} Say how you got the number: math, a simulation or a small experiment.")
+    stepping = (args.stepping_stone or "").strip()
+    if stepping:
+        problem = reason_problem(stepping, "--stepping-stone", min_len=20)
+        if problem:
+            gate_error(f"[RA GATE BLOCKED] ceiling: {problem} Say what racing it teaches or builds for an approach that can win.")
+    elif args.estimate is None:
+        stepping = old.get("stepping_stone", "")
+    reaches = can_reach(est, sr)
+    if old and not can_reach(old.get("estimate"), sr) and reaches and basis == old.get("basis"):
+        gate_error(
+            f"[RA GATE BLOCKED] Raising `{fam}`'s ceiling from {fmt_score(old.get('estimate'))} past the target needs new "
+            "evidence: write the new `--basis` (what you computed or measured since)."
+        )
+    agent_id = args.agent or "PRIMARY_AGENT"
+    ts = now_iso()
+    ap = sb["approaches"].setdefault(fam, {"rounds": [], "status": "RACING"})
+    if old:
+        ap.setdefault("ceiling_history", []).append(old)
+    ap["ceiling"] = {"estimate": est, "basis": basis, "at": ts, "agent": agent_id}
+    if stepping:
+        ap["ceiling"]["stepping_stone"] = stepping
+    status = ap.get("status", "RACING")
+    if not reaches and not stepping and status in ("RACING", "CANT_REACH"):
+        ap["status"] = "CANT_REACH"
+    elif status == "CANT_REACH":
+        ap["status"] = "RACING"
+    state.setdefault("history", []).append(
+        {"timestamp": ts, "agent": agent_id, "event": "CEILING", "hypothesis": hyp, "approach": fam, "estimate": est,
+         "stepping_stone": bool(stepping)}
+    )
+    save_state(workspace, state)
+    append_lab_log_row(
+        rdir,
+        ts,
+        f"| `{hyp}` | `-` | `{agent_id}` | `CEILING` | `{fam}` paper ceiling {fmt_score(est)} vs target "
+        f"{fmt_score(sr.get('target'))}: {_table_cell(basis)}" + (f" STEPPING STONE: {_table_cell(stepping)}" if stepping else "")
+        + " | `-` |",
+    )
+    sign = ">" if sr.get("lower_is_better") else "<"
+    print(f"[RA GATE] Paper ceiling for `{fam}` on `{hyp}`: {fmt_score(est)} (target {fmt_score(sr.get('target'))}).")
+    print(f"          Basis: {basis}")
+    if reaches:
+        print("          It can reach the target on paper. Race it and let the scoreboard confirm.")
+    elif stepping:
+        print(f"          {fmt_score(est)} {sign} target, raced as a STEPPING STONE: {stepping}")
+    else:
+        print(
+            f"          CAN'T REACH: {fmt_score(est)} {sign} target {fmt_score(sr.get('target'))}. `{fam}` is CANT_REACH and\n"
+            f"          `ra_log_engine.py run --approach {fam}` is refused. Change the architecture, DROP it in a review, or\n"
+            f"          justify it: `ra_gate.py ceiling --approach {fam} --estimate {fmt_score(est)} --basis \"...\" "
+            "--stepping-stone \"<why>\"`."
+        )
+
+
+_DECISION_RE = re.compile(
+    r"^[\s>*_#`-]*DECISION[\s*_`]*:[\s*_`]*([A-Za-z0-9][A-Za-z0-9_-]{0,63})[\s*_`]*:[\s*_`]*"
+    r"(KEEP|SWITCH|DROP|RESTART)\b(.*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_LESSON_RE = re.compile(r"^[\s>*_#`-]*LESSON[\s*_`]*:(.*)$", re.IGNORECASE | re.MULTILINE)
+_NEXT_RE = re.compile(r"^[\s>*_#`-]*NEXT[\s*_`]*:(.*)$", re.IGNORECASE | re.MULTILINE)
+
+
+def _line_text(m: "re.Match[str]") -> str:
+    return m.group(1).strip().strip("*_`").strip()
+
+
+def _names_family(text: str, fam: str, decided: set) -> bool:
+    if fam in decided or re.search(rf"`{re.escape(fam)}`", text, re.IGNORECASE):
+        return True
+    # A 1-2 letter family ("a") hides inside ordinary prose, so it must be on a DECISION line or in backticks.
+    return len(fam) >= 3 and bool(re.search(rf"(?<![A-Za-z0-9_-]){re.escape(fam)}(?![A-Za-z0-9_-])", text, re.IGNORECASE))
+
+
+def cmd_review(args: argparse.Namespace) -> None:
+    """The manager's review meeting on finished worker reports: decide per approach, record lessons, name the next step."""
+    workspace = Path(args.workspace).resolve()
+    state = load_state(workspace)
+    rdir = get_research_dir(workspace)
+    hyp = state.get("active_hypothesis")
+    fpath = Path(args.file)
+    fpath = (fpath if fpath.is_absolute() else workspace / fpath).resolve()
+    rel = workspace_rel(workspace, fpath) or str(fpath)
+    if rdir.resolve() not in fpath.parents:
+        gate_error(f"[RA GATE] REFUSED: `{args.file}` must live under `research/` (e.g. research/reviews/REVIEW_<n>.md).")
+    if not fpath.is_file():
+        gate_error(f"[RA GATE] REFUSED: review file not found: {rel}")
+    text = read_md(fpath)
+    reviews = lab_reviews(workspace)
+    pending = pending_reviews_detail(workspace)
+    workers = [w for w, _ in pending]
+    scores = sb_all_scores(state, hyp) if hyp else []
+    if not pending and not scores:
+        gate_error("[RA GATE] REFUSED: nothing to review - no worker report is waiting and the board has no scores yet.")
+
+    problems: List[str] = []
+    digest = hash_file(fpath)
+    if any(r.get("sha256") == digest or r.get("file") == rel for r in reviews):
+        problems.append("this review file was already used; every meeting writes a new one.")
+    if pending:
+        oldest = min(_iso_ts(e.get("since")) for _, e in pending)
+        if fpath.stat().st_mtime + 2 < oldest:
+            problems.append(
+                f"it was written before worker `{workers[0]}`'s report came back ({pending[0][1].get('since')}); "
+                "review the report you actually got."
+            )
+    approaches: Dict[str, Any] = sb_get(state, hyp, create=False)["approaches"] if hyp else {}
+    live = [f for f, ap in approaches.items() if (ap or {}).get("status") not in RETIRED_STATUSES]
+    decisions = [(approach_key(m.group(1)), m.group(2).upper(), m.group(3).strip(" *_`-:")) for m in _DECISION_RE.finditer(text)]
+    decided = {f for f, _, _ in decisions}
+    missing = [f for f in live if not _names_family(text, f, decided)]
+    if missing:
+        problems.append(
+            "it does not name every approach still in the race: missing "
+            + ", ".join(f"`{f}`" for f in missing)
+            + " (a name under 3 characters must be in backticks or on a DECISION line)."
+        )
+    quoted: Optional[str]
+    if scores:
+        quoted = quoted_score(text, scores)
+        if not quoted:
+            problems.append(
+                "it quotes none of the scoreboard's numbers (" + ", ".join(fmt_score(s) for s in scores[-8:])
+                + "). Judge with the numbers on `ra_gate.py board`."
+            )
+    else:
+        quoted = next((w for w in workers if re.search(rf"(?<![\w-]){re.escape(w)}(?![\w-])", text, re.IGNORECASE)), None)
+        if not quoted:
+            problems.append(f"the board has no scores yet, so the review must name the worker it reviews ({', '.join(workers)}).")
+    if not decisions:
+        problems.append("it has no `DECISION: <family>: KEEP|SWITCH|DROP|RESTART` line.")
+    by_fam: Dict[str, set] = {}
+    for f, verb, _ in decisions:
+        by_fam.setdefault(f, set()).add(verb)
+    for f, verbs in by_fam.items():
+        if len(verbs) > 1:
+            problems.append(f"conflicting decisions for `{f}`: {', '.join(sorted(verbs))}.")
+        elif not hyp and verbs - {"KEEP"}:
+            problems.append(f"there is no active hypothesis, so `DECISION: {f}: {next(iter(verbs))}` has nothing to act on.")
+        elif hyp and f not in approaches and not family_in_report(workspace, hyp, f):
+            problems.append(f"`DECISION: {f}` names no approach on the board or in REPORT.md's Option Sweep.")
+        elif hyp and "KEEP" in verbs and (approaches.get(f) or {}).get("status") in RETIRED_STATUSES:
+            problems.append(f"`{f}` is already {approaches[f].get('status')}; it can't be kept.")
+    lessons = [_line_text(m) for m in _LESSON_RE.finditer(text)]
+    if not lessons:
+        problems.append("it has no `LESSON: <what we learned>` line (>= 20 chars).")
+    for ls in lessons:
+        bad = reason_problem(ls, "LESSON", min_len=20)
+        if bad:
+            problems.append(bad)
+    nexts = [_line_text(m) for m in _NEXT_RE.finditer(text) if len(_line_text(m)) >= 5]
+    if not nexts:
+        problems.append("it has no `NEXT: <the next step>` line.")
+    if problems:
+        print(f"[RA GATE] REFUSED review `{rel}`:", file=sys.stderr)
+        for p in problems:
+            print(f"  - {p}", file=sys.stderr)
+        sys.exit(2)
+
+    n = len(reviews) + 1
+    ts = now_iso()
+    agent_id = args.agent or "PRIMARY_AGENT"
+    nxt = nexts[-1]
+    notes: List[str] = []
+    restart = ""
+    if hyp:
+        sb = sb_get(state, hyp)
+        for f, verb, _ in decisions:
+            lock = sb.get("lock") or {}
+            lock_here = lock.get("approach") == f and lock.get("rule") not in ("BRICK_FIRST", "RESTART")
+            if verb == "KEEP":
+                ap = sb["approaches"].get(f)
+                if ap is not None:
+                    ap["kept_at_round"] = len(ap.get("rounds", []))
+                notes.append(f"`{f}` KEEP" + (f" (its {lock.get('rule')} lock still needs a cold review)" if lock_here else ""))
+            elif verb in ("DROP", "SWITCH"):
+                ap = sb["approaches"].setdefault(f, {"rounds": [], "status": "RACING"})
+                if ap.get("status") in RETIRED_STATUSES:
+                    notes.append(f"`{f}` was already {ap.get('status')}")
+                    continue
+                ap["status"] = "DROPPED" if verb == "DROP" else "SWITCHED"
+                sb["grace"].pop(f, None)
+                moved = archive_family(workspace, rdir, hyp, f)
+                note = f"`{f}` {ap['status']} (runs refused" + (f", sandbox -> `{moved}/`" if moved else "") + ")"
+                if lock_here:
+                    sb["lock"] = None
+                    note += f"; its {lock.get('rule')} lock is cleared"
+                notes.append(note)
+            else:
+                restart = f
+        if restart:
+            found = metric_rule(state, hyp)
+            sb["lock"] = {
+                "approach": restart,
+                "rule": "RESTART",
+                "reason": f"RESTART: review #{n} ({rel}) decided to restart `{hyp}`",
+                "since": ts,
+                "stop_rule": found[0] if found else None,
+            }
+            notes.append(f"RESTART: runs of `{hyp}` are LOCKED")
+    else:
+        notes.extend(f"`{f}` {verb}" for f, verb, _ in decisions)
+    summary = "; ".join(f"{f}: {verb}" for f, verb, _ in decisions)
+    state.setdefault("history", []).append(
+        {"timestamp": ts, "agent": agent_id, "event": "REVIEW", "hypothesis": hyp, "n": n, "file": rel, "decisions": summary}
+    )
+    save_state(workspace, state)
+    for ls in lessons:
+        append_self_learning(
+            rdir,
+            hyp or "LAB_REVIEW",
+            agent_id,
+            f"Review #{n} (`{rel}`) of {', '.join(workers) or 'the scoreboard'}.",
+            f"Manager review meeting - {summary}. NEXT: {nxt}",
+            ls,
+        )
+    append_lab_log_row(
+        rdir, ts, f"| `{hyp or '-'}` | `-` | `{agent_id}` | `REVIEW_{n}` | {_table_cell(summary + '. NEXT: ' + nxt)} | `{rel}` |"
+    )
+    clear_reviews(workspace, workers)
+    record_review(
+        workspace,
+        {"n": n, "at": ts, "file": rel, "sha256": digest, "workers": workers, "hypothesis": hyp,
+         "decisions": [{"approach": f, "decision": v, "why": w} for f, v, w in decisions],
+         "lessons": lessons, "next": nxt, "quoted": quoted},
+    )
+    print("=" * 78)
+    print(f"  RA REVIEW #{n} ACCEPTED - `{hyp or 'no hypothesis'}` (reviewed: {', '.join(workers) or 'scoreboard'}; quoted {quoted})")
+    print("=" * 78)
+    for note in notes:
+        print(f"  DECISION : {note}")
+    print(f"  LESSONS  : {len(lessons)} appended to research/SELF_LEARNING.md (they ride along in every next fork brief)")
+    print(f"  NEXT     : {nxt}")
+    if workers:
+        print(f"  Cleared pending review(s): {', '.join(workers)}. The next fork is open.")
+    if restart:
+        for line in sb_lock_instructions(state, hyp):
+            print(f"  {line}")
+    print("=" * 78)
+
+
+def _rule_docs(workspace: Path) -> List[str]:
+    names = ("CLAUDE.md", "AGENTS.md", "GEMINI.md", "research/INVARIANTS.md", "research/DECISIONS.md", "research/VISION_AND_MISSION.md")
+    return [n for n in names if (workspace / n).is_file()]
+
+
+def _print_board(workspace: Path, mode: str) -> None:
+    import ra_common  # the raising variant: a broken board must show its error here, not vanish
+
+    if not get_state_path(workspace).is_file():
+        gate_error("[RA GATE] No `research/.ra_state.json` here - run `ra_gate.py init --workspace .` first.", 1)
+    print(ra_common._board(workspace, mode))
+
+
+def cmd_board(args: argparse.Namespace) -> None:
+    _print_board(Path(args.workspace).resolve(), "summary" if args.summary else "full")
+
+
+def cmd_resume(args: argparse.Namespace) -> None:
+    """Pick a run back up as the lab manager: the board, then the resume protocol."""
+    workspace = Path(args.workspace).resolve()
+    state = load_state(workspace)
+    _print_board(workspace, "full")
+    hyp = state.get("active_hypothesis")
+    print("RESUME PROTOCOL - you are the lab manager picking this run back up:")
+    print("  1. Reconcile rules. Rules found in project docs are AI suggestions unless research/DIRECTIVES.md quotes the")
+    print("     user saying them. Check each one; record the real ones verbatim:")
+    print("       ra_gate.py directive --quote \"<the user's exact words>\" --source \"<when/where>\"")
+    docs = _rule_docs(workspace)
+    print(f"     Docs here with rules in them: {', '.join(docs) if docs else 'none found'}")
+    print("  2. Pull the in-flight hypothesis through today's gates: Option Sweep (>= 3 families, REPORT.md Section 3),")
+    print("     a numeric stop rule (`stop-rule ... --metric --target --min-gain`), a paper ceiling per family (`ceiling`).")
+    if hyp:
+        found = metric_rule(state, hyp)
+        gaps: List[str] = []
+        if not found or not rule_has_numbers(found[1]):
+            gaps.append("no numeric stop rule")
+        no_ceiling = [
+            f for f, ap in sb_get(state, hyp, create=False)["approaches"].items()
+            if not (ap or {}).get("ceiling") and (ap or {}).get("status") not in RETIRED_STATUSES
+        ]
+        if no_ceiling:
+            gaps.append("no paper ceiling for " + ", ".join(no_ceiling))
+        print(f"     `{hyp}`: {'; '.join(gaps) if gaps else 'gates in place'}")
+    else:
+        print("     No hypothesis is open.")
+    print("  3. Do the NEXT DECISION now and report afterwards - don't ask what to do.")
+
+
+def cmd_manager_edit(args: argparse.Namespace) -> None:
+    """One-time allowance for the manager to edit a file itself, on the user's own words."""
+    workspace = Path(args.workspace).resolve()
+    state = load_state(workspace)
+    reason = (args.reason or "").strip()
+    problem = reason_problem(reason, "--reason", min_len=10)
+    if problem:
+        gate_error(f"[RA GATE BLOCKED] manager-edit needs the user's exact words asking you to edit it yourself. {problem}")
+    rel = workspace_rel(workspace, (workspace / args.file).resolve())
+    if rel is None:
+        gate_error(f"[RA GATE] REFUSED: `{args.file}` is outside the workspace.")
+    agent_id = args.agent or "PRIMARY_AGENT"
+    state.setdefault("history", []).append(
+        {"timestamp": now_iso(), "agent": agent_id, "event": "MANAGER_EDIT_ALLOWED", "file": rel, "user_words": reason}
+    )
+    save_state(workspace, state)
+    shown = grant_manager_edit(workspace, rel, reason, agent_id)
+    if shown is None:
+        gate_error("[RA GATE] ERROR: could not record the allowance (research/.ra_state.json unreadable).", 1)
+    print(f"[RA GATE] One-time allowance: the manager may edit `{shown}` itself ONCE (user: \"{reason}\").")
+    print("          The first direct edit uses it up; after that, delegate to a worker again.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2234,6 +2654,51 @@ def build_parser() -> argparse.ArgumentParser:
     p_re.add_argument("--agent", default="PRIMARY_AGENT", help="Agent or session ID")
     p_re.set_defaults(func=cmd_re_evaluate)
 
+    p_dir = sub.add_parser("directive", help="Record the user's own words verbatim in research/DIRECTIVES.md, or --list them")
+    p_dir.add_argument("--workspace", default=".", help="Workspace root directory")
+    p_dir.add_argument("--quote", default=None, help="The user's exact words (verbatim, never paraphrased)")
+    p_dir.add_argument("--source", default=None, help="When/where the user said it (e.g. \"chat 2026-10-12\")")
+    p_dir.add_argument("--list", action="store_true", help="Print every recorded directive")
+    p_dir.add_argument("--agent", default="PRIMARY_AGENT", help="Agent or session ID")
+    p_dir.set_defaults(func=cmd_directive)
+
+    p_ceil = sub.add_parser(
+        "ceiling", help="Store an approach family's paper ceiling; one that can't reach the target refuses its runs"
+    )
+    p_ceil.add_argument("--workspace", default=".", help="Workspace root directory")
+    p_ceil.add_argument("--approach", required=True, help="Option Sweep family (REPORT.md Section 3)")
+    p_ceil.add_argument("--estimate", type=float, default=None, help="Best score this family can reach, on paper")
+    p_ceil.add_argument("--basis", default="", help="How you got the estimate: math / simulation / small experiment (>= 20 chars)")
+    p_ceil.add_argument(
+        "--stepping-stone", default="", help="Why race it anyway although the ceiling misses the target (>= 20 chars)"
+    )
+    p_ceil.add_argument("--agent", default="PRIMARY_AGENT", help="Agent or session ID")
+    p_ceil.set_defaults(func=cmd_ceiling)
+
+    p_rev = sub.add_parser(
+        "review", help="The manager's review meeting on finished worker reports (DECISION / LESSON / NEXT lines)"
+    )
+    p_rev.add_argument("--workspace", default=".", help="Workspace root directory")
+    p_rev.add_argument("--file", required=True, help="research/reviews/REVIEW_<n>.md")
+    p_rev.add_argument("--agent", default="PRIMARY_AGENT", help="Agent or session ID")
+    p_rev.set_defaults(func=cmd_review)
+
+    p_board = sub.add_parser("board", help="Print the live lab board (aim, user directives, approaches, reviews, next decision)")
+    p_board.add_argument("--workspace", default=".", help="Workspace root directory")
+    p_board.add_argument("--summary", action="store_true", help="Two-line summary instead of the full board")
+    p_board.set_defaults(func=cmd_board)
+
+    p_res = sub.add_parser("resume", help="The full board plus the resume protocol for picking a run back up")
+    p_res.add_argument("--workspace", default=".", help="Workspace root directory")
+    p_res.set_defaults(func=cmd_resume)
+
+    p_me = sub.add_parser("manager-edit", help="One-time allowance for the manager to edit a file itself (user's words)")
+    p_me.add_argument("--workspace", default=".", help="Workspace root directory")
+    p_me.add_argument("--file", required=True, help="File the user asked you to edit directly")
+    p_me.add_argument("--reason", required=True, help="The user's exact words asking for it (>= 10 chars)")
+    p_me.add_argument("--agent", default="PRIMARY_AGENT", help="Agent or session ID")
+    p_me.set_defaults(func=cmd_manager_edit)
+
     return p
 
 
@@ -2245,6 +2710,10 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     args.func(args)
+    if args.cmd not in ("board", "resume"):
+        footer = render_board(Path(args.workspace).resolve(), "summary")
+        if footer:
+            print(footer)
 
 
 if __name__ == "__main__":

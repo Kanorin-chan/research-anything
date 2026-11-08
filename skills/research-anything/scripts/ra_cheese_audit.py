@@ -152,6 +152,16 @@ _COMMENT_LEAD_RE = re.compile(r"^[\s/*#!<=\-]+")
 _COMMENT_TAIL_RE = re.compile(r"(\*/|-->|=#|\]=*\])\s*$")
 
 
+def _save_state_safe(state_path, state):
+    # Atomic, lab-aware write via ra_common so concurrent hook updates aren't lost.
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import ra_common
+        ra_common.write_state(Path(state_path).parent.parent, state)
+    except ImportError:
+        Path(state_path).write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
 def _ra_common():
     # Same hashing as ra_gate.py; the script dir is not on sys.path under `python -I`.
     here = str(Path(__file__).resolve().parent)
@@ -864,7 +874,7 @@ def main() -> None:
     if violations:
         if state_path.exists():
             state["cheese_audit_passed"] = False
-            state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            _save_state_safe(state_path, state)
         print("  [FAIL] AUDIT REJECTED THE PROTOTYPE FOR THE FOLLOWING REASONS:")
         for v in violations:
             print(f"    - {v}")
@@ -881,7 +891,7 @@ def main() -> None:
         state.setdefault("pass_fingerprints", {})["cheese_audit_passed"] = rc.code_fingerprint(
             workspace, state, args.hypothesis
         )
-        state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        _save_state_safe(state_path, state)
     print("  [PASS] Zero cheese, zero band-aids, and all axiom seals verified!")
     print("         Ensure `ra_log_engine.py audit` and `ra_visual_audit.py audit` also pass, then run `ra_gate.py advance` to proceed to Stage 6.")
     print("=" * 78)

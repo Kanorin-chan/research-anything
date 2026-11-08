@@ -149,6 +149,16 @@ BLANK_MAX_BYTES_PER_PIXEL = 0.02
 STDLIB_PNG_MAX_RAW_BYTES = 24_000_000
 
 
+def _save_state_safe(state_path, state):
+    # Atomic, lab-aware write via ra_common so concurrent hook updates aren't lost.
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import ra_common
+        ra_common.write_state(Path(state_path).parent.parent, state)
+    except ImportError:
+        Path(state_path).write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
 def _utf8_console() -> None:
     # Windows consoles default to cp932/cp1252, which cannot print the report's dashes.
     for stream in (sys.stdout, sys.stderr):
@@ -989,7 +999,7 @@ def cmd_audit(args: argparse.Namespace) -> None:
         if state_path.exists():
             state = json.loads(state_path.read_text(encoding="utf-8-sig"))
             _mark_passed(state, workspace, hyp)
-            state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            _save_state_safe(state_path, state)
         return
 
     violations: List[str] = []
@@ -1123,7 +1133,7 @@ def cmd_audit(args: argparse.Namespace) -> None:
         if state_path.exists():
             state = json.loads(state_path.read_text(encoding="utf-8-sig"))
             state["visual_audit_passed"] = False
-            state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            _save_state_safe(state_path, state)
         print("  [FAIL] VISUAL & PROVIDED-ASSET REALITY GATE REJECTED THE PROTOTYPE:")
         for v in violations:
             print(f"    - {v}")
@@ -1139,7 +1149,7 @@ def cmd_audit(args: argparse.Namespace) -> None:
     if state_path.exists():
         state = json.loads(state_path.read_text(encoding="utf-8-sig"))
         _mark_passed(state, workspace, hyp)
-        state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        _save_state_safe(state_path, state)
 
     print("  [PASS] Provided assets, container fit, and captured screenshots verified!")
     print("=" * 78)

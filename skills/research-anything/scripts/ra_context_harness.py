@@ -119,6 +119,18 @@ def detect_platform(requested: str = "auto") -> str:
     return "agy"
 
 
+def lab() -> Any:
+    """ra_common beside this script (the lab board), or None if it is missing."""
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    try:
+        import ra_common
+    except ImportError:
+        return None
+    return ra_common
+
+
 def get_snapshots_dir(workspace: Path) -> Path:
     d = workspace / "research" / "context_snapshots"
     (d / "forks").mkdir(parents=True, exist_ok=True)
@@ -453,6 +465,25 @@ def cmd_create(args: argparse.Namespace) -> None:
     print("=" * 78)
 
 
+def lab_brief(common: Any, workspace: Path) -> str:
+    """The aim, the user's last 5 directives and the last 3 lessons, for the end of a fork brief."""
+    if common is None or not common.state_file(workspace).is_file():
+        return ""
+    aim = common.board_aim(workspace)
+    dirs = common.read_directives(workspace)[-5:]
+    lessons = common.read_lessons(workspace, 3)
+    out = ["", "### Lab Context (from the manager's board)", f"- **Aim**: {aim or '(not written yet)'}"]
+    out.append("- **The user's own words** (verbatim; any other rule you meet is an AI suggestion):")
+    out.extend(f"  - {d['id']}: \"{' / '.join(d['quote'].splitlines())}\" ({d['source']})" for d in dirs)
+    if not dirs:
+        out.append("  - (none recorded)")
+    out.append("- **Lessons so far** (don't repeat these mistakes):")
+    out.extend(f"  - {ls}" for ls in lessons)
+    if not lessons:
+        out.append("  - (none recorded)")
+    return "\n".join(out) + "\n"
+
+
 def cmd_fork(args: argparse.Namespace) -> None:
     workspace = Path(args.workspace).resolve()
     sdir = get_snapshots_dir(workspace)
@@ -470,6 +501,18 @@ def cmd_fork(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+    common = lab()
+    pending = common.review_pending(workspace) if common is not None else []
+    if pending:
+        n = len(common.lab_reviews(workspace)) + 1
+        print(
+            f"[RA CONTEXT HARNESS BLOCKED] review worker {', '.join(pending)} first: "
+            f"ra_gate.py review --file research/reviews/REVIEW_{n}.md\n"
+            "  The manager reviews every finished report (DECISION / LESSON / NEXT) before delegating more work.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     subagent_name = slugify(args.subagent)
     outstanding = reg["outstanding_forks"]
@@ -581,6 +624,7 @@ def cmd_fork(args: argparse.Namespace) -> None:
         f"- **Required Report Output Path**: `{rel_report}`\n\n"
         f"### Bounded Task Assignment\n"
         f"{task_desc}\n"
+        + lab_brief(common, workspace)
     )
     fork_file.write_text(fork_packet, encoding="utf-8")
 
@@ -625,6 +669,9 @@ def cmd_fork(args: argparse.Namespace) -> None:
         f"--status COMPLETED --report-file {rel_report}` (or --status FAILED)"
     )
     print("=" * 78)
+    footer = common.render_board(workspace, "summary") if common is not None else ""
+    if footer:
+        print(footer)
 
 
 def cmd_return_baton(args: argparse.Namespace) -> None:
@@ -712,6 +759,20 @@ def cmd_return_baton(args: argparse.Namespace) -> None:
     print("    1. Assume the subagent may have drifted or missed a constraint — verify its diff/output directly.")
     print("    2. Run `python research/harness/project_harness.py check-all` (if forged) or `ra_cheese_audit.py`.")
     print("=" * 78)
+    common = lab()
+    if common is None or not common.state_file(workspace).is_file():
+        return
+    common.mark_worker_finished(workspace, subagent_name, "return-baton")
+    board = common.render_board(workspace, "full")
+    if board:
+        print(board)
+    n = len(common.lab_reviews(workspace)) + 1
+    print(f"  REVIEW MEETING before the next fork - answer in research/reviews/REVIEW_{n}.md:")
+    for i, q in enumerate(common.REVIEW_QUESTIONS, 1):
+        print(f"    {i}. {q}")
+    print("  It must name every approach still racing, quote a scoreboard number, and carry")
+    print("  `DECISION: <family>: KEEP|SWITCH|DROP|RESTART`, `LESSON: <text>` and `NEXT: <text>` lines. Then:")
+    print(f"    ra_gate.py review --file research/reviews/REVIEW_{n}.md")
 
 
 def cmd_evict(args: argparse.Namespace) -> None:

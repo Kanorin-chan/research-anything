@@ -817,7 +817,23 @@ def _load_state(state_path: Path) -> Dict[str, Any]:
 
 def _save_state(state_path: Path, state: Dict[str, Any]) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    common = _ra_common()
+    if common is not None and hasattr(common, "write_state"):
+        common.write_state(state_path.parent.parent, state)  # locked, atomic, keeps the hooks' state["lab"]
+        return
+    tmp = state_path.with_name(f"{state_path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, state_path)
+
+
+def _board_footer(workspace: Path) -> None:
+    """Two-line lab board summary under the output (nothing in an SDK copy without ra_common)."""
+    common = _ra_common()
+    footer = common.render_board(workspace, "summary") if common is not None and hasattr(common, "render_board") else ""
+    if footer:
+        sys.stdout.flush()
+        print(footer)
+        sys.stdout.flush()
 
 
 def _lock_for(state: Dict[str, Any], hyp: str) -> Optional[Dict[str, Any]]:
@@ -1068,10 +1084,11 @@ def _scoreboard_gate(args: argparse.Namespace, workspace: Path, state: Dict[str,
         print(f"[RA LOG ENGINE] `--approach {raw}` must be [A-Za-z0-9_-] (e.g. template-reader).", file=sys.stderr)
         sys.exit(2)
     key = common.approach_key(raw)
-    if (sb["approaches"].get(key) or {}).get("status") == "SWITCHED":
+    status = (sb["approaches"].get(key) or {}).get("status")
+    if status in ("SWITCHED", "DROPPED"):
         print(
-            f"[RA LOG ENGINE BLOCKED] `{key}` was SWITCHED away from by a cold review; its sandbox is in the graveyard.\n"
-            "  Race a different family from the Option Sweep.",
+            f"[RA LOG ENGINE BLOCKED] `{key}` is {status} (a cold review or your review retired it; its sandbox is in\n"
+            "  the graveyard). Race a different family from the Option Sweep.",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -1081,6 +1098,10 @@ def _scoreboard_gate(args: argparse.Namespace, workspace: Path, state: Dict[str,
             f"(research/hypotheses/{hyp}/REPORT.md).",
             file=sys.stderr,
         )
+        sys.exit(2)
+    blocked = common.ceiling_block(state, hyp, key) if hasattr(common, "ceiling_block") else None
+    if blocked:
+        print(f"[RA LOG ENGINE BLOCKED] `{key}`: {blocked}.", file=sys.stderr)
         sys.exit(2)
     return common, key
 
@@ -1277,7 +1298,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     if common is not None and approach:
         ap = common.sb_get(state, hyp)["approaches"][approach]
         found = common.metric_rule(state, hyp)
-        cap = (found[1].get("max_rounds_per_approach") if found else None) or common.DEFAULT_MAX_ROUNDS_PER_APPROACH
+        cap = common.rule_cap(found[1] if found else None)
         shown = common.fmt_score(score) if score is not None else "NONE (no `RA_SCORE=<x>` line on stdout)"
         print(
             f"  Score    : {shown} | approach `{approach}` round {len(ap['rounds'])}"
@@ -1293,6 +1314,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                 common, workspace, state, hyp,
                 f"[PLATEAU LOCK ENGAGED] `{hyp}`: further runs are refused until a cold review.", sys.stdout,
             )
+    _board_footer(workspace)
     sys.exit(exit_code)
 
 
@@ -1513,6 +1535,7 @@ def cmd_audit(args: argparse.Namespace) -> None:
                 "    python ra_gate.py re-evaluate --component <slug> --why-failed \"...\" --new-calculation \"...\" --why-different \"...\""
             )
         print("=" * 78)
+        _board_footer(workspace)
         sys.exit(1)
 
     if not trusted:
@@ -1521,6 +1544,7 @@ def cmd_audit(args: argparse.Namespace) -> None:
             "  (unmodified) can pass the audit gate. Re-run the workflow via `run`, then audit again."
         )
         print("=" * 78)
+        _board_footer(workspace)
         sys.exit(2)
 
     if state_path.exists():
@@ -1533,6 +1557,7 @@ def cmd_audit(args: argparse.Namespace) -> None:
 
     print("  [PASS] Real-Environment `.log` Flow, Functional Roles, State Deltas & Contracts Verified!")
     print("=" * 78)
+    _board_footer(workspace)
 
 
 RUN_EPILOG = """\
@@ -1552,11 +1577,14 @@ is exported to the program as $RA_LOG_FILE. `audit` checks the latest one by def
 
 scoreboard: every run is a round. The program prints `RA_SCORE=<x>` (the last such stdout line
 counts). With a numeric stop rule, pass --approach <family> (from REPORT.md Section 3) and --unseen
-on held-out data. BLIND / FLAT / BASELINE / CAP plateaus lock all runs of the hypothesis until
-`ra_gate.py cold-review`; target met on an --unseen round = WON. See `ra_gate.py status --scoreboard`.
+on held-out data. BLIND / FLAT (best of last 3) / BASELINE / CAP / TREND (can't reach the target
+within the round budget) plateaus lock all runs of the hypothesis until `ra_gate.py cold-review`;
+target met on an --unseen round = WON. A family that is SWITCHED / DROPPED, or whose paper ceiling
+(`ra_gate.py ceiling`) can't reach the target without a stepping-stone reason, is refused.
+See `ra_gate.py status --scoreboard` and `ra_gate.py board`.
 
 exit codes: the program's exit code, 124 = killed by the watchdog, 127 = could not start,
-2 = blocked by the retry lock / plateau lock / usage error.
+2 = blocked by the retry lock / plateau lock / approach rules / usage error.
 """
 
 

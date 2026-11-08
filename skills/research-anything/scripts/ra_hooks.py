@@ -13,6 +13,14 @@ Verified on Claude Code 2.1.319 (skill-frontmatter hooks):
   - SessionStart, SubagentStop, PreCompact and PostCompact from skill frontmatter never fire,
     so compaction / resume is detected here from the transcript and CLAUDE_PID instead;
   - a background worker's completion arrives as a <task-notification> user prompt.
+
+Two launch paths: the skill frontmatter (active once the skill is invoked) and, after ra_forge.py, the project's
+.claude/settings.local.json with --armed (every session: board at start / after compaction; blocks and per-prompt
+reminders only once the skill is invoked in that session). When both exist the frontmatter copy stays silent.
+
+Manager edit rule: no code file anywhere (CODE_SUFFIXES, research/sandbox/ included); notes, reports and config
+under research/, docs/, .claude/ and any .md/.txt/.log are the manager's. Bash writes (redirect, tee, sed -i,
+cp/mv, Set-Content/Out-File) are judged by the same rule; writes a regex can't see fail open.
 """
 
 from __future__ import annotations
@@ -20,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -30,10 +39,21 @@ BOARD_EVERY = 25
 CONTEXT_CAP = 9500
 TAIL_CAP = 8 * 1024 * 1024
 MANAGER_DIRS = {"research", "docs", ".claude"}
-MANAGER_SUFFIXES = {".md", ".txt"}
+MANAGER_SUFFIXES = {".md", ".txt", ".log"}
+# Code is bench work wherever it lives — research/sandbox/ and research/harness/ included.
+CODE_SUFFIXES = {
+    ".py", ".pyi", ".ipynb", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".vue", ".svelte",
+    ".php", ".rb", ".rs", ".go", ".java", ".kt", ".kts", ".scala", ".swift", ".m", ".mm",
+    ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".cs", ".fs", ".lua", ".pl", ".r", ".jl", ".dart", ".zig",
+    ".sh", ".bash", ".zsh", ".ps1", ".psm1", ".bat", ".cmd", ".sql", ".html", ".htm", ".css", ".scss", ".less",
+    ".glsl", ".hlsl", ".wgsl", ".shader", ".cu", ".proto", ".graphql",
+}
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 RA_SKILL = "research-anything"
 WIN = os.name == "nt"
+# --armed = launched from the project's own .claude/settings hooks (written by ra_forge.py), not the skill frontmatter.
+ARMED = "--armed" in sys.argv
+SEAT_HINT = "RA run in flight here. Take the manager seat: invoke the research-anything skill, then run ra_gate.py resume."
 
 REVIEW_QUESTIONS = (
     "  1. Is it closer to the target?\n"
@@ -141,10 +161,68 @@ def _inside(p: str, base: str) -> Optional[str]:
 
 
 def manager_may_edit(rel: str) -> bool:
+    suffix = Path(rel).suffix.lower()
+    if suffix in CODE_SUFFIXES:
+        return False
     first = rel.split("/", 1)[0]
     if WIN:
         first = first.lower()
-    return first in MANAGER_DIRS or Path(rel).suffix.lower() in MANAGER_SUFFIXES
+    return first in MANAGER_DIRS or suffix in MANAGER_SUFFIXES
+
+
+_SEG_SPLIT = re.compile(r"\s*(?:\|\||&&|[;|\n])\s*")
+_REDIRECT = re.compile(r"(?<![<>&\d])\d?>{1,2}\s*([^\s;|&<>]+)")
+_PS_TARGET = re.compile(r"-(?:Path|FilePath|LiteralPath|Destination)\s+(\S+)", re.IGNORECASE)
+_LEADING_VAR = re.compile(r"^\$(?:\{\w+\}|\w+)/")
+
+
+def bash_write_targets(command: str) -> List[str]:
+    """Files a shell command writes, as far as a regex can tell: redirects, tee, sed -i, cp/mv/install,
+    Set-Content/Out-File. Heredoc bodies are skipped. Misses fail open; a false block is the bug to avoid."""
+    if "<<" in command:
+        command = command.split("\n", 1)[0]
+    out: List[str] = []
+    for seg in _SEG_SPLIT.split(command):
+        if not seg.strip():
+            continue
+        out += [m.group(1) for m in _REDIRECT.finditer(seg) if m.group(1) not in ("/dev/null", "$null")]
+        try:
+            toks = shlex.split(seg, posix=True)
+        except ValueError:
+            toks = seg.split()
+        while toks and re.match(r"^\w+=", toks[0]):
+            toks.pop(0)
+        if toks and toks[0] in ("sudo", "command", "exec", "time"):
+            toks.pop(0)
+        if not toks:
+            continue
+        cmd = os.path.basename(toks[0]).lower()
+        args = toks[1:]
+        plain = [a for a in args if not a.startswith("-")]
+        if cmd == "tee":
+            out += plain
+        elif cmd == "sed" and any(
+            a == "--in-place" or a.startswith("--in-place=") or (a.startswith("-") and not a.startswith("--") and "i" in a[1:])
+            for a in args
+        ):
+            if len(plain) >= 2:
+                out.append(plain[-1])
+        elif cmd in ("cp", "mv", "install"):
+            if len(plain) >= 2:
+                out.append(plain[-1])
+        elif cmd in ("set-content", "out-file", "add-content", "copy-item", "move-item"):
+            m = _PS_TARGET.search(seg)
+            if m:
+                out.append(m.group(1))
+            elif plain:
+                out.append(plain[-1])
+    cleaned: List[str] = []
+    for t in out:
+        t = t.strip("'\"")
+        if not t or t.startswith(("$(", "`")):
+            continue
+        cleaned.append(_LEADING_VAR.sub("", t))  # "$W/src/x.py" -> "src/x.py" (judged relative to the workspace)
+    return cleaned
 
 
 def gate_cmd() -> str:
@@ -225,9 +303,44 @@ def context_reset(ws: Path, payload: Dict[str, Any], source: Optional[str] = Non
             reason = "resume"
         elif _compacted_since(payload, int(rec.get("off", 0))):
             reason = "compact"
-    sessions[sid] = {"pid": pid or (rec or {}).get("pid", ""), "off": size, "seen": time.time()}
+    sessions[sid] = {
+        "pid": pid or (rec or {}).get("pid", ""),
+        "off": size,
+        "seen": time.time(),
+        "skill": bool((rec or {}).get("skill")),
+    }
     _save_hooks_state(ws, data)
     return reason
+
+
+def project_armed(ws: Path) -> bool:
+    for name in ("settings.local.json", "settings.json"):
+        try:
+            if "ra_hooks.py" in (ws / ".claude" / name).read_text(encoding="utf-8-sig"):
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def mark_skill_active(ws: Path, payload: Dict[str, Any]) -> None:
+    sid = str(payload.get("session_id") or "")
+    if not sid:
+        return
+    data = _load_hooks_state(ws)
+    rec = data.setdefault("sessions", {}).setdefault(sid, {})
+    if not rec.get("skill"):
+        rec["skill"] = True
+        rec.setdefault("seen", time.time())
+        _save_hooks_state(ws, data)
+
+
+def manager_seat(ws: Path, payload: Dict[str, Any]) -> bool:
+    """Blocks and per-prompt reminders need the skill invoked in this session; frontmatter hooks imply that."""
+    if not ARMED:
+        return True
+    sid = str(payload.get("session_id") or "")
+    return bool(_load_hooks_state(ws).get("sessions", {}).get(sid, {}).get("skill"))
 
 
 RESET_LINES = {
@@ -349,12 +462,19 @@ def subagent_label(payload: Dict[str, Any]) -> Optional[str]:
 def on_session_start(ws: Path, payload: Dict[str, Any]) -> int:
     source = str(payload.get("source") or "startup")
     context_reset(ws, payload, source=source)
-    emit_context("SessionStart", full_board(ws, source))
+    text = full_board(ws, source)
+    if text and not manager_seat(ws, payload):
+        text = f"{text}\n{SEAT_HINT}"
+    emit_context("SessionStart", text)
     return 0
 
 
 def on_prompt(ws: Path, payload: Dict[str, Any]) -> int:
     reason = context_reset(ws, payload)
+    if not manager_seat(ws, payload):
+        if reason:
+            emit_context("UserPromptSubmit", f"{full_board(ws, reason)}\n{SEAT_HINT}".strip())
+        return 0
     finished = finished_from_notifications(str(payload.get("prompt") or ""))
     for name in finished:
         common().mark_worker_finished(ws, name, "task-notification")
@@ -371,6 +491,8 @@ def on_prompt(ws: Path, payload: Dict[str, Any]) -> int:
 def on_pre_tool(ws: Path, payload: Dict[str, Any]) -> int:
     if payload.get("agent_id"):
         return 0  # workers are never blocked by the manager harness
+    if not manager_seat(ws, payload):
+        return 0
     tool = payload.get("tool_name") or ""
     tin = payload.get("tool_input") or {}
     if tool in ("Agent", "Task"):
@@ -394,8 +516,25 @@ def on_pre_tool(ws: Path, payload: Dict[str, Any]) -> int:
             return 0
         return block(
             f"[RA HOOK] You are the lab manager — delegate this edit of {rel} to a worker (Agent tool) "
-            f"with a brief. One-off exception only with the user's words: "
+            f"with a brief. Code is bench work wherever it lives, research/sandbox/ included. "
+            f"One-off exception only with the user's words: "
             f'{gate_cmd()} manager-edit --file {rel} --reason "<user quote>"'
+        )
+    if tool == "Bash":
+        hits = []
+        for target in bash_write_targets(str(tin.get("command") or "")):
+            rel = rel_to_workspace(ws, target, payload.get("cwd"))
+            if rel is not None and not manager_may_edit(rel):
+                hits.append(rel)
+        if not hits:
+            return 0
+        rel = hits[0]
+        if common().consume_manager_edit(ws, rel):
+            return 0
+        return block(
+            f"[RA HOOK] You are the lab manager — this command writes {rel}. Delegate code changes to a worker "
+            f"(Agent tool) with a brief; redirects, tee, sed -i and cp/mv count as edits. "
+            f'One-off exception only with the user\'s words: {gate_cmd()} manager-edit --file {rel} --reason "<user quote>"'
         )
     return 0
 
@@ -404,10 +543,16 @@ def on_post_tool(ws: Path, payload: Dict[str, Any]) -> int:
     if payload.get("agent_id"):
         return 0
     c = common()
-    count = c.record_main_tool_call(ws)
-    reason = context_reset(ws, payload)
     tool = payload.get("tool_name") or ""
     tin = payload.get("tool_input") or {}
+    if tool == "Skill" and str(tin.get("skill") or "").split(":")[-1] == RA_SKILL:
+        mark_skill_active(ws, payload)
+    count = c.record_main_tool_call(ws)
+    reason = context_reset(ws, payload)
+    if not manager_seat(ws, payload):
+        if reason:
+            emit_context("PostToolUse", f"{full_board(ws, reason)}\n{SEAT_HINT}".strip())
+        return 0
     if tool in ("Agent", "Task") and agent_report_finished(payload.get("tool_response")):
         c.mark_worker_finished(ws, worker_label(tin, payload.get("tool_response")), "agent-tool")
         text = review_call(ws, reason)
@@ -424,6 +569,8 @@ def on_post_tool(ws: Path, payload: Dict[str, Any]) -> int:
 
 
 def on_subagent_stop(ws: Path, payload: Dict[str, Any]) -> int:
+    if not manager_seat(ws, payload):
+        return 0
     label = subagent_label(payload)
     if label:
         common().mark_worker_finished(ws, label, "subagent-stop")
@@ -440,12 +587,17 @@ HANDLERS = {
 
 
 def main(argv: List[str]) -> int:
-    handler = HANDLERS.get(argv[1] if len(argv) > 1 else "")
+    args = [a for a in argv[1:] if a != "--armed"]
+    handler = HANDLERS.get(args[0] if args else "")
     if handler is None:
         return 0
     payload = read_payload()
     ws = find_workspace(payload)
     if ws is None:
+        return 0
+    if not ARMED and project_armed(ws):
+        # The project's settings hooks carry the harness; the skill-frontmatter copy only takes the seat.
+        mark_skill_active(ws, payload)
         return 0
     return handler(ws, payload)
 

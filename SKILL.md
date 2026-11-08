@@ -14,7 +14,7 @@ description: >-
   novel mechanisms or building R&D projects where standard boilerplate fails.
 metadata:
   short_name: RA
-  version: "1.5.0"
+  version: "1.5.1"
 hooks:
   SessionStart:
     - hooks:
@@ -29,7 +29,7 @@ hooks:
           timeout: 10
           command: 'p=$(command -v python || command -v python3) || exit 0; for d in "$CLAUDE_PLUGIN_ROOT" "$CLAUDE_SKILL_DIR" "$CLAUDE_PROJECT_DIR/.claude/skills/research-anything" "$HOME/.claude/skills/research-anything"; do [ -f "$d/scripts/ra_hooks.py" ] && exec "$p" -I "$d/scripts/ra_hooks.py" prompt; done; exit 0'
   PreToolUse:
-    - matcher: "Agent|Task|Edit|Write|MultiEdit|NotebookEdit"
+    - matcher: "Agent|Task|Edit|Write|MultiEdit|NotebookEdit|Bash"
       hooks:
         - type: command
           shell: bash
@@ -120,11 +120,11 @@ RA runs like an R&D department, not a help desk. **The user owns the vision, the
 You are the **lab manager (lead orchestrator)**. Your job is to understand the whole thing, turn the user's idea into an aim, and run the department — not to do the bench work yourself.
 
 - **You must understand the flow; workers need only their slice.** Give each worker a brief: the aim, its one task, the data and assets to use, and how its result will be scored. Dispatch, then wait.
-- **Hands off the code.** The harness blocks the manager from editing project code (anything outside `research/`, `docs/`, `.claude/` and `.md`/`.txt` files). Delegate it. A one-off exception needs the user's words: `ra_gate.py manager-edit --file <f> --reason "<user quote>"`.
+- **Hands off the code.** The harness blocks the manager from writing any code file, wherever it lives (`research/sandbox/` included), through Edit/Write and through Bash redirects, `tee`, `sed -i`, `cp`/`mv`. Notes, reports and config under `research/`, `docs/`, `.claude/` and any `.md`/`.txt`/`.log` are yours. Delegate the rest. A one-off exception needs the user's words: `ra_gate.py manager-edit --file <f> --reason "<user quote>"`.
 - **Every report gets a review meeting, and the next dispatch is blocked until it happens.** Write `research/reviews/REVIEW_<n>.md` answering: closer to the target? Does the trend reach it within budget? Is another approach better? Keep, switch, drop or restart? What did we learn? It must name every live approach (in backticks for names under 3 characters), quote at least one current score, and carry `DECISION: <family>: KEEP|SWITCH|DROP|RESTART`, `LESSON: …` and `NEXT: …` lines. Register it with `ra_gate.py review --file <f>`. Lessons go to `SELF_LEARNING.md` and come back in the next brief.
 - **Judge by the trend toward the target, not by the last step.** Before building an approach, estimate its ceiling on paper: `ra_gate.py ceiling --approach <family> --estimate <x> --basis "<math / simulation / small test>"`. An approach whose ceiling can't reach the target is refused (unless it is a declared `--stepping-stone`). While racing, the engine projects each curve to the end of its budget and locks it for a fresh-eyes review when it can't get there. One noisy dip is not a failure; a curve that can't reach the target is.
 - **The user's words vs. your own rules.** Record the user's directives verbatim: `ra_gate.py directive --quote "<exact words>" --source "<when/where>"`. Your own choices go through `ra_gate.py decide`; they are reversible suggestions, never law. Never write a rule into project docs that reads as if the user said it.
-- **The lab board is the plan, not your memory.** `ra_gate.py board` shows the aim, the user's directives, every approach (ceiling, best, projection, status), pending reviews, lessons and the next decision. In Claude Code this skill's own hooks (`scripts/ra_hooks.py`, active once the skill is invoked) push it into your context: on the first prompt of a session, after every compaction, on every prompt (as a summary), when a worker reports, and every 25 tool calls. Other harnesses get the board summary at the end of every RA script's output. When the board and your memory disagree, the board wins. (Runtime file: `research/.ra_hooks.json`.)
+- **The lab board is the plan, not your memory.** `ra_gate.py board` shows the aim, the user's directives, every approach (ceiling, best, projection, status), pending reviews, lessons and the next decision. In Claude Code this skill's own hooks (`scripts/ra_hooks.py`, active once the skill is invoked) push it into your context: on the first prompt of a session, after every compaction, on every prompt (as a summary), when a worker reports, and every 25 tool calls. Once `ra_forge.py` has run, the project's `.claude/settings.local.json` carries the same harness for every session there: the board at session start and after compaction, and the manager blocks as soon as this skill is invoked. Other harnesses get the board summary at the end of every RA script's output. When the board and your memory disagree, the board wins. (Runtime file: `research/.ra_hooks.json`.)
 - **Picking up an existing project**: run `ra_gate.py resume`. Reconcile rules found in the project's docs against `research/DIRECTIVES.md` (no user quote means it's an AI suggestion), pull the in-flight hypothesis through the current gates, then do the NEXT DECISION without asking.
 
 ### Delegation Machinery (`/fork` Context Controlling & Snapshot Eviction)
@@ -160,7 +160,7 @@ To keep the manager's context from bloating and decaying during deep R&D:
 
 To prevent context drift and attention decay during long sessions, **you must not rely on memory to track the research workflow**. You must drive every project through the RA CLI state-machine gatekeeper (`scripts/ra_gate.py`).
 
-At the start of every session and before transitioning between any stage, run (on a project that already has `research/`, start with `resume` instead):
+At the start of every session and before transitioning between any stage, run (on a project that already has `research/`, start with `resume` instead; `status` is read-only and creates nothing — a new project starts with `ra_gate.py init`):
 
 ```bash
 python "${CLAUDE_SKILL_DIR}/scripts/ra_gate.py" status --workspace "."

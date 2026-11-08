@@ -1,7 +1,7 @@
-# RA — Research Anything (`research-anything`) v1.5.0
+# RA — Research Anything (`research-anything`) v1.5.1
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
-[![Version: 1.3.0](https://img.shields.io/badge/Version-1.3.0-orange.svg)](#)
+[![Version: 1.5.1](https://img.shields.io/badge/Version-1.5.1-orange.svg)](#)
 [![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![Zero Dependencies](https://img.shields.io/badge/Dependencies-None%20(Stdlib)-brightgreen.svg)](#)
 [![Platforms](https://img.shields.io/badge/Platforms-OpenCode%20%7C%20Claude%20Code%20%7C%20Codex%20%7C%20Antigravity%20%7C%20Gemini%20CLI-purple.svg)](#installation-30-second-setup)
@@ -129,7 +129,7 @@ Every skill in this repo splits on one axis: **who can invoke it**.
 
 ## Why Standard AI Agents Fail at Real Engineering & R&D (And How RA Fixes It)
 
-| Failure Mode | What Standard AI Agents Do | How **RA (`research-anything`) v1.3.0** Solves It |
+| Failure Mode | What Standard AI Agents Do | How **RA (`research-anything`) v1.5.1** Solves It |
 | :--- | :--- | :--- |
 | **1. 1-Hop Symptom Blindness & Innocent-Function Mutation** | User says *"Function A is broken!"* and the AI blindly mutates `Function A`, breaking working code when the real bug was `Function C` 2 hops upstream (`Symptom != Culprit`). | **`ra-workflow-map` & `ra-systemic-debug` (`ra_gate.py map-context`)**: Traces `-N` to `+N` hops in `WORKFLOW_MAP.md`, proves culprit vs. innocent victim, and locks working functions as `PROTECTED_WORKING`. |
 | **2. Whack-a-Mole Ping-Pong Regressions** | Fixes Bug B by wiping shared state, which silently breaks Behavior A that depended on that state. | **Existing Behavioral Contracts (`BC-xxx`)**: Locks all existing working guarantees (`BC-001`, `BC-002`...) in `WORKFLOW_MAP.md` and verifies every contract in real-environment `.log` traces. |
@@ -141,6 +141,24 @@ Every skill in this repo splits on one axis: **who can invoke it**.
 | **8. The Boilerplate Reflex** | Forces textbook patterns onto novel ideas whose mechanics and connections are fundamentally different. | **First-Principles Mandate (Stage 2)**: Forbids pattern-matching; requires explicit mathematical/structural derivation and Pre-Edit/Pre-Creation justification in `REPORT.md` before coding. |
 | **9. The "Hardcoded Data" Slippery Slope & Band-Aids** | Sees legitimate math/syntax symbols (like `=`) labeled `# hardcoded` and uses that as an excuse to dump lookup tables, `if input == X: return Y`, or `try/except: pass` band-aids when stuck. | **Axiom Seal + AST Cheese Auditor (`ra_cheese_audit.py`)**: Separates SHA-256 sealed `AXIOMATIC_PRIMITIVES` from forbidden data cheesing; fails immediately if tampered with. |
 | **10. Misalignment & Lazy Repeat Questions** | Starts coding before aligning with the user, or asks the user the same question repeatedly instead of checking reference images and docs already on disk. | **`/ra-talk` + Pre-Question Gate (`check-question`)**: Scans `GLOSSARY.md`, `reference/`, `assets/`, and `REFERENCES_INDEX.md` first, then runs frontier grilling rounds and updates `GLOSSARY.md` inline. |
+
+| **11. Lazy Retry Loops & Fake Progress** | Tweaks the same approach for hours ("tracks better", "speeds up"), re-runs it under a new name, and calls activity progress. | **Scoreboard + Plateau Lock (v1.4)**: every `ra_log_engine.py run` is a round that must print `RA_SCORE=`; 3 blind or 2 flat rounds lock the approach until a **fresh subagent's** `COLD_REVIEW_<n>.md` (`CONTINUE | SWITCH | BRICK-FIRST`) is registered via `ra_gate.py cold-review`. |
+| **12. Manager Does the Bench Work & Forgets the Plan** | The main agent writes the prototypes itself, never reviews what workers return, and after compaction forgets which approaches are dead. | **Lab Manager Harness (v1.5, `ra_hooks.py`)**: the main agent is blocked from writing code (workers do it), every worker report forces a review meeting (`ra_gate.py review` with `DECISION / LESSON / NEXT`), and a live **lab board** (aim, user directives verbatim, approaches with paper ceiling + trend, lessons, next decision) is pushed into context on every prompt, after compaction and every 25 tool calls. |
+
+---
+
+## The Product Loop & the Lab (v1.4 → v1.5)
+
+The vision stays fixed; the architecture evolves in **generations**. Every stage serves this loop:
+
+1. **Take stock** (`research/INVENTORY.md`): open every provided asset, dataset, dump and tool. Triage each part of the product **KNOWN** (with evidence of fit) or **UNKNOWN** (gets R&D).
+2. **Brick first**: the crudest end-to-end version that runs, before polishing any part.
+3. **Weakest link only**: measure the brick, work on the one part that limits it.
+4. **Option sweep, then race**: ≥ 3 approach **families** for that link, raced cheaply on the same real data; each spike prints `RA_SCORE=`. A numeric stop rule (`ra_gate.py stop-rule --metric --target --min-gain`) and a paper ceiling per family (`ra_gate.py ceiling`) are registered **before** building.
+5. **Plateau = switch, not tweak**: the scoreboard locks a flat approach; only a fresh subagent's cold review unlocks it.
+6. **Graduate, use, repeat**: `PROVEN` needs an `--unseen` round at target and the user's sign-off; the next weakest link starts the next generation.
+
+**Autonomy contract**: the user owns the vision, the invariants and sign-off. Everything else is decided and recorded (`ra_gate.py decide` → `research/DECISIONS.md`); the user's own words are kept verbatim and apart (`ra_gate.py directive` → `research/DIRECTIVES.md`). `ra_gate.py board` prints the live lab board; `ra_gate.py resume` picks an existing run back up.
 
 ---
 
@@ -196,7 +214,7 @@ Every full R&D track is deterministically governed by [`scripts/ra_gate.py`](./s
 
 ---
 
-## CLI Reference (All 7 Deterministic Python Engines)
+## CLI Reference (The Deterministic Python Engines)
 
 All engines work both in **Standalone / Partial Mode** (`--hypothesis STANDALONE`, auto-initializing `research/` lazily when needed) and in **Full 8-Stage Mode**:
 
@@ -220,6 +238,18 @@ python scripts/ra_gate.py conclude --workspace . --verdict PROVEN \
   --issue "Upstream retry recovery cleared session dispatch ledger" \
   --workflow "User blamed downstream consumer func_a_summon; 2-hop trace isolated func_c" \
   --found "Transient retry state and session-once dispatch ledgers must remain orthogonal"
+
+# Product loop & lab manager (v1.4 / v1.5)
+python scripts/ra_gate.py stop-rule --workspace . --component "tile_reader" --purpose "..." --success-criteria "..." \
+  --metric "checkpoint_pass_rate" --target 0.9 --min-gain 0.02 --max-rounds 2 --if-never-works "ocr"
+python scripts/ra_gate.py ceiling --workspace . --approach "template_match" --estimate 0.6 --basis "39-point hand test"
+python scripts/ra_gate.py status --workspace . --scoreboard          # hand to a FRESH subagent when locked
+python scripts/ra_gate.py cold-review --workspace . --file "research/hypotheses/H001_x/COLD_REVIEW_1.md" --reviewer "cold-1"
+python scripts/ra_gate.py review --workspace . --file "research/reviews/REVIEW_1.md"   # DECISION / LESSON / NEXT
+python scripts/ra_gate.py decide --workspace . --what "..." --why "..." --alternatives "a; b"
+python scripts/ra_gate.py directive --workspace . --quote "<user's exact words>" --source "chat 2026-11-08"
+python scripts/ra_gate.py board --workspace .                        # live lab board
+python scripts/ra_gate.py resume --workspace .                       # pick an existing run back up
 ```
 
 ### 2. `ra_context_harness.py` — Multi-Platform `/fork` Controller, Baton & Handoff Engine

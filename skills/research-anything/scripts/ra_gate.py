@@ -623,7 +623,13 @@ def cmd_init(args: argparse.Namespace) -> None:
 
 def cmd_status(args: argparse.Namespace) -> None:
     workspace = Path(args.workspace).resolve()
-    state = load_state(workspace, auto_init=True)
+    if not get_state_path(workspace).exists():
+        # status is read-only: it must never plant research/ (and arm the manager hooks) in a stray folder.
+        print(f"[RA GATE] No RA workspace at {workspace} (no research/.ra_state.json). Nothing was created.")
+        print("  New project  : ra_gate.py init --workspace .")
+        print("  Wrong folder : cd to the project root and run status again.")
+        return
+    state = load_state(workspace)
     if not args.scoreboard:
         print_context_refresh(workspace, state)
         return

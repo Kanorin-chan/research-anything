@@ -12,7 +12,7 @@ hooks:
           timeout: 10
           command: 'p=$(command -v python || command -v python3) || exit 0; for d in "$CLAUDE_PLUGIN_ROOT" "$CLAUDE_SKILL_DIR" "$CLAUDE_PROJECT_DIR/.claude/skills/research-anything" "$HOME/.claude/skills/research-anything"; do [ -f "$d/scripts/ra_hooks.py" ] && exec "$p" -I "$d/scripts/ra_hooks.py" prompt; done; exit 0'
   PreToolUse:
-    - matcher: "Agent|Task|Edit|Write|MultiEdit|NotebookEdit"
+    - matcher: "Agent|Task|Edit|Write|MultiEdit|NotebookEdit|Bash"
       hooks:
         - type: command
           shell: bash

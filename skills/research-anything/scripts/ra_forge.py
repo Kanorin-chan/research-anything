@@ -14,7 +14,8 @@ enforcement suite (never polluting global skills):
    - Compatible with Antigravity / CLI / Git hooks (`check-edit --file <path>`, `check-all [--workspace <dir>]`)
    - Blocks edits to `PROTECTED_WORKING` files/functions, sealed axioms, and RA state files
 3. Multi-Platform Hook & Dedicated Review Agent Configs:
-   - `.claude/settings.local.json` (Claude Code Pre/Post/Stop hooks, merged into existing hooks; `.bak` kept)
+   - `.claude/settings.local.json` (project harness Pre/Post/Stop hooks + the armed lab-manager hooks
+     `ra_hooks.py --armed`, merged into existing hooks; `.bak` kept)
    - `.claude/agents/ra-reviewer.md` (Claude Code adversarial Review Subagent)
    - `.agents/workflows/ra-review.md` & `research/harness/REVIEW_AGENT_PROMPT.md` (Antigravity / Multi-Agent Reviewer)
 
@@ -34,7 +35,8 @@ from typing import Any, Dict, List
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 RA_HOOK_MARKER = "research/harness/project_harness.py"
-HOOK_EVENTS = ("PreToolUse", "PostToolUse", "Stop")
+RA_MANAGER_MARKER = "ra_hooks.py"
+HOOK_EVENTS = ("PreToolUse", "PostToolUse", "Stop", "SessionStart", "UserPromptSubmit", "SubagentStop")
 
 
 def _save_state_safe(state_path, state):
@@ -684,21 +686,41 @@ def ra_hook_command(mode: str) -> str:
     return f'python "$CLAUDE_PROJECT_DIR/{RA_HOOK_MARKER}" {mode}'
 
 
+def manager_hook_command(mode: str) -> str:
+    # Arms the lab-manager harness for every session in this project. --armed marks the settings copy.
+    script = (SCRIPTS_DIR / RA_MANAGER_MARKER).as_posix()
+    return f'p=$(command -v python || command -v python3) || exit 0; exec "$p" -I "{script}" {mode} --armed'
+
+
 def is_ra_hook(hook: Any) -> bool:
-    return isinstance(hook, dict) and RA_HOOK_MARKER in str(hook.get("command", "")).replace("\\", "/")
+    cmd = str(hook.get("command", "")).replace("\\", "/") if isinstance(hook, dict) else ""
+    return RA_HOOK_MARKER in cmd or RA_MANAGER_MARKER in cmd
+
+
+def _hook_group(command: str, matcher: str = "") -> Dict[str, Any]:
+    # shell=bash so $CLAUDE_PROJECT_DIR expands even where the default hook shell is PowerShell.
+    group: Dict[str, Any] = {"hooks": [{"type": "command", "shell": "bash", "timeout": 10, "command": command}]}
+    if matcher:
+        group["matcher"] = matcher
+    return group
 
 
 def merge_claude_settings_hooks(settings_path: Path, settings: Dict[str, Any]) -> Path:
     """Append RA hooks to the user's own hooks; RA entries from earlier runs are replaced, not duplicated."""
     edit_tools = "Edit|Write|MultiEdit"
-    # shell=bash so $CLAUDE_PROJECT_DIR expands even where the default hook shell is PowerShell.
-    ra_groups = {
-        "PreToolUse": {"matcher": edit_tools, "hooks": [{"type": "command", "shell": "bash", "command": ra_hook_command("pre-tool")}]},
-        "PostToolUse": {"matcher": edit_tools, "hooks": [{"type": "command", "shell": "bash", "command": ra_hook_command("post-tool")}]},
-        "Stop": {"hooks": [{"type": "command", "shell": "bash", "command": ra_hook_command("stop")}]},
-    }
+    manager_tools = "Agent|Task|Edit|Write|MultiEdit|NotebookEdit|Bash"
+    ra_groups: List[Any] = [
+        ("PreToolUse", _hook_group(ra_hook_command("pre-tool"), edit_tools)),
+        ("PostToolUse", _hook_group(ra_hook_command("post-tool"), edit_tools)),
+        ("Stop", _hook_group(ra_hook_command("stop"))),
+        ("SessionStart", _hook_group(manager_hook_command("session-start"))),
+        ("UserPromptSubmit", _hook_group(manager_hook_command("prompt"))),
+        ("PreToolUse", _hook_group(manager_hook_command("pre-tool"), manager_tools)),
+        ("PostToolUse", _hook_group(manager_hook_command("post-tool"), "*")),
+        ("SubagentStop", _hook_group(manager_hook_command("subagent-stop"))),
+    ]
     hooks = settings.setdefault("hooks", {})
-    for event, ra_group in ra_groups.items():
+    for event in HOOK_EVENTS:
         kept: List[Any] = []
         for group in hooks.get(event, []):
             if isinstance(group, dict) and isinstance(group.get("hooks"), list):
@@ -707,7 +729,7 @@ def merge_claude_settings_hooks(settings_path: Path, settings: Dict[str, Any]) -
                     continue
                 group = {**group, "hooks": own}
             kept.append(group)
-        hooks[event] = kept + [ra_group]
+        hooks[event] = kept + [g for ev, g in ra_groups if ev == event]
 
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     if settings_path.exists():
@@ -815,7 +837,7 @@ def main() -> None:
     print(f"     - .agents/skills/{slug}-rd/SKILL.md")
     print("  2. Executable Python Harness & Hook Gate:")
     print(f"     - {harness_py.relative_to(workspace).as_posix()}")
-    print(f"     - {settings_path.relative_to(workspace).as_posix()} (Claude Code PreToolUse/PostToolUse/Stop hooks, merged; .bak kept)")
+    print(f"     - {settings_path.relative_to(workspace).as_posix()} (project harness hooks + armed lab-manager hooks, merged; .bak kept)")
     print("  3. Dedicated Adversarial Review Agent (Multi-Platform):")
     print(f"     - {claude_agent_path.relative_to(workspace).as_posix()} (Claude Code Subagent)")
     print(f"     - {agy_workflow_path.relative_to(workspace).as_posix()} (Antigravity / Agent Workflow)")

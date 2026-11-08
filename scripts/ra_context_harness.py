@@ -5,8 +5,8 @@ ra_context_harness.py — Multi-Platform Subagent Context Controller, `/fork` Ma
 First-Class Platform Support:
   1. `opencode` (OpenCode CLI: `opencode run --session <id> --fork` & `-f FORK_<subagent>.md`)
   2. `claude`   (Claude Code: `claude --resume <id> --fork-session`, `/fork`, & `Task` subagent tool)
-  3. `codex`    (OpenAI Codex CLI: `codex exec --full-auto` & `codex resume <id>`)
-  4. `agy`      (Antigravity / Gemini: `invoke_subagent` with `Workspace: share/branch/inherit` & Gemini CLI)
+  3. `codex`    (OpenAI Codex CLI: `codex exec fork <id>` & `codex exec -c sandbox_mode=workspace-write`)
+  4. `agy`      (Antigravity / Gemini: `invoke_subagent(Subagents=[...])`; subagents start with a clean context)
 
 Enforces RA's Lead-Orchestrator & Context-Control Protocol:
   1. Main Agent = Lead Orchestrator / Compiler (delegates execution to Subagents even at 1-concurrency baton-pass).
@@ -48,6 +48,33 @@ TIER_DEFAULTS = {
 }
 
 SUPPORTED_PLATFORMS = ("auto", "opencode", "claude", "codex", "agy")
+
+# Each harness exports its own current session id; never cross-feed one platform's id to another.
+SESSION_ENV_VARS = {
+    "opencode": "OPENCODE_SESSION_ID",
+    "claude": "CLAUDE_CODE_SESSION_ID",
+    "codex": "CODEX_SESSION_ID",
+}
+
+UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+RELAY_STATUSES = ("COMPLETED", "FAILED", "PARTIAL", "ABORTED")
+
+
+def positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a whole number, got {text!r}")
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be greater than 0 (got {value})")
+    return value
+
+
+def resolve_inside(workspace: Path, raw: str) -> Optional[Path]:
+    """Resolve `raw` against the workspace; None if it lands outside it."""
+    p = (workspace / raw).resolve()
+    return p if p.is_relative_to(workspace) else None
 
 
 def now_utc() -> dt.datetime:
@@ -113,6 +140,7 @@ def load_registry(workspace: Path) -> Dict[str, Any]:
         "total_forks_dispatched": 0,
         "completed_subagent_relays": 0,
         "subagent_reports": [],
+        "outstanding_forks": {},
         "last_gc_at": None,
     }
     if not rp.exists():
@@ -121,9 +149,15 @@ def load_registry(workspace: Path) -> Dict[str, Any]:
         loaded = json.loads(rp.read_text(encoding="utf-8"))
         for k, v in default_reg.items():
             loaded.setdefault(k, v)
+        baton = str(loaded.get("active_baton", "MAIN_ORCHESTRATOR"))
+        # Registries written before `outstanding_forks` existed only know the baton holder.
+        if baton.startswith("SUBAGENT:") and not loaded["outstanding_forks"]:
+            loaded["outstanding_forks"][baton.split(":", 1)[1]] = {"forked_at": None, "legacy": True}
         return loaded
-    except Exception:
-        return default_reg
+    except (OSError, ValueError) as exc:
+        # Silently resetting would erase fork/relay counts the gate relies on.
+        print(f"[RA CONTEXT] ERROR: cannot read {rp} ({exc}). Fix or restore it; refusing to reset.", file=sys.stderr)
+        sys.exit(1)
 
 
 def save_registry(workspace: Path, reg: Dict[str, Any]) -> None:
@@ -193,78 +227,84 @@ def evict_snapshot_internal(workspace: Path, reg: Dict[str, Any], snap_id: str, 
         src_md.rename(dest_md)
 
 
+def path_key(p: Any) -> str:
+    return os.path.normcase(os.path.realpath(str(p)))
+
+
+def claude_project_dirs(workspace: Path) -> List[Path]:
+    """Exact `~/.claude/projects/<encoded cwd>` folders for this workspace (short and long path forms)."""
+    root = Path.home() / ".claude" / "projects"
+    forms = {os.path.abspath(str(workspace)), os.path.realpath(str(workspace))}
+    # Claude Code replaces every non-alphanumeric char of the cwd with "-" (`F:\AI_Kazeto V2` -> `F--AI-Kazeto-V2`).
+    names = sorted({re.sub(r"[^a-zA-Z0-9]", "-", f) for f in forms})
+    return [root / n for n in names if (root / n).is_dir()]
+
+
 def auto_discover_native_session_id(workspace: Path, platform: str) -> Optional[str]:
     """
-    Auto-discover the active native session ID for OpenCode, Claude Code, or Codex
-    when `--base-session` is not explicitly provided, enabling true native `/fork`
-    (`opencode run --session <id> --fork`, `claude --resume <id> --fork-session`,
-    `codex exec resume <id>`) without manual copy-paste.
+    Find the session to fork for `platform` when `--base-session` is not given.
+    Returns None unless the session is provably this workspace's, so the caller falls back
+    to a fresh subagent instead of loading some other conversation.
     """
-    # 1. Check explicit environment variables first
-    for env_key in ("OPENCODE_SESSION_ID", "OPENCODE_SESSION", "CLAUDE_SESSION_ID", "CODEX_SESSION_ID"):
-        val = os.environ.get(env_key, "").strip()
-        if val:
-            return val
+    env_val = os.environ.get(SESSION_ENV_VARS.get(platform, ""), "").strip()
+    ws_key = path_key(workspace)
 
-    home = Path.home()
-    ws_str = str(workspace.resolve())
+    if platform == "claude":
+        dirs = claude_project_dirs(workspace)
+        if env_val:
+            # `claude --resume` only finds sessions stored under the cwd's project folder.
+            return env_val if any((d / f"{env_val}.jsonl").is_file() for d in dirs) else None
+        sessions = [f for d in dirs for f in d.glob("*.jsonl") if f.is_file()]
+        # Concurrent sessions share a folder; "newest file" may be someone else's conversation.
+        return sessions[0].stem if len(sessions) == 1 else None
 
-    # 2. OpenCode CLI session auto-discovery (`opencode session list --format json -n 5`)
-    if platform == "opencode" and shutil.which("opencode"):
+    if env_val:
+        return env_val
+
+    if platform == "opencode":
+        exe = shutil.which("opencode")  # npm installs a .cmd shim that bare-name subprocess can't launch
+        if not exe:
+            return None
         try:
             proc = subprocess.run(
-                ["opencode", "session", "list", "--format", "json", "-n", "5"],
-                cwd=ws_str,
+                [exe, "session", "list", "--format", "json", "-n", "20"],
+                cwd=str(workspace),
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=3.0,
+                timeout=15.0,  # cold start of the opencode background service takes ~7 s
             )
-            if proc.returncode == 0 and proc.stdout.strip().startswith("["):
-                items = json.loads(proc.stdout)
-                for item in items:
-                    if isinstance(item, dict) and item.get("id"):
-                        item_dir = str(item.get("directory", ""))
-                        if not item_dir or Path(item_dir).resolve() == workspace.resolve():
-                            return str(item["id"])
-                if items and isinstance(items[0], dict) and items[0].get("id"):
-                    return str(items[0]["id"])
-        except Exception:
-            pass
+            items = json.loads(proc.stdout) if proc.returncode == 0 and proc.stdout.strip() else []
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+        for item in items if isinstance(items, list) else []:
+            if isinstance(item, dict) and item.get("id") and item.get("directory"):
+                if path_key(item["directory"]) == ws_key:
+                    return str(item["id"])
+        return None
 
-    # 3. Claude Code session auto-discovery (`~/.claude/projects/<encoded-workspace>/<uuid>.jsonl`)
-    if platform == "claude":
-        claude_projects = home / ".claude" / "projects"
-        if claude_projects.exists():
-            encoded_ws = re.sub(r"[^a-zA-Z0-9]", "-", ws_str)
-            candidate_dirs = [claude_projects / encoded_ws]
-            if not candidate_dirs[0].exists():
-                ws_name = workspace.name.lower()
-                candidate_dirs = [
-                    d for d in claude_projects.iterdir() if d.is_dir() and ws_name in d.name.lower()
-                ]
-            jsonl_files: List[Path] = []
-            for cdir in candidate_dirs:
-                if cdir.exists():
-                    jsonl_files.extend(f for f in cdir.glob("*.jsonl") if f.is_file())
-            if jsonl_files:
-                newest = max(jsonl_files, key=lambda p: p.stat().st_mtime)
-                return newest.stem
-
-    # 4. OpenAI Codex rollout session auto-discovery (`~/.codex/sessions/**/rollout-*-<uuid>.jsonl`)
     if platform == "codex":
-        codex_sessions = home / ".codex" / "sessions"
-        if codex_sessions.exists():
-            rollouts = list(codex_sessions.rglob("rollout-*.jsonl"))
-            if rollouts:
-                newest = max(rollouts, key=lambda p: p.stat().st_mtime)
-                m = re.search(
-                    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$",
-                    newest.stem,
-                )
+        root = Path.home() / ".codex" / "sessions"
+        if not root.is_dir():
+            return None
+        rollouts = sorted(root.rglob("rollout-*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for f in rollouts:
+            try:
+                with f.open(encoding="utf-8", errors="replace") as h:
+                    meta = json.loads(h.readline())
+            except (OSError, ValueError):
+                continue
+            payload = meta.get("payload") if isinstance(meta, dict) else None
+            if not isinstance(payload, dict) or meta.get("type") != "session_meta":
+                continue
+            if isinstance(payload.get("source"), dict):
+                continue  # dict source = a sub-agent thread spawned inside another session
+            if payload.get("cwd") and path_key(payload["cwd"]) == ws_key:
+                m = UUID_RE.search(str(payload.get("id", ""))) or UUID_RE.search(f.stem)
                 if m:
-                    return m.group(1)
+                    return m.group(0)
+        return None
 
     return None
 
@@ -282,9 +322,11 @@ def build_platform_fork_instructions(
     oc_model_flag = f'--model "{model}" ' if model else ""
     codex_model_flag = f'-m "{model}" ' if model else ""
 
-    oc_session = base_session_id or (auto_discover_native_session_id(workspace, "opencode") if workspace else None)
-    claude_session = base_session_id or (auto_discover_native_session_id(workspace, "claude") if workspace else None)
-    codex_session = base_session_id or (auto_discover_native_session_id(workspace, "codex") if workspace else None)
+    # A session id only means something to the platform that owns it; other platforms get a fresh subagent.
+    session = base_session_id or (auto_discover_native_session_id(workspace, platform) if workspace else None)
+    oc_session = session if platform == "opencode" else None
+    claude_session = session if platform == "claude" else None
+    codex_session = session if platform == "codex" else None
 
     if oc_session:
         opencode_cmd = (
@@ -300,38 +342,45 @@ def build_platform_fork_instructions(
 
     if claude_session:
         claude_cmd = (
-            f'claude --resume "{claude_session}" --fork-session '
+            f'claude --resume "{claude_session}" --fork-session --permission-mode acceptEdits '
             f'-p "Read {rel_fork_file}, execute ONLY the bounded task, and write your report to {rel_report_file}."'
         )
     else:
         claude_cmd = (
-            f'Task(subagent_type="general-purpose", description="{subagent_name}", '
+            f'Agent(subagent_type="general-purpose", description="{subagent_name}", '
             f'prompt="Read {rel_fork_file} (KV-cache prefix-aligned snapshot). Do NOT re-read already-summarized files. '
             f'Execute ONLY the bounded task and write your report to {rel_report_file}.")'
         )
 
-    if codex_session:
-        codex_cmd = (
-            f'codex exec resume "{codex_session}" {codex_model_flag}--full-auto '
-            f'"Read {rel_fork_file} (shared forked context snapshot). Do NOT re-read already-summarized files. '
-            f'Execute ONLY the bounded task and write your report to {rel_report_file}."'
-        )
-    else:
-        codex_cmd = (
-            f'codex exec resume --last {codex_model_flag}--full-auto '
-            f'"Read {rel_fork_file} (shared forked context snapshot). Do NOT re-read already-summarized files. '
-            f'Execute ONLY the bounded task and write your report to {rel_report_file}."'
-        )
-
-    agy_cmd = (
-        f'invoke_subagent(TypeName="self", Role="{subagent_name}", Workspace="inherit", '
-        f'Prompt="Read {rel_fork_file} (KV-cache prefix-aligned snapshot). Do NOT re-read already-summarized files. '
-        f'Execute ONLY the bounded task and write your report to {rel_report_file}.")'
+    codex_prompt = (
+        f'"Read {rel_fork_file} (shared forked context snapshot). Do NOT re-read already-summarized files. '
+        f'Execute ONLY the bounded task and write your report to {rel_report_file}."'
     )
+    # `--full-auto` was removed in codex 0.147; the sandbox is set through config instead.
+    git_flag = "" if workspace and (Path(workspace) / ".git").exists() else "--skip-git-repo-check "
+    if codex_session:
+        codex_cmd = f'codex exec fork "{codex_session}" -c sandbox_mode=workspace-write {git_flag}{codex_model_flag}{codex_prompt}'
+    else:
+        codex_cmd = f"codex exec -c sandbox_mode=workspace-write {git_flag}{codex_model_flag}{codex_prompt}"
+
+    # Antigravity subagents start with no parent history, so the prompt must stand alone.
+    ws_posix = Path(os.path.realpath(str(workspace))).as_posix() if workspace else "."
+    agy_subagent = {
+        "TypeName": "self",
+        "Role": subagent_name,
+        "Prompt": (
+            f"You start with none of the parent conversation. Workspace root: {ws_posix}. "
+            f"Read {ws_posix}/{rel_fork_file} in full: it holds the shared context snapshot and your one bounded task. "
+            f"Do NOT re-read files it already summarizes. Execute ONLY that task and write your report to "
+            f"{ws_posix}/{rel_report_file}."
+        ),
+        "Workspace": "inherit",
+    }
+    agy_cmd = f"invoke_subagent(Subagents={json.dumps([agy_subagent], ensure_ascii=False)})"
 
     return {
         "active_platform": platform,
-        "discovered_session_id": base_session_id or oc_session or claude_session or codex_session or "KV_PREFIX_ALIGNED",
+        "discovered_session_id": session or "NONE (fresh subagent; context comes from the fork file)",
         "opencode": opencode_cmd,
         "claude": claude_cmd,
         "codex": codex_cmd,
@@ -353,7 +402,10 @@ def cmd_create(args: argparse.Namespace) -> None:
 
     tracked_files: Dict[str, str] = {}
     for fstr in args.files or []:
-        fpath = (workspace / fstr).resolve()
+        fpath = resolve_inside(workspace, fstr)
+        if fpath is None:
+            print(f"[RA CONTEXT HARNESS ERROR] --files path is outside the workspace: {fstr}", file=sys.stderr)
+            sys.exit(1)
         if not fpath.exists() or not fpath.is_file():
             print(f"[RA CONTEXT HARNESS] WARNING: File not found: {fstr}", file=sys.stderr)
             continue
@@ -420,6 +472,14 @@ def cmd_fork(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     subagent_name = slugify(args.subagent)
+    outstanding = reg["outstanding_forks"]
+    if subagent_name in outstanding:
+        print(
+            f"[RA CONTEXT HARNESS BLOCKED] `{subagent_name}` already holds an outstanding fork.\n"
+            f"  Run `ra_context_harness.py return-baton --subagent {subagent_name}` first, or use another name.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     task_type = args.task_type.upper()
     raw_task = args.task
     if isinstance(raw_task, list):
@@ -450,60 +510,51 @@ def cmd_fork(args: argparse.Namespace) -> None:
             )
             sys.exit(1)
 
-    requested_ids = [slugify(sid) for sid in args.snapshots]
-    compiled_sections: List[str] = []
-    base_session_id: Optional[str] = args.base_session
+    requested_ids = list(dict.fromkeys(slugify(sid) for sid in args.snapshots))
 
+    # Validate every snapshot before charging any, so an aborted fork leaves the registry untouched.
+    missing = [sid for sid in requested_ids if sid not in snaps]
+    if missing:
+        print(
+            f"[RA CONTEXT HARNESS ERROR] Snapshot(s) not found (or already evicted): {', '.join(missing)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    stale: List[Tuple[str, str]] = []
     for sid in requested_ids:
-        if sid not in snaps:
-            print(f"[RA CONTEXT HARNESS ERROR] Snapshot `{sid}` not found (or already evicted).", file=sys.stderr)
-            sys.exit(1)
-        snap = snaps[sid]
-        healthy, reasons = evaluate_snapshot_health(workspace, snap)
+        healthy, reasons = evaluate_snapshot_health(workspace, snaps[sid])
         if not healthy:
-            reason_str = ", ".join(reasons)
+            stale.append((sid, ", ".join(reasons)))
+    if stale:
+        for sid, reason_str in stale:
             evict_snapshot_internal(workspace, reg, sid, reason_str)
-            save_registry(workspace, reg)
             print(
                 f"[RA CONTEXT HARNESS AUTO-EVICTED] Snapshot `{sid}` is stale/invalid ({reason_str}) and was "
-                f"THROWN AWAY!\n  Rebuild a fresh snapshot before forking to `{subagent_name}`.",
+                f"THROWN AWAY!",
                 file=sys.stderr,
             )
-            sys.exit(1)
+        save_registry(workspace, reg)
+        print(f"  Nothing was forked. Rebuild fresh snapshot(s) before forking to `{subagent_name}`.", file=sys.stderr)
+        sys.exit(1)
 
-        if not base_session_id and snap.get("base_session_id"):
-            base_session_id = snap.get("base_session_id")
-
-        # Increment reuse counter and log fork lineage
-        snap["reuse_count"] = snap.get("reuse_count", 0) + 1
-        snap.setdefault("forked_to", []).append(
-            {
-                "subagent": subagent_name,
-                "forked_at": now_iso(),
-                "task_type": task_type,
-                "platform": platform,
-            }
-        )
-        snap_file = workspace / snap["file"]
+    base_session_id: Optional[str] = args.base_session or next(
+        (snaps[sid]["base_session_id"] for sid in requested_ids if snaps[sid].get("base_session_id")), None
+    )
+    compiled_sections: List[str] = []
+    for sid in requested_ids:
+        snap_file = workspace / snaps[sid]["file"]
         if snap_file.exists():
             compiled_sections.append(snap_file.read_text(encoding="utf-8"))
-
-        # If this was a 1-shot TASK_EPHEMERAL snapshot, mark it consumed after this fork
-        if snap.get("tier") == "TASK_EPHEMERAL" and snap["reuse_count"] >= snap.get("max_reuses", 1):
-            evict_snapshot_internal(workspace, reg, sid, "TASK_EPHEMERAL_CONSUMED_BY_FORK")
-
-    # Record 1-Concurrency Baton Pass to the Subagent
-    reg["active_baton"] = f"SUBAGENT:{subagent_name}"
-    reg["total_forks_dispatched"] = reg.get("total_forks_dispatched", 0) + 1
-    save_registry(workspace, reg)
 
     fork_file = sdir / "forks" / f"FORK_{subagent_name}.md"
     report_file = sdir / "reports" / f"REPORT_{subagent_name}.md"
     rel_fork = fork_file.relative_to(workspace).as_posix()
     rel_report = report_file.relative_to(workspace).as_posix()
 
+    # Unresolved form keeps a short (8.3) cwd, which Claude Code may have used for its project folder.
     dispatch_cmds = build_platform_fork_instructions(
-        platform, subagent_name, rel_fork, rel_report, base_session_id, args.model, workspace=workspace
+        platform, subagent_name, rel_fork, rel_report, base_session_id, args.model,
+        workspace=Path(os.path.abspath(args.workspace)),
     )
 
     # IMPORTANT HARDWARE KV-CACHE PREFIX OPTIMIZATION:
@@ -533,6 +584,26 @@ def cmd_fork(args: argparse.Namespace) -> None:
     )
     fork_file.write_text(fork_packet, encoding="utf-8")
 
+    forked_at = now_iso()
+    for sid in requested_ids:
+        snap = snaps[sid]
+        snap["reuse_count"] = snap.get("reuse_count", 0) + 1
+        snap.setdefault("forked_to", []).append(
+            {"subagent": subagent_name, "forked_at": forked_at, "task_type": task_type, "platform": platform}
+        )
+        if snap.get("tier") == "TASK_EPHEMERAL" and snap["reuse_count"] >= snap.get("max_reuses", 1):
+            evict_snapshot_internal(workspace, reg, sid, "TASK_EPHEMERAL_CONSUMED_BY_FORK")
+
+    outstanding[subagent_name] = {
+        "forked_at": forked_at,
+        "snapshots": requested_ids,
+        "platform": platform,
+        "task_type": task_type,
+    }
+    reg["active_baton"] = f"SUBAGENT:{subagent_name}"
+    reg["total_forks_dispatched"] = reg.get("total_forks_dispatched", 0) + 1
+    save_registry(workspace, reg)
+
     print("=" * 78)
     print(f"  RA CONTEXT FORK READY -> SUBAGENT: `{subagent_name}` (PLATFORM: {platform.upper()})")
     print("=" * 78)
@@ -551,7 +622,7 @@ def cmd_fork(args: argparse.Namespace) -> None:
     print("-" * 78)
     print(
         f"  WHEN `{subagent_name}` FINISHES: Run `ra_context_harness.py return-baton --subagent {subagent_name} "
-        f"--report-file {rel_report}`"
+        f"--status COMPLETED --report-file {rel_report}` (or --status FAILED)"
     )
     print("=" * 78)
 
@@ -561,12 +632,25 @@ def cmd_return_baton(args: argparse.Namespace) -> None:
     sdir = get_snapshots_dir(workspace)
     reg = load_registry(workspace)
     subagent_name = slugify(args.subagent)
+    status = args.status
+    outstanding = reg["outstanding_forks"]
 
-    report_path = (
-        (workspace / args.report_file).resolve()
-        if args.report_file
-        else (sdir / "reports" / f"REPORT_{subagent_name}.md")
-    )
+    if subagent_name not in outstanding:
+        holders = ", ".join(f"`{n}`" for n in outstanding) or "none"
+        print(
+            f"[RA CONTEXT HARNESS BLOCKED] `{subagent_name}` holds no outstanding fork, so it has no baton to return.\n"
+            f"  Outstanding forks: {holders}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if args.report_file:
+        report_path = resolve_inside(workspace, args.report_file)
+        if report_path is None:
+            print(f"[RA CONTEXT HARNESS ERROR] --report-file is outside the workspace: {args.report_file}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        report_path = sdir / "reports" / f"REPORT_{subagent_name}.md"
     report_summary = (args.summary or "").strip()
 
     if report_path.exists():
@@ -588,15 +672,17 @@ def cmd_return_baton(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    reg["active_baton"] = "MAIN_ORCHESTRATOR"
-    reg["completed_subagent_relays"] = reg.get("completed_subagent_relays", 0) + 1
+    outstanding.pop(subagent_name)
+    # With --parallel forks still out, the baton stays with the most recent remaining subagent.
+    reg["active_baton"] = f"SUBAGENT:{list(outstanding)[-1]}" if outstanding else "MAIN_ORCHESTRATOR"
+    if status == "COMPLETED":
+        reg["completed_subagent_relays"] = reg.get("completed_subagent_relays", 0) + 1
     reg.setdefault("subagent_reports", []).append(
         {
             "subagent": subagent_name,
+            "status": status,
             "returned_at": now_iso(),
-            "report_file": report_path.relative_to(workspace).as_posix()
-            if report_path.is_relative_to(workspace)
-            else str(report_path),
+            "report_file": report_path.relative_to(workspace).as_posix(),
             "summary": report_summary[:240],
         }
     )
@@ -613,10 +699,10 @@ def cmd_return_baton(args: argparse.Namespace) -> None:
     save_registry(workspace, reg)
 
     print("=" * 78)
-    print(f"  RA BATON RETURNED: `{subagent_name}` -> `MAIN_ORCHESTRATOR`")
+    print(f"  RA BATON RETURNED: `{subagent_name}` -> `{reg['active_baton']}` (status: {status})")
     print("=" * 78)
     print(f"  Completed Subagent Relays : {reg['completed_subagent_relays']}")
-    print(f"  Verified Report File      : {report_path.relative_to(workspace).as_posix() if report_path.is_relative_to(workspace) else report_path}")
+    print(f"  Verified Report File      : {report_path.relative_to(workspace).as_posix()}")
     if drifted_snaps:
         print("  [AUTO-EVICTED STALE SNAPSHOTS AFTER SUBAGENT WORK]:")
         for sid, r_str in drifted_snaps:
@@ -651,6 +737,24 @@ def cmd_evict(args: argparse.Namespace) -> None:
         else:
             print(f"[RA CONTEXT HARNESS] Snapshot `{sid}` not found in active registry.", file=sys.stderr)
             sys.exit(1)
+    else:
+        # No --id / --auto-gc: report health only, change nothing.
+        stale = []
+        for sid in snaps:
+            healthy, reasons = evaluate_snapshot_health(workspace, reg["snapshots"][sid])
+            if not healthy:
+                stale.append((sid, ", ".join(reasons)))
+        print("=" * 78)
+        print("  RA CONTEXT SNAPSHOT HEALTH CHECK (dry run, nothing evicted)")
+        print("=" * 78)
+        for sid, r in stale:
+            print(f"  - [STALE] `{sid}` -> {r}")
+        if stale:
+            print("  Throw them away with `evict --auto-gc`, or one at a time with `evict --id <id>`.")
+        else:
+            print(f"  - All {len(snaps)} active snapshot(s) are fresh.")
+        print("=" * 78)
+        return
 
     save_registry(workspace, reg)
     print("=" * 78)
@@ -674,6 +778,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     print("  RA SUBAGENT CONTEXT CONTROLLER & SNAPSHOT HARNESS STATUS")
     print("=" * 78)
     print(f"  Active Execution Baton    : {reg.get('active_baton', 'MAIN_ORCHESTRATOR')}")
+    print(f"  Outstanding Forks         : {', '.join(reg['outstanding_forks']) or 'none'}")
     print(f"  Total Forks Dispatched    : {reg.get('total_forks_dispatched', 0)}")
     print(f"  Completed Subagent Relays : {reg.get('completed_subagent_relays', 0)}")
     print(f"  Active Snapshots          : {len(snaps)}")
@@ -802,8 +907,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional native session ID for `opencode run --session <id> --fork` or `claude --resume <id> --fork-session`",
     )
-    p_create.add_argument("--max-reuses", type=int, default=None, help="Override max fork reuse count before eviction")
-    p_create.add_argument("--ttl-minutes", type=int, default=None, help="Override TTL in minutes before eviction")
+    p_create.add_argument("--max-reuses", type=positive_int, default=None, help="Override max fork reuse count before eviction (> 0)")
+    p_create.add_argument("--ttl-minutes", type=positive_int, default=None, help="Override TTL in minutes before eviction (> 0)")
     p_create.set_defaults(func=cmd_create)
 
     p_fork = sub.add_parser("fork", help="Fork shared context snapshot(s) into a bounded Subagent execution packet")
@@ -835,16 +940,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--platform",
         default="auto",
         choices=list(SUPPORTED_PLATFORMS),
-        help="Target agent platform (`auto`, `opencode`, `claude`, `agy`)",
+        help="Target agent platform (`auto`, `opencode`, `claude`, `codex`, `agy`)",
     )
     p_fork.add_argument(
         "--base-session",
         "--session-id",
         dest="base_session",
         default=None,
-        help="Optional native session ID override for `--fork`",
+        help="Native session ID to fork; applies to the target platform only",
     )
-    p_fork.add_argument("--model", default=None, help="Optional model name for opencode dispatch command")
+    p_fork.add_argument("--model", default=None, help="Optional model name for the opencode / codex dispatch command")
     p_fork.add_argument("--parallel", action="store_true", help="Allow parallel forks (default enforces 1-concurrency baton pass)")
     p_fork.add_argument("--allow-multi-step", action="store_true", help="Allow numbered sub-steps within a single atomic goal")
     p_fork.set_defaults(func=cmd_fork)
@@ -860,7 +965,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to subagent report markdown file",
     )
     p_ret.add_argument("--summary", default=None, help="Inline report summary if report file was not written directly")
-    p_ret.add_argument("--status", default="COMPLETED", help="Optional completion status tag (e.g., COMPLETED)")
+    p_ret.add_argument(
+        "--status",
+        default="COMPLETED",
+        type=str.upper,
+        choices=list(RELAY_STATUSES),
+        help="Outcome of the subagent's task; only COMPLETED counts toward completed_subagent_relays",
+    )
     p_ret.set_defaults(func=cmd_return_baton)
 
     p_evict = sub.add_parser("evict", help="Throw away (evict) a specific snapshot or auto-garbage-collect stale snapshots")
@@ -893,6 +1004,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    # Windows pipes default to the ANSI code page (e.g. cp932), which cannot encode the em dashes printed here.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     parser = build_parser()
     args = parser.parse_args()
     args.func(args)

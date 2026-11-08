@@ -27,7 +27,7 @@ Never refer to mathematical symbols, physical laws, or structural syntax tokens 
 1. Place all legitimate `AXIOMATIC_PRIMITIVES` in a dedicated file (e.g., `axioms.py`, `axioms.ts`, `axioms.rs`, or `research/AXIOMS.json`).
 2. Seal the file using the gatekeeper:
    ```bash
-   python "<SKILL_DIR>/scripts/ra_gate.py" seal-axioms --file "<path/to/axioms>"
+   python "<RA_DIR>/scripts/ra_gate.py" seal-axioms --file "<path/to/axioms>"
    ```
 3. `ra_gate.py` records the SHA-256 hash and line count of the axioms file in `research/.ra_state.json`.
 4. If any subsequent session or subagent modifies the sealed axioms file to sneak in lookup data or heuristics, `ra_cheese_audit.py` and `ra_gate.py` immediately fail with `AXIOM_SEAL_VIOLATION` unless the user explicitly approves resealing.

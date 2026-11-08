@@ -17,7 +17,7 @@ Before stating what a skill does or skipping a step, read that skill's `SKILL.md
 Most projects don't start with RA from day 1 — they arrive half-finished, vibe-coded across multiple AI sessions, or full of hidden band-aids, mocked/fake data, and silent bypasses.
 Whenever you are dropped into an **existing project** where the user isn't sure why things are failing or what previous AI sessions broke, **first run the Truth-Path Project Scanner**:
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_cheese_audit.py" --workspace "." --scan-project
+python "${CLAUDE_SKILL_DIR}/../research-anything/scripts/ra_cheese_audit.py" --workspace "." --scan-project
 ```
 This classifies the project (`FRESH_GREENFIELD`, `POLLUTED_VIBE_CODE_NEEDS_TRUTH_PATH`, `UNFINISHED_HALF_WIRED`, or `CLEAN_PRODUCTION_TIER`) and generates **`research/TRUTH_PATH_AUDIT.md`**, exposing:
 1. **Hidden Band-Aids (`[EXPOSED_BANDAID]`)**: `except: pass`, empty `catch {}`, `@ts-ignore` / `type: ignore`, and `setTimeout` race-condition hacks.

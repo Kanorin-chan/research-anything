@@ -6,14 +6,18 @@ Prevents "Code-Context Blindness" (where an AI assumes the UI/game/chart/render 
 because the code compiled or DOM exists, or ignores/misfits the user's provided assets).
 
 Enforces:
-1. Auto-detection of visual/UI/rendering scope across sandbox and target files.
+1. Auto-detection of visual/UI/rendering scope across sandbox and target files (and, in
+   STANDALONE mode, the project's own source files).
 2. Provided-Asset Discovery, Usage & Fit Auditing:
    - Scans workspace & sandbox asset folders (`assets/`, `public/`, `static/`, `icons/`,
      `images/`, `img/`, `sprites/`, `textures/`, `media/`, `ui/`, `reference/`, etc.).
    - Extracts native `WxH` dimensions and aspect ratios (`W:H`) for `.png`, `.jpg`, `.jpeg`,
-     `.webp`, `.gif`, `.bmp`, `.ico`, and `.svg` (`viewBox`/`width`/`height`) so the agent
-     fits every asset/icon into a properly proportioned slot without stretching or clipping.
-   - Cross-checks prototype code against provided assets to catch:
+     `.webp`, `.gif`, `.bmp`, `.ico` (largest image), and `.svg` (root `width`/`height`,
+     else `viewBox`) so the agent fits every asset/icon into a properly proportioned slot.
+   - Cross-checks code against provided assets. An asset counts as used only when a real
+     path reference (quoted string, `src=`/`href=`/`url(...)`, `key: value`) resolves to it —
+     relative to the file, the workspace, `public/`/`static/` roots, or the `@/` / `~/` aliases.
+     Docs (`.md`, `.txt`, ...) never count. This catches:
      a) **Ignored Provided Assets**: Provided assets exist on disk, but the AI ignored them
         and rendered bare CSS boxes, text, or emoji instead.
      b) **Hallucinated / Broken Asset Paths**: Code references `assets/foo.png` that does
@@ -23,7 +27,8 @@ Enforces:
 3. Verification of real captured screenshots (`.png`, `.jpg`, `.jpeg`, `.webp`) in
    `research/sandbox/<hypothesis>/visual_captures/`:
    - Parses binary headers to verify real resolution (`width x height >= 64x64`).
-   - Rejects 0-byte, tiny, or uniform blank-screen captures (Shannon byte entropy `< 2.2`).
+   - Rejects 0-byte, tiny, or blank-screen captures by decoded-pixel variance (Pillow when
+     installed; else a pure-stdlib PNG decoder; else bytes-per-pixel), naming the method used.
 4. Verification of `VISUAL_AUDIT.md`:
    - Ensures every captured image and provided asset fit is logged.
    - Blocks unfilled placeholders and lazy superficial comments ("looks good", "rendered fine")
@@ -38,12 +43,20 @@ import difflib
 import hashlib
 import json
 import math
+import os
 import re
 import struct
 import sys
+import zlib
 from collections import Counter
+from itertools import accumulate
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+
+try:  # optional: exact pixel statistics for every format
+    from PIL import Image as _PILImage
+except Exception:  # pragma: no cover - stdlib fallback below
+    _PILImage = None
 
 VISUAL_EXTENSIONS = {
     ".css", ".scss", ".sass", ".less", ".html", ".htm", ".jsx", ".tsx",
@@ -71,26 +84,50 @@ DEFAULT_ASSET_DIR_NAMES = {
     "fonts", "font", "reference", "references", "skins", "themes",
 }
 
-EXCLUDED_ASSET_SCAN_DIRS = {
-    ".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
-    ".claude", ".agents", ".gemini", "visual_captures", "graveyard",
-    "context_snapshots", "hypotheses", "library", "harness", "logs",
+# Same pruning as ra_cheese_audit.py (case-insensitive directory names).
+PRUNED_DIR_NAMES = {
+    ".git", ".hg", ".svn", "node_modules", "bower_components", "jspm_packages", "venv", ".venv", "env",
+    "virtualenv", "site-packages", "__pycache__", ".tox", ".nox", ".mypy_cache", ".pytest_cache",
+    "dist", "build", "builds", "out", "target", "obj", "bin", "library", "temp", ".gradle", ".next", ".nuxt",
+    ".svelte-kit", ".dart_tool", ".expo", "vendor", "third_party", "third-party", "thirdparty", "external",
+    "coverage", "pods", "research", ".agents", ".claude", ".codex", ".gemini",
+}
+TEST_DIR_NAMES = {
+    "test", "tests", "__tests__", "__mocks__", "spec", "specs", "testdata", "test_data", "fixtures", "androidtest",
+}
+# Sandboxes live under research/, so asset and sandbox walks keep it but skip RA's own bookkeeping dirs.
+EXCLUDED_ASSET_SCAN_DIRS = (PRUNED_DIR_NAMES - {"research"}) | {
+    "visual_captures", "graveyard", "context_snapshots", "hypotheses", "harness", "logs",
 }
 
 CODE_SCAN_EXTENSIONS = {
-    ".html", ".htm", ".css", ".scss", ".sass", ".less", ".js", ".jsx",
-    ".ts", ".tsx", ".vue", ".svelte", ".py", ".php", ".rb", ".rs",
-    ".gd", ".tscn", ".qml", ".json", ".yaml", ".yml", ".xml", ".md",
+    ".html", ".htm", ".css", ".scss", ".sass", ".less", ".js", ".mjs", ".cjs", ".jsx",
+    ".ts", ".tsx", ".vue", ".svelte", ".py", ".php", ".rb", ".rs", ".cs", ".kt", ".dart",
+    ".gd", ".tscn", ".qml", ".json", ".yaml", ".yml", ".xml",
 }
+DOC_EXTENSIONS = {".md", ".markdown", ".rst", ".txt", ".adoc"}
+UI_SOURCE_EXTENSIONS = VISUAL_EXTENSIONS | {".js", ".mjs", ".cjs", ".ts"}
+SKIPPED_CODE_FILE_NAMES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "composer.lock"}
+RA_SDK_FILE_NAMES = {"visual_audit.md", "ra_logger.py", "ra_logger.js", "ra_logger.ts", "ra_logger.mjs", "ralogger.php"}
+MAX_CODE_FILE_BYTES = 2_000_000
+
+_ASSET_EXT_ALT = r"png|jpe?g|webp|svg|ico|gif|bmp|avif|ttf|otf|woff2?|glb|gltf|atlas"
 
 ASSET_PATH_REF_RE = re.compile(
-    r"""(?:src|href|url|icon|image|texture|sprite|background|poster|load_image|load|open|preload)\s*(?:=|\()\s*['"]?([^'"\)\s<>]+?\.(?:png|jpe?g|webp|svg|ico|gif|bmp|avif|ttf|otf|woff2?|glb|gltf|atlas))['"]?""",
+    r"""(?:src|href|url|icon|image|texture|sprite|background|poster|load_image|load|open|preload)\s*(?:=|\()\s*['"]?([^'"\)\s<>]+?\.(?:"""
+    + _ASSET_EXT_ALT + r"""))['"]?(?![\w.])""",
     re.IGNORECASE,
 )
 
 QUOTED_ASSET_STRING_RE = re.compile(
-    r"""['"]([^'"\n\r<>]+?\.(?:png|jpe?g|webp|svg|ico|gif|bmp|avif|ttf|otf|woff2?|glb|gltf|atlas))['"]""",
+    r"""['"`]([^'"`\n\r<>]+?\.(?:""" + _ASSET_EXT_ALT + r"""))(?:[?#][^'"`\n\r<>]*)?['"`]""",
     re.IGNORECASE,
+)
+
+# `icon: images/logo.png` / `icon = images/logo.png` in YAML/INI/TOML-ish configs.
+KEY_VALUE_ASSET_RE = re.compile(
+    r"""^\s*[\w.\-]+\s*[:=]\s*([^\s'"#]+\.(?:""" + _ASSET_EXT_ALT + r"""))\s*$""",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 DUMMY_PLACEHOLDER_URL_RE = re.compile(
@@ -105,6 +142,36 @@ LAZY_OBSERVATION_PATTERNS = [
     ),
 ]
 
+# Blank-capture thresholds: max per-channel std-dev, and share of pixels within +-6 of the dominant luminance.
+BLANK_MAX_STDDEV = 4.0
+BLANK_DOMINANT_SHARE = 0.999
+BLANK_MAX_BYTES_PER_PIXEL = 0.02
+STDLIB_PNG_MAX_RAW_BYTES = 24_000_000
+
+
+def _utf8_console() -> None:
+    # Windows consoles default to cp932/cp1252, which cannot print the report's dashes.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
+def _ra_common():
+    # The script dir is not on sys.path under `python -I`.
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import ra_common
+
+    return ra_common
+
+
+def _mark_passed(state: Dict[str, Any], workspace: Path, hyp: str) -> None:
+    state["visual_audit_passed"] = True
+    state.setdefault("pass_fingerprints", {})["visual_audit_passed"] = _ra_common().code_fingerprint(workspace, state, hyp)
+
 
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -114,17 +181,11 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def shannon_entropy(data: bytes) -> float:
-    if not data:
-        return 0.0
-    counts = Counter(data)
-    total = len(data)
-    return -sum((c / total) * math.log2(c / total) for c in counts.values())
-
-
-def simplify_aspect_ratio(w: int, h: int) -> str:
+def simplify_aspect_ratio(w: float, h: float) -> str:
     if w <= 0 or h <= 0:
         return "UNKNOWN"
+    if not (isinstance(w, int) and isinstance(h, int)):
+        return f"{w / h:.2f}:1"
     g = math.gcd(w, h)
     rw, rh = w // g, h // g
     if rw > 64 or rh > 64:
@@ -132,26 +193,58 @@ def simplify_aspect_ratio(w: int, h: int) -> str:
     return f"{rw}:{rh}"
 
 
-def get_image_dimensions(path: Path) -> Optional[Tuple[int, int]]:
+# --------------------------------------------------------------------------- dimensions
+
+_SVG_NUM = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+_SVG_UNIT_PX = {"": 1.0, "px": 1.0, "pt": 4 / 3, "pc": 16.0, "in": 96.0, "cm": 96 / 2.54, "mm": 96 / 25.4}
+
+
+def _clean_num(v: float) -> Any:
+    return int(round(v)) if abs(v - round(v)) < 1e-6 else round(v, 3)
+
+
+def _svg_dimensions(path: Path) -> Optional[Tuple[Any, Any]]:
+    """Root <svg> size: absolute width/height win, else viewBox (scaled by one absolute side if present)."""
+    try:
+        txt = path.read_text(encoding="utf-8", errors="ignore")[:2_000_000]
+    except OSError:
+        return None
+    txt = re.sub(r"<!--.*?-->", "", txt, flags=re.DOTALL)
+    m = re.search(r"<svg\b([^>]*)>", txt, re.IGNORECASE)
+    if not m:
+        return None
+    attrs = m.group(1)
+
+    def attr(name: str) -> Optional[str]:
+        am = re.search(rf"""(?<![\w:\-]){name}\s*=\s*["']([^"']*)["']""", attrs, re.IGNORECASE)
+        return am.group(1).strip() if am else None
+
+    def absolute(value: Optional[str]) -> Optional[float]:
+        vm = re.fullmatch(rf"({_SVG_NUM})\s*(px|pt|pc|in|cm|mm)?", value or "", re.IGNORECASE)
+        if not vm:
+            return None  # %, em, auto...: relative, not an intrinsic size
+        px = float(vm.group(1)) * _SVG_UNIT_PX[(vm.group(2) or "").lower()]
+        return px if px > 0 else None
+
+    w, h = absolute(attr("width")), absolute(attr("height"))
+    if w and h:
+        return _clean_num(w), _clean_num(h)
+    nums = re.findall(_SVG_NUM, attr("viewBox") or "")
+    if len(nums) == 4 and float(nums[2]) > 0 and float(nums[3]) > 0:
+        vw, vh = float(nums[2]), float(nums[3])
+        if w:
+            return _clean_num(w), _clean_num(w * vh / vw)
+        if h:
+            return _clean_num(h * vw / vh), _clean_num(h)
+        return _clean_num(vw), _clean_num(vh)
+    return None
+
+
+def get_image_dimensions(path: Path) -> Optional[Tuple[Any, Any]]:
     """Extract (width, height) from PNG, JPEG, WebP, GIF, BMP, ICO, or SVG headers using pure Python."""
     suffix = path.suffix.lower()
     if suffix == ".svg":
-        try:
-            txt = path.read_text(encoding="utf-8", errors="ignore")[:4096]
-            vb = re.search(
-                r'viewBox\s*=\s*["\']\s*[-+]?\d*\.?\d+[\s,]+[-+]?\d*\.?\d+[\s,]+(\d+(?:\.\d+)?)[\s,]+(\d+(?:\.\d+)?)',
-                txt,
-                re.IGNORECASE,
-            )
-            if vb:
-                return max(1, int(float(vb.group(1)))), max(1, int(float(vb.group(2))))
-            wm = re.search(r'\bwidth\s*=\s*["\'](\d+(?:\.\d+)?)(?:px)?["\']', txt, re.IGNORECASE)
-            hm = re.search(r'\bheight\s*=\s*["\'](\d+(?:\.\d+)?)(?:px)?["\']', txt, re.IGNORECASE)
-            if wm and hm:
-                return max(1, int(float(wm.group(1)))), max(1, int(float(hm.group(1))))
-        except Exception:
-            return None
-        return None
+        return _svg_dimensions(path)
 
     try:
         data = path.read_bytes()
@@ -214,13 +307,203 @@ def get_image_dimensions(path: Path) -> Optional[Tuple[int, int]]:
         w, h = struct.unpack("<ii", data[18:26])
         return abs(int(w)), abs(int(h))
 
-    # 6. ICO: 00 00 01 00
-    if len(data) >= 8 and data[:4] == b"\x00\x00\x01\x00":
-        w = data[6] or 256
-        h = data[7] or 256
-        return int(w), int(h)
+    # 6. ICO: 00 00 01 00 + one 16-byte directory entry per image; report the largest
+    if len(data) >= 22 and data[:4] == b"\x00\x00\x01\x00":
+        count = struct.unpack("<H", data[4:6])[0]
+        sizes = [
+            (data[6 + 16 * i] or 256, data[7 + 16 * i] or 256)
+            for i in range(count)
+            if 6 + 16 * i + 2 <= len(data)
+        ]
+        if sizes:
+            return max(sizes, key=lambda s: s[0] * s[1])
 
     return None
+
+
+# --------------------------------------------------------------------------- blank-capture detection
+
+_SWAR_MASKS: Dict[int, Tuple[int, int]] = {}
+
+
+def _add_rows(a: bytes, b: bytes) -> bytes:
+    """Bytewise (a + b) & 0xFF without a Python loop (SWAR on one big int)."""
+    n = len(a)
+    if n not in _SWAR_MASKS:
+        hi = int.from_bytes(b"\x80" * n, "little")
+        _SWAR_MASKS[n] = (hi, hi ^ int.from_bytes(b"\xff" * n, "little"))
+    hi, lo = _SWAR_MASKS[n]
+    x, y = int.from_bytes(a, "little"), int.from_bytes(b, "little")
+    return (((x & lo) + (y & lo)) ^ ((x ^ y) & hi)).to_bytes(n, "little")
+
+
+def _unfilter_png(raw: bytes, height: int, stride: int, bpp: int) -> List[bytes]:
+    rows: List[bytes] = []
+    prev = bytes(stride)
+    pos = 0
+    for _ in range(height):
+        ft, line = raw[pos], raw[pos + 1 : pos + 1 + stride]
+        pos += stride + 1
+        if ft == 0:
+            cur = line
+        elif ft == 1:
+            out = bytearray(line)
+            for c in range(bpp):
+                out[c::bpp] = bytes(v & 0xFF for v in accumulate(line[c::bpp]))
+            cur = bytes(out)
+        elif ft == 2:
+            cur = _add_rows(line, prev)
+        elif ft in (3, 4):
+            out = bytearray(line)
+            for k in range(stride):
+                a = out[k - bpp] if k >= bpp else 0
+                b = prev[k]
+                if ft == 3:
+                    out[k] = (line[k] + ((a + b) >> 1)) & 0xFF
+                else:
+                    c = prev[k - bpp] if k >= bpp else 0
+                    p = a + b - c
+                    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                    out[k] = (line[k] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 0xFF
+            cur = bytes(out)
+        else:
+            raise ValueError(f"bad PNG filter {ft}")
+        rows.append(cur)
+        prev = cur
+    return rows
+
+
+def _stdlib_png_samples(data: bytes) -> Optional[List[Tuple[int, int, int]]]:
+    """Decode a non-interlaced 8/16-bit PNG with zlib and return sampled RGB pixels (None if unsupported)."""
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    pos, idat, palette, ihdr = 8, [], b"", None
+    while pos + 8 <= len(data):
+        length, ctype = struct.unpack(">I4s", data[pos : pos + 8])
+        body = data[pos + 8 : pos + 8 + length]
+        if ctype == b"IHDR":
+            ihdr = struct.unpack(">IIBBBBB", body[:13])
+        elif ctype == b"PLTE":
+            palette = body
+        elif ctype == b"IDAT":
+            idat.append(body)
+        elif ctype == b"IEND":
+            break
+        pos += 12 + length
+    if not ihdr:
+        return None
+    w, h, depth, color, _, _, interlace = ihdr
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(color)
+    if not channels or interlace or depth not in (8, 16) or (color == 3 and depth != 8):
+        return None
+    bpp = channels * depth // 8
+    stride = w * bpp
+    if h * (stride + 1) > STDLIB_PNG_MAX_RAW_BYTES:
+        return None
+    rows = _unfilter_png(zlib.decompress(b"".join(idat)), h, stride, bpp)
+
+    step = max(1, math.ceil(math.sqrt(w * h / 300_000)))
+    samples: List[Tuple[int, int, int]] = []
+    for row in rows[::step]:
+        if depth == 16:
+            row = row[0::2]  # high byte of each sample
+        px = channels
+        if color == 3:
+            idx = row[::step]
+            samples.extend((palette[3 * i], palette[3 * i + 1], palette[3 * i + 2]) for i in idx if 3 * i + 2 < len(palette))
+        elif color in (0, 4):
+            g = row[0::px][::step]
+            samples.extend(zip(g, g, g))
+        else:
+            samples.extend(zip(row[0::px][::step], row[1::px][::step], row[2::px][::step]))
+    return samples
+
+
+def _blank_verdict(sd_max: float, dominant: float, method: str) -> Tuple[bool, str]:
+    blank = sd_max < BLANK_MAX_STDDEV or dominant >= BLANK_DOMINANT_SHARE
+    return blank, f"pixel std-dev {sd_max:.2f}, {dominant * 100:.2f}% one colour [{method}]"
+
+
+def _stats_from_hists(channel_hists: List[List[int]], lum_hist: List[int], method: str) -> Tuple[bool, str]:
+    sds = []
+    for hist in channel_hists:
+        n = sum(hist) or 1
+        mean = sum(i * c for i, c in enumerate(hist)) / n
+        sds.append(math.sqrt(sum(c * (i - mean) ** 2 for i, c in enumerate(hist)) / n))
+    n = sum(lum_hist) or 1
+    mode = max(range(256), key=lambda i: lum_hist[i])
+    dominant = sum(lum_hist[max(0, mode - 6) : mode + 7]) / n
+    return _blank_verdict(max(sds), dominant, method)
+
+
+def measure_blankness(path: Path, raw: bytes, dims: Optional[Tuple[Any, Any]]) -> Tuple[Optional[bool], str]:
+    """(is_blank, evidence). Method: Pillow pixels > stdlib PNG pixels > bytes-per-pixel."""
+    pil_note = ""
+    if _PILImage is not None:
+        try:
+            with _PILImage.open(path) as im:
+                rgb = im.convert("RGB")
+                hist = rgb.histogram()
+                lum = rgb.convert("L").histogram()
+            return _stats_from_hists([hist[0:256], hist[256:512], hist[512:768]], lum, "Pillow pixel variance")
+        except Exception as exc:  # unreadable to Pillow: fall back and say why
+            pil_note = f"; Pillow could not decode it: {exc}"
+    try:
+        samples = _stdlib_png_samples(raw)
+    except (zlib.error, ValueError, IndexError, struct.error):
+        samples = None
+    if samples:
+        chans = [[0] * 256 for _ in range(3)]
+        lum = [0] * 256
+        for c, cnt in Counter(samples).items():
+            for k in range(3):
+                chans[k][c[k]] += cnt
+            lum[(c[0] * 299 + c[1] * 587 + c[2] * 114) // 1000] += cnt
+        return _stats_from_hists(chans, lum, "stdlib PNG pixel variance" + pil_note)
+    if dims and dims[0] * dims[1] > 0:
+        bpp = len(raw) / (dims[0] * dims[1])
+        return bpp < BLANK_MAX_BYTES_PER_PIXEL, (
+            f"{bpp:.4f} bytes/pixel [bytes-per-pixel estimate; install Pillow for a pixel check{pil_note}]"
+        )
+    return None, "not measured (unknown dimensions)" + pil_note
+
+
+# --------------------------------------------------------------------------- walking
+
+def _prune(cur: str, dirs: List[str], excluded: Set[str], skip_tests: bool) -> List[str]:
+    kept = []
+    for d in dirs:
+        dl = d.lower()
+        if dl in excluded or (dl.startswith(".") and dl != ".github") or dl.endswith(".egg-info"):
+            continue
+        if skip_tests and dl in TEST_DIR_NAMES:
+            continue
+        if os.path.isfile(os.path.join(cur, d, "pyvenv.cfg")):  # a venv under any name
+            continue
+        kept.append(d)
+    return sorted(kept)
+
+
+def _walk_files(root: Path, excluded: Set[str], skip_tests: bool) -> Iterator[Path]:
+    for cur, dirs, files in os.walk(root):
+        dirs[:] = _prune(cur, dirs, excluded, skip_tests)
+        for f in sorted(files):
+            yield Path(cur, f)
+
+
+def _is_code_file(f: Path) -> bool:
+    name = f.name.lower()
+    if name in SKIPPED_CODE_FILE_NAMES or name in RA_SDK_FILE_NAMES or ".min." in name:
+        return False
+    return f.suffix.lower() in CODE_SCAN_EXTENSIONS or any(name.endswith(s) for s in VISUAL_COMPOUND_SUFFIXES)
+
+
+def _is_relative(p: Path, base: Path) -> bool:
+    try:
+        p.relative_to(base)
+        return True
+    except ValueError:
+        return False
 
 
 def discover_provided_assets(
@@ -248,9 +531,7 @@ def discover_provided_assets(
 
     for base in search_bases:
         for child in sorted(base.iterdir()):
-            if not child.is_dir():
-                continue
-            if child.name in EXCLUDED_ASSET_SCAN_DIRS:
+            if not child.is_dir() or child.name.lower() in EXCLUDED_ASSET_SCAN_DIRS:
                 continue
             if child.name.lower() in DEFAULT_ASSET_DIR_NAMES:
                 candidate_roots.append(child)
@@ -264,29 +545,16 @@ def discover_provided_assets(
     assets: List[Dict[str, Any]] = []
 
     for root in candidate_roots:
-        files_iter = [root] if root.is_file() else sorted(root.rglob("*"))
+        files_iter = [root] if root.is_file() else _walk_files(root, EXCLUDED_ASSET_SCAN_DIRS, skip_tests=False)
         for f in files_iter:
-            if not f.is_file():
+            if f.suffix.lower() not in ASSET_EXTENSIONS or not f.is_file():
                 continue
             resolved = f.resolve()
-            rel_parts = (
-                resolved.relative_to(workspace).parts
-                if resolved.is_relative_to(workspace)
-                else (resolved.name,)
-            )
-            if any(part in EXCLUDED_ASSET_SCAN_DIRS for part in rel_parts):
-                continue
-            if f.suffix.lower() not in ASSET_EXTENSIONS:
-                continue
             if resolved in seen_paths:
                 continue
             seen_paths.add(resolved)
 
-            rel = (
-                resolved.relative_to(workspace).as_posix()
-                if resolved.is_relative_to(workspace)
-                else resolved.name
-            )
+            rel = resolved.relative_to(workspace).as_posix() if _is_relative(resolved, workspace) else resolved.name
             dims = get_image_dimensions(resolved)
             dim_str = f"{dims[0]}x{dims[1]}" if dims else "N/A"
             aspect_str = simplify_aspect_ratio(dims[0], dims[1]) if dims else "N/A"
@@ -306,40 +574,134 @@ def discover_provided_assets(
     return assets
 
 
-def collect_code_files_for_asset_scan(workspace: Path, sandbox_dir: Optional[Path]) -> List[Path]:
-    """Collect prototype/UI code files in sandbox and tracked workspace files."""
-    files: List[Path] = []
+def _tracked_files(workspace: Path) -> List[Path]:
+    state_path = workspace / "research" / ".ra_state.json"
+    if not state_path.exists():
+        return []
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return []
+    out = []
+    for rel in state.get("context_map_snapshot", {}).get("tracked_files", {}).keys():
+        fp = (workspace / rel).resolve()
+        if fp.is_file():
+            out.append(fp)
+    return out
+
+
+def collect_code_files_for_asset_scan(
+    workspace: Path, sandbox_dir: Optional[Path], standalone: bool = False
+) -> List[Tuple[Path, bool]]:
+    """(file, found only by the project walk): sandbox code + tracked files, plus project source when standalone.
+
+    Docs never count.
+    """
+    files: List[Tuple[Path, bool]] = []
     seen: Set[Path] = set()
 
-    if sandbox_dir and sandbox_dir.exists():
-        for f in sorted(sandbox_dir.rglob("*")):
-            if not f.is_file():
-                continue
-            if "visual_captures" in f.parts or "logs" in f.parts:
-                continue
-            if f.name in {"VISUAL_AUDIT.md", "ra_logger.py", "ra_logger.js", "RALogger.php"}:
-                continue
-            if f.suffix.lower() in CODE_SCAN_EXTENSIONS or any(
-                f.name.lower().endswith(s) for s in VISUAL_COMPOUND_SUFFIXES
-            ):
-                r = f.resolve()
-                if r not in seen:
-                    seen.add(r)
-                    files.append(r)
-
-    state_path = workspace / "research" / ".ra_state.json"
-    if state_path.exists():
+    def add(f: Path, project_only: bool = False) -> None:
+        if f.suffix.lower() in DOC_EXTENSIONS or not _is_code_file(f):
+            return
+        r = f.resolve()
+        if r in seen:
+            return
         try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-            for rel in state.get("context_map_snapshot", {}).get("tracked_files", {}).keys():
-                fp = (workspace / rel).resolve()
-                if fp.exists() and fp.is_file() and fp not in seen:
-                    seen.add(fp)
-                    files.append(fp)
-        except Exception:
-            pass
+            if r.stat().st_size > MAX_CODE_FILE_BYTES:
+                return
+        except OSError:
+            return
+        seen.add(r)
+        files.append((r, project_only))
 
+    if sandbox_dir and sandbox_dir.exists():
+        for f in _walk_files(sandbox_dir, EXCLUDED_ASSET_SCAN_DIRS, skip_tests=False):
+            add(f)
+    for f in _tracked_files(workspace):
+        add(f)
+    if standalone:
+        for f in _walk_files(workspace, PRUNED_DIR_NAMES, skip_tests=True):
+            add(f, project_only=True)
     return files
+
+
+# --------------------------------------------------------------------------- reference resolution
+
+def _extract_asset_refs(text: str) -> Set[str]:
+    refs: Set[str] = set()
+    for rx in (ASSET_PATH_REF_RE, QUOTED_ASSET_STRING_RE, KEY_VALUE_ASSET_RE):
+        for m in rx.finditer(text):
+            ref = m.group(1).strip()
+            # Prose in a string ("Click logo.png to open") is not a path.
+            if ref and (not re.search(r"\s", ref) or "/" in ref):
+                refs.add(ref)
+    return refs
+
+
+def _is_dynamic_or_external(ref: str) -> bool:
+    low = ref.lower()
+    if low.startswith(("res://", "user://", "~/")):
+        return False
+    if "://" in low or low.startswith(("data:", "//", "{", "$", "<", "~", "mailto:")):
+        return True  # URL, data URI, template, or `~pkg/...` node_modules import
+    return any(tok in ref for tok in ("{", "}", "(", ")", "%", "*"))
+
+
+def _resolve_asset_ref(
+    ref: str,
+    code_file: Path,
+    workspace: Path,
+    sandbox_dir: Optional[Path],
+    by_path: Dict[str, Dict[str, Any]],
+    by_name: Dict[str, List[Dict[str, Any]]],
+) -> Tuple[bool, List[Dict[str, Any]], bool]:
+    """(exists, provided assets it points at, its folder exists). Tries file-relative, root, public/static, aliases."""
+    clean = ref.split("?")[0].split("#")[0].replace("\\", "/")
+    for prefix in ("res://", "user://"):
+        if clean.startswith(prefix):
+            clean = clean[len(prefix):]
+    bases: List[Tuple[Path, str]] = []
+    if clean.startswith(("@/", "~/")):
+        rest = clean[2:]
+        bases += [(workspace / "src", rest), (workspace, rest)]
+    elif clean.startswith("@") and "/" in clean:
+        alias, rest = clean[1:].split("/", 1)  # e.g. @assets/x -> src/assets/x
+        bases += [(workspace / "src" / alias, rest), (workspace / alias, rest)]
+    elif clean.startswith("/"):
+        rest = clean.lstrip("/")
+        roots = [workspace, workspace / "public", workspace / "static"]
+        if sandbox_dir:
+            roots += [sandbox_dir, sandbox_dir / "public", sandbox_dir / "static"]
+        bases += [(r, rest) for r in roots]
+    else:
+        rest = clean
+        bases.append((code_file.parent, rest))
+        roots = [workspace, workspace / "public", workspace / "static", workspace / "assets"]
+        if sandbox_dir:
+            roots += [sandbox_dir, sandbox_dir / "public", sandbox_dir / "assets"]
+        bases += [(r, rest) for r in roots]
+
+    dir_exists = False
+    for base, rel in bases:
+        try:
+            cand = (base / rel).resolve()
+            if not cand.is_file():
+                dir_exists = dir_exists or cand.parent.is_dir()
+                continue
+        except (OSError, ValueError):
+            continue
+        hit = by_path.get(str(cand))
+        return True, [hit] if hit else [], True
+
+    # Not on disk as written: match a provided asset by path suffix (or bare filename).
+    norm = re.sub(r"^(?:\.{1,2}/|/|[@~][\w-]*/)+", "", clean)
+    if not norm:
+        return False, [], dir_exists
+    if "/" in norm:
+        hits = [a for p, a in by_path.items() if a["path"] == norm or a["path"].endswith("/" + norm)]
+    else:
+        hits = by_name.get(norm, [])
+    return bool(hits), hits, dir_exists
 
 
 def audit_asset_usage_and_paths(
@@ -347,6 +709,7 @@ def audit_asset_usage_and_paths(
     sandbox_dir: Optional[Path],
     provided_assets: List[Dict[str, Any]],
     required_assets: Optional[List[str]] = None,
+    standalone: bool = False,
 ) -> Dict[str, Any]:
     """
     Cross-check code files against discovered provided assets:
@@ -354,100 +717,47 @@ def audit_asset_usage_and_paths(
       2. Detect broken/hallucinated asset paths referenced in code that do not exist on disk.
       3. Detect dummy external placeholder URLs (`placehold.co`, `via.placeholder.com`, etc.).
     """
-    code_files = collect_code_files_for_asset_scan(workspace, sandbox_dir)
-    combined_code_blobs: List[Tuple[str, str]] = []
-    for cf in code_files:
-        try:
-            rel_cf = cf.relative_to(workspace).as_posix() if cf.is_relative_to(workspace) else cf.name
-            combined_code_blobs.append((rel_cf, cf.read_text(encoding="utf-8", errors="ignore")))
-        except Exception:
-            pass
+    workspace = workspace.resolve()
+    sandbox_res = sandbox_dir.resolve() if sandbox_dir else None
+    code_files = collect_code_files_for_asset_scan(workspace, sandbox_res, standalone)
 
-    # 1. Check which provided assets are referenced in code
-    used_assets: List[Dict[str, Any]] = []
-    unused_assets: List[Dict[str, Any]] = []
+    by_path = {str(a["abs_path"]): a for a in provided_assets}
+    by_name: Dict[str, List[Dict[str, Any]]] = {}
+    for a in provided_assets:
+        by_name.setdefault(a["name"], []).append(a)
+        a["referenced_in"] = []
+    provided_names = [a["name"] for a in provided_assets] + [a["path"] for a in provided_assets]
+    provided_lower = {a["name"].lower() for a in provided_assets}
 
-    for asset in provided_assets:
-        name = asset["name"]
-        rel_path = asset["path"]
-        # Strip leading folder like sandbox prefix if referenced relatively inside sandbox
-        sandbox_rel = None
-        if sandbox_dir and asset["abs_path"].is_relative_to(sandbox_dir.resolve()):
-            sandbox_rel = asset["abs_path"].relative_to(sandbox_dir.resolve()).as_posix()
-
-        referenced_in: List[str] = []
-        for rel_cf, text in combined_code_blobs:
-            if name in text or rel_path in text or (sandbox_rel and sandbox_rel in text):
-                referenced_in.append(rel_cf)
-
-        asset["referenced_in"] = referenced_in
-        if referenced_in:
-            used_assets.append(asset)
-        else:
-            unused_assets.append(asset)
-
-    # 2. Scan code for broken/non-existent asset references & dummy placeholder URLs
     broken_references: List[Dict[str, Any]] = []
     dummy_placeholders: List[str] = []
-    provided_names = [a["name"] for a in provided_assets] + [a["path"] for a in provided_assets]
-
-    seen_broken: Set[Tuple[str, str]] = set()
-    for rel_cf, text in combined_code_blobs:
-        if Path(rel_cf).suffix.lower() == ".md":
+    for cf, project_only in code_files:
+        rel_cf = cf.relative_to(workspace).as_posix() if _is_relative(cf, workspace) else cf.name
+        try:
+            text = cf.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
             continue
-        cf_dir = (workspace / rel_cf).parent
+        if len(text) > 4000 and len(text) / (text.count("\n") + 1) > 300:
+            continue  # minified bundle
+        # Project-walk data files (JSON dumps, scripts that write images) name outputs, not wired assets.
+        ui_source = cf.suffix.lower() in UI_SOURCE_EXTENSIONS or cf.name.lower().endswith(VISUAL_COMPOUND_SUFFIXES)
 
         for dm in DUMMY_PLACEHOLDER_URL_RE.finditer(text):
             dummy_placeholders.append(f"`{rel_cf}` uses dummy placeholder service `{dm.group(0)}` instead of real assets")
 
-        candidates: Set[str] = set()
-        for m in ASSET_PATH_REF_RE.finditer(text):
-            candidates.add(m.group(1).strip())
-        for m in QUOTED_ASSET_STRING_RE.finditer(text):
-            candidates.add(m.group(1).strip())
-
-        for raw_ref in sorted(candidates):
-            # Ignore URLs, data URIs, template expressions, or logger/script names
-            if (
-                raw_ref.startswith(("http://", "https://", "data:", "//", "{", "$", "<"))
-                or "{{" in raw_ref
-                or "${" in raw_ref
-                or "%" in raw_ref
-            ):
+        can_break = not project_only or ui_source
+        for raw_ref in sorted(_extract_asset_refs(text)):
+            if _is_dynamic_or_external(raw_ref):
                 continue
-            clean_ref = raw_ref.split("?")[0].split("#")[0]
-            if clean_ref.startswith("res://"):
-                clean_ref = clean_ref[len("res://") :]
-            clean_ref_lstrip = clean_ref.lstrip("/")
-
-            # Check possible resolution locations: relative to code file, relative to sandbox, relative to workspace, or matching a provided asset
-            possible_paths = [
-                (cf_dir / clean_ref),
-                (cf_dir / clean_ref_lstrip),
-                (workspace / clean_ref_lstrip),
-                (workspace / "public" / clean_ref_lstrip),
-                (workspace / "static" / clean_ref_lstrip),
-                (workspace / "assets" / clean_ref_lstrip),
-            ]
-            if sandbox_dir:
-                possible_paths.extend(
-                    [
-                        (sandbox_dir / clean_ref_lstrip),
-                        (sandbox_dir / "public" / clean_ref_lstrip),
-                        (sandbox_dir / "assets" / clean_ref_lstrip),
-                    ]
-                )
-
-            exists_on_disk = any(p.exists() and p.is_file() for p in possible_paths)
-            if not exists_on_disk:
-                # Also check if basename matches a provided asset inside a mounted static root
-                ref_name = Path(clean_ref_lstrip).name
-                if any(a["name"] == ref_name and clean_ref.startswith("/") for a in provided_assets):
-                    exists_on_disk = True
-
-            if not exists_on_disk and (rel_cf, clean_ref) not in seen_broken:
-                seen_broken.add((rel_cf, clean_ref))
-                close = difflib.get_close_matches(Path(clean_ref).name, provided_names, n=2, cutoff=0.4)
+            # Cheap skip: cannot be broken here and its filename is no provided asset's.
+            if not can_break and raw_ref.replace("\\", "/").split("?")[0].rsplit("/", 1)[-1].lower() not in provided_lower:
+                continue
+            exists, hits, dir_exists = _resolve_asset_ref(raw_ref, cf, workspace, sandbox_res, by_path, by_name)
+            for a in hits:
+                if rel_cf not in a["referenced_in"]:
+                    a["referenced_in"].append(rel_cf)
+            if not exists and (not project_only or (ui_source and dir_exists)):
+                close = difflib.get_close_matches(Path(raw_ref).name, provided_names, n=2, cutoff=0.4)
                 suggestion = f" (Did you mean provided asset: `{', '.join(close)}`?)" if close else ""
                 broken_references.append(
                     {
@@ -456,6 +766,9 @@ def audit_asset_usage_and_paths(
                         "message": f"`{rel_cf}` references non-existent asset `{raw_ref}`{suggestion}",
                     }
                 )
+
+    used_assets = [a for a in provided_assets if a["referenced_in"]]
+    unused_assets = [a for a in provided_assets if not a["referenced_in"]]
 
     # 3. Check explicit required assets (--require-assets)
     missing_required: List[str] = []
@@ -481,6 +794,7 @@ def audit_asset_usage_and_paths(
         "broken_references": broken_references,
         "dummy_placeholders": dummy_placeholders,
         "missing_required": missing_required,
+        "code_files_scanned": len(code_files),
     }
 
 
@@ -504,57 +818,61 @@ def format_provided_assets_markdown_table(provided_assets: List[Dict[str, Any]])
     return "\n".join(lines)
 
 
-def is_visual_project_or_hypothesis(sandbox_dir: Path, workspace: Path) -> Tuple[bool, List[str]]:
-    """Detect whether the hypothesis or mapped files involve visual/UI/rendering output."""
+def is_visual_project_or_hypothesis(sandbox_dir: Path, workspace: Path, standalone: bool = False) -> Tuple[bool, List[str]]:
+    """Detect whether the hypothesis, mapped files (or, standalone, the project) involve visual/UI/rendering output."""
+    workspace = workspace.resolve()
     matched_files: List[str] = []
     search_files: List[Path] = []
     if sandbox_dir.exists():
-        search_files.extend(f for f in sandbox_dir.rglob("*") if f.is_file())
+        search_files.extend(_walk_files(sandbox_dir, EXCLUDED_ASSET_SCAN_DIRS, skip_tests=False))
+    search_files.extend(_tracked_files(workspace))
+    if standalone:
+        search_files.extend(_walk_files(workspace, PRUNED_DIR_NAMES, skip_tests=True))
 
-    state_path = workspace / "research" / ".ra_state.json"
-    if state_path.exists():
-        try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-            for rel in state.get("context_map_snapshot", {}).get("tracked_files", {}).keys():
-                fp = workspace / rel
-                if fp.exists() and fp.is_file():
-                    search_files.append(fp)
-        except Exception:
-            pass
-
+    seen: Set[Path] = set()
+    candidate_exts = VISUAL_EXTENSIONS | {".py", ".js", ".mjs", ".ts", ".rs", ".cpp", ".cs"}
     for f in search_files:
-        name_lower = f.name.lower()
-        rel = (
-            f.resolve().relative_to(workspace.resolve()).as_posix()
-            if f.resolve().is_relative_to(workspace.resolve())
-            else f.name
-        )
-        if f.suffix.lower() in VISUAL_EXTENSIONS or any(name_lower.endswith(s) for s in VISUAL_COMPOUND_SUFFIXES):
-            if rel not in matched_files:
-                matched_files.append(rel)
+        name_l = f.name.lower()
+        if f.suffix.lower() not in candidate_exts and not name_l.endswith(VISUAL_COMPOUND_SUFFIXES):
             continue
-        if f.suffix.lower() in {".py", ".js", ".ts", ".rs", ".cpp", ".cs"}:
+        r = f.resolve()
+        if r in seen or r.name.lower() in RA_SDK_FILE_NAMES:
+            continue
+        seen.add(r)
+        name_lower = r.name.lower()
+        rel = r.relative_to(workspace).as_posix() if _is_relative(r, workspace) else r.name
+        if r.suffix.lower() in VISUAL_EXTENSIONS or any(name_lower.endswith(s) for s in VISUAL_COMPOUND_SUFFIXES):
+            matched_files.append(rel)
+            continue
+        if r.suffix.lower() in {".py", ".js", ".mjs", ".ts", ".rs", ".cpp", ".cs"}:
             try:
-                txt = f.read_text(encoding="utf-8", errors="ignore")[:8000]
+                with r.open("r", encoding="utf-8", errors="ignore") as fh:
+                    txt = fh.read(8000)
                 if VISUAL_CODE_IMPORTS_RE.search(txt):
-                    if rel not in matched_files:
-                        matched_files.append(rel)
-            except Exception:
-                pass
+                    matched_files.append(rel)
+            except OSError:
+                continue
 
     return len(matched_files) > 0, matched_files
+
+
+def _is_standalone(hyp: Optional[str]) -> bool:
+    return not hyp or hyp.strip().upper() == "STANDALONE"
 
 
 def cmd_scan_assets(args: argparse.Namespace) -> None:
     workspace = Path(args.workspace).resolve()
     rdir = workspace / "research"
     sandbox_dir = (rdir / "sandbox" / args.hypothesis.strip()) if args.hypothesis else None
+    standalone = _is_standalone(args.hypothesis)
     provided = discover_provided_assets(workspace, sandbox_dir, args.assets_dir)
-    report = audit_asset_usage_and_paths(workspace, sandbox_dir, provided, args.require_assets)
+    report = audit_asset_usage_and_paths(workspace, sandbox_dir, provided, args.require_assets, standalone)
 
     print("=" * 78)
     print("  RA PROVIDED-ASSET DISCOVERY, USAGE & FIT SCANNER")
     print("=" * 78)
+    scope = "project source + sandbox + tracked files" if standalone else "sandbox + tracked files"
+    print(f"  Code Files Scanned         : {report['code_files_scanned']} ({scope}; docs ignored)")
     print(f"  Discovered Provided Assets : {len(provided)}")
     print(f"  Assets Wired in Code       : {len(report['used_assets'])}")
     print(f"  Unused Provided Assets     : {len(report['unused_assets'])}")
@@ -594,7 +912,7 @@ def cmd_init_audit(args: argparse.Namespace) -> None:
     captures_dir.mkdir(parents=True, exist_ok=True)
 
     provided = discover_provided_assets(workspace, sandbox_dir, args.assets_dir)
-    audit_asset_usage_and_paths(workspace, sandbox_dir, provided, [])
+    audit_asset_usage_and_paths(workspace, sandbox_dir, provided, [], _is_standalone(hyp))
 
     tpl_path = Path(__file__).resolve().parent.parent / "resources" / "templates" / "VISUAL_AUDIT.md"
     audit_md_path = sandbox_dir / "VISUAL_AUDIT.md"
@@ -606,7 +924,7 @@ def cmd_init_audit(args: argparse.Namespace) -> None:
     assets_table_md = format_provided_assets_markdown_table(provided)
 
     if not audit_md_path.exists():
-        tpl = tpl_path.read_text(encoding="utf-8") if tpl_path.exists() else "# Visual Audit\n"
+        tpl = tpl_path.read_text(encoding="utf-8-sig") if tpl_path.exists() else "# Visual Audit\n"
         content = (
             tpl.replace("{{HYPOTHESIS_ID}}", hyp_id)
             .replace("{{SLUG}}", slug)
@@ -645,13 +963,14 @@ def cmd_audit(args: argparse.Namespace) -> None:
     rdir = workspace / "research"
     state_path = rdir / ".ra_state.json"
     hyp = args.hypothesis.strip()
+    standalone = _is_standalone(hyp)
     sandbox_dir = rdir / "sandbox" / hyp
     captures_dir = sandbox_dir / "visual_captures"
     audit_md_path = sandbox_dir / "VISUAL_AUDIT.md"
 
-    visual_detected, trigger_files = is_visual_project_or_hypothesis(sandbox_dir, workspace)
+    visual_detected, trigger_files = is_visual_project_or_hypothesis(sandbox_dir, workspace, standalone)
     provided = discover_provided_assets(workspace, sandbox_dir, args.assets_dir)
-    asset_report = audit_asset_usage_and_paths(workspace, sandbox_dir, provided, args.require_assets)
+    asset_report = audit_asset_usage_and_paths(workspace, sandbox_dir, provided, args.require_assets, standalone)
 
     if (
         not visual_detected
@@ -660,15 +979,16 @@ def cmd_audit(args: argparse.Namespace) -> None:
         and not asset_report["broken_references"]
         and not asset_report["missing_required"]
     ):
+        scope = "project source, sandbox or tracked context map" if standalone else "sandbox or tracked context map"
         print("=" * 78)
         print(f"  RA VISUAL AUDIT — `{hyp}` (NON-VISUAL SCOPE)")
         print("=" * 78)
-        print("  No UI/CSS/rendering files detected in sandbox or tracked context map.")
+        print(f"  No UI/CSS/rendering files detected in {scope}.")
         print("  Visual audit marked NOT_APPLICABLE (PASS). Use `--require-visual` to force visual verification.")
         print("=" * 78)
         if state_path.exists():
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-            state["visual_audit_passed"] = True
+            state = json.loads(state_path.read_text(encoding="utf-8-sig"))
+            _mark_passed(state, workspace, hyp)
             state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         return
 
@@ -684,7 +1004,7 @@ def cmd_audit(args: argparse.Namespace) -> None:
     for mr in asset_report["missing_required"]:
         violations.append(f"[MISSING_REQUIRED_ASSET] {mr}")
 
-    audit_txt = audit_md_path.read_text(encoding="utf-8") if audit_md_path.exists() else ""
+    audit_txt = audit_md_path.read_text(encoding="utf-8-sig") if audit_md_path.exists() else ""
 
     if provided and len(asset_report["used_assets"]) == 0 and not args.allow_unused_assets:
         if "INTENTIONALLY_UNUSED_ASSET:" not in audit_txt:
@@ -712,7 +1032,8 @@ def cmd_audit(args: argparse.Namespace) -> None:
                 f"Do NOT rely on code/DOM reading alone — capture what the user actually sees."
             )
 
-    # Validate each image file's binary dimensions, size, and non-blank entropy
+    # Validate each image file's binary dimensions, size, and decoded-pixel blankness
+    blank_checks: List[str] = []
     for img in images:
         raw = img.read_bytes()
         if len(raw) < 400:
@@ -729,11 +1050,11 @@ def cmd_audit(args: argparse.Namespace) -> None:
                 violations.append(
                     f"`{img.name}` resolution is `{w}x{h}` (< 64x64 minimum). Capture a real user-viewport screenshot!"
                 )
-        # Check if compressed image payload is completely uniform/blank
-        ent = shannon_entropy(raw[64:])
-        if ent < 2.2:
+        blank, evidence = measure_blankness(img, raw, dims)
+        blank_checks.append(f"{img.name}: {evidence}")
+        if blank:
             violations.append(
-                f"`{img.name}` has abnormally low byte entropy ({ent:.2f} bits/byte) — indicates a solid blank/empty screen render!"
+                f"`{img.name}` is (nearly) uniform — {evidence} — indicates a blank/empty screen render!"
             )
 
     # 3. Validate VISUAL_AUDIT.md
@@ -775,21 +1096,32 @@ def cmd_audit(args: argparse.Namespace) -> None:
                         f"State concrete visual geometry, alignment, provided-asset fit/aspect-ratio, and user-view reasoning!"
                     )
 
+    if trigger_files:
+        trigger_label = ", ".join(trigger_files[:5]) + (f" (+{len(trigger_files) - 5} more)" if len(trigger_files) > 5 else "")
+    elif args.require_visual:
+        trigger_label = "none detected — forced by --require-visual"
+    elif captures_dir.exists():
+        trigger_label = "none detected — audited because visual_captures/ exists"
+    else:
+        trigger_label = "none detected — audited because of broken/missing asset references"
+
     print("=" * 78)
     print(f"  RA USER-EYES VISUAL, PROVIDED-ASSET & REALITY AUDIT — `{hyp}`")
     print("=" * 78)
-    print(f"  Visual Trigger Files : {', '.join(trigger_files[:5]) or 'Forced (--require-visual)'}")
+    print(f"  Visual Trigger Files : {trigger_label}")
     print(
         f"  Provided Assets      : {len(provided)} discovered ({len(asset_report['used_assets'])} wired, "
         f"{len(asset_report['unused_assets'])} unused, {len(asset_report['broken_references'])} broken refs)"
     )
     print(f"  Captured Screenshots : {len(images)}")
+    for bc in blank_checks:
+        print(f"    - {bc}")
     print(f"  Violations Found     : {len(violations)}")
     print("-" * 78)
 
     if violations:
         if state_path.exists():
-            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state = json.loads(state_path.read_text(encoding="utf-8-sig"))
             state["visual_audit_passed"] = False
             state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         print("  [FAIL] VISUAL & PROVIDED-ASSET REALITY GATE REJECTED THE PROTOTYPE:")
@@ -805,8 +1137,8 @@ def cmd_audit(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     if state_path.exists():
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        state["visual_audit_passed"] = True
+        state = json.loads(state_path.read_text(encoding="utf-8-sig"))
+        _mark_passed(state, workspace, hyp)
         state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     print("  [PASS] Provided assets, container fit, and captured screenshots verified!")
@@ -822,7 +1154,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Scan workspace/sandbox for provided assets, native WxH/aspect ratios, unused assets, and broken code paths",
     )
     p_scan.add_argument("--workspace", default=".", help="Workspace root")
-    p_scan.add_argument("--hypothesis", default=None, help="Optional hypothesis folder name (e.g., H001_slug)")
+    p_scan.add_argument(
+        "--hypothesis", default=None,
+        help="Optional hypothesis folder name (e.g., H001_slug); omitted or STANDALONE also scans the project's source",
+    )
     p_scan.add_argument("--assets-dir", nargs="*", default=[], help="Additional asset directories to scan")
     p_scan.add_argument("--require-assets", nargs="*", default=[], help="Specific asset filenames that must be wired")
     p_scan.set_defaults(func=cmd_scan_assets)
@@ -835,7 +1170,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_audit = sub.add_parser("audit", help="Verify provided-asset usage/fit, captured screenshots, and VISUAL_AUDIT.md")
     p_audit.add_argument("--workspace", default=".", help="Workspace root")
-    p_audit.add_argument("--hypothesis", default="STANDALONE", help="Hypothesis folder name (e.g., H001_slug) or STANDALONE")
+    p_audit.add_argument(
+        "--hypothesis", default="STANDALONE",
+        help="Hypothesis folder name (e.g., H001_slug) or STANDALONE (also scans the project's source)",
+    )
     p_audit.add_argument("--require-visual", action="store_true", help="Force visual audit even if no UI extensions detected")
     p_audit.add_argument("--assets-dir", nargs="*", default=[], help="Additional asset directories to scan")
     p_audit.add_argument("--require-assets", nargs="*", default=[], help="Specific asset filenames that must be wired")
@@ -846,8 +1184,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    _utf8_console()
     parser = build_parser()
     args = parser.parse_args()
+    if not Path(args.workspace).is_dir():
+        print(f"[RA VISUAL AUDIT] ERROR: Workspace directory not found: {Path(args.workspace).resolve()}", file=sys.stderr)
+        sys.exit(2)
     args.func(args)
 
 

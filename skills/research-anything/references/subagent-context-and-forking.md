@@ -63,9 +63,9 @@ Suppose `Subagent A` and `Subagent B` are both working on tasks inside a **Larav
      - **`opencode` (OpenCode CLI)**:
        `opencode run --session "<base_session_id>" --fork --title "Subagent_A" --auto -f "research/context_snapshots/forks/FORK_Subagent_A.md" "..."`
      - **`claude` (Claude Code)**:
-       `claude --resume "<base_session_id>" --fork-session -p "..."` OR `Task(subagent_type="general-purpose", description="Subagent_A", prompt="Read research/context_snapshots/forks/FORK_Subagent_A.md ...")`
+       `claude --resume "<base_session_id>" --fork-session --permission-mode acceptEdits -p "..."` OR `Agent(subagent_type="general-purpose", description="Subagent_A", prompt="Read research/context_snapshots/forks/FORK_Subagent_A.md ...")`
      - **`agy` (`Antigravity` / `Gemini`)**:
-       `invoke_subagent(TypeName="self", Role="Subagent_A", Workspace="inherit", Prompt="Read research/context_snapshots/forks/FORK_Subagent_A.md ...")`
+       `invoke_subagent(Subagents=[{"TypeName": "self", "Role": "Subagent_A", "Workspace": "inherit", "Prompt": "You start with none of the parent conversation. Read <ws>/research/context_snapshots/forks/FORK_Subagent_A.md ..."}])`
      - Fork 1 $\rightarrow$ **`Subagent_A`**: Inherits `laravel_base` + `auth_workflow_slice` + **Task A Delta Only**.
      - Fork 2 $\rightarrow$ **`Subagent_B`**: Inherits `laravel_base` + `auth_workflow_slice` + **Task B Delta Only**.
   3. **Hard Gate in `ra_gate.py`**:
@@ -87,7 +87,7 @@ To control **what is retained**, **how many times it is reused**, and **when the
 
 1. **Create a Shared Context Snapshot (Read Once)**:
    ```bash
-   python "~/.gemini/skills/research-anything/scripts/ra_context_harness.py" create \
+   python "<RA_DIR>/scripts/ra_context_harness.py" create \
      --workspace "." \
      --id "laravel_base" \
      --tier BASE_FRAMEWORK \
@@ -97,7 +97,7 @@ To control **what is retained**, **how many times it is reused**, and **when the
 
 2. **Fork Context into `Subagent_A` and `Subagent_B` (Without Re-Reading)**:
    ```bash
-   python "~/.gemini/skills/research-anything/scripts/ra_context_harness.py" fork \
+   python "<RA_DIR>/scripts/ra_context_harness.py" fork \
      --workspace "." \
      --subagent "Subagent_A" \
      --snapshots "laravel_base" "queue_workflow_slice" \
@@ -108,13 +108,13 @@ To control **what is retained**, **how many times it is reused**, and **when the
 
 3. **Return Baton After Subagent Completes (1-Concurrency Relay)**:
    ```bash
-   python "~/.gemini/skills/research-anything/scripts/ra_context_harness.py" return-baton \
+   python "<RA_DIR>/scripts/ra_context_harness.py" return-baton \
      --workspace "." \
      --subagent "Subagent_A"
    ```
 
 4. **Check Snapshot Retention & Auto-Throw-Away Stale Snapshots**:
    ```bash
-   python "~/.gemini/skills/research-anything/scripts/ra_context_harness.py" status --workspace "."
-   python "~/.gemini/skills/research-anything/scripts/ra_context_harness.py" evict --workspace "." --auto-gc
+   python "<RA_DIR>/scripts/ra_context_harness.py" status --workspace "."
+   python "<RA_DIR>/scripts/ra_context_harness.py" evict --workspace "." --auto-gc
    ```

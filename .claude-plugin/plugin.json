@@ -1,6 +1,6 @@
 {
   "name": "research-anything",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "RA (Research Anything) — Composable Super-Skill Suite for first-principles R&D, stateful project grilling (/ra-talk), systemic multi-hop root-cause debugging (/ra-systemic-debug), /fork context controlling (/ra-context-fork), real .log telemetry (/ra-log-verify), and visual/provided-asset reality auditing (/ra-visual-audit).",
   "author": {
     "name": "Kanorin-chan",

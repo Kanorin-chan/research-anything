@@ -10,7 +10,7 @@ Use this skill standalone (or during Stage 0/3/5/7 of `research-anything`) to en
 ## 0. Mid-Project / Vibe-Coded Intake: Expose Band-Aids, Fake Data & Polluted Pipes (`--scan-project`)
 When joining a project that did **not** use RA from the beginning (or after previous AI sessions left behind hidden shortcuts), scan the entire codebase to generate a **Truth-Path Recovery Plan (`research/TRUTH_PATH_AUDIT.md`)**:
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_cheese_audit.py" \
+python "${CLAUDE_SKILL_DIR}/../research-anything/scripts/ra_cheese_audit.py" \
   --workspace "." \
   --scan-project
 ```
@@ -19,14 +19,14 @@ Exposes all existing band-aids (`except: pass`, `@ts-ignore`, `setTimeout` race 
 ## 1. Seal Legitimate `AXIOMATIC_PRIMITIVES` (`seal-axioms`)
 Never label foundational mathematical/structural constants (e.g., operator symbols like `=`, physical constants, dimensional bounds) as `# hardcoded data`. Place them in a dedicated `axioms` module and seal them with SHA-256:
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_gate.py" seal-axioms \
+python "${CLAUDE_SKILL_DIR}/../research-anything/scripts/ra_gate.py" seal-axioms \
   --workspace "." \
   --file "<path/to/axioms.py>"
 ```
 
 ## 2. Run the Automated Anti-Cheese, Data-Pollution & Protected-Node Scanner (`ra_cheese_audit.py`)
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_cheese_audit.py" \
+python "${CLAUDE_SKILL_DIR}/../research-anything/scripts/ra_cheese_audit.py" \
   --workspace "." \
   --hypothesis "STANDALONE" \
   --files <optional_explicit_files...> \
@@ -44,7 +44,7 @@ Fails immediately if it detects:
 ## 3. Forge Project-Local Skill, `.py` Hooks & Cold-Eyes `ra-reviewer` (`ra_forge.py`)
 Generate a custom project-local skill, executable `research/harness/project_harness.py` (CLI + Claude Code `PreToolUse`/`PostToolUse`/`Stop` hooks), and a cold-eyes `ra-reviewer` agent:
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_forge.py" \
+python "${CLAUDE_SKILL_DIR}/../research-anything/scripts/ra_forge.py" \
   --workspace "." \
   --name "<project-slug>" \
   --domain "<domain>"

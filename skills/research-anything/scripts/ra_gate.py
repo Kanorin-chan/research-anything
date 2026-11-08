@@ -12,13 +12,45 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import hashlib
 import json
 import re
 import shutil
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# ra_common lives next to this script; `python -I` does not put the script dir on sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ra_common import (  # noqa: E402
+    DEFAULT_MAX_ROUNDS_PER_APPROACH,
+    FAMILY_RE,
+    HASH_ALGO,
+    approach_key,
+    canonical_spec,
+    code_fingerprint,
+    describe_matches,
+    extract_protected_node,
+    family_in_report,
+    find_ambiguous,
+    fingerprint_files,
+    fmt_score,
+    hash_file,
+    hash_protected_node,
+    metric_rule,
+    quoted_score,
+    raw_sha256,
+    read_text_normalised,
+    rule_has_numbers,
+    sb_all_scores,
+    sb_get,
+    sb_lines,
+    sb_lock_instructions,
+    sb_summary,
+    spec_path,
+    unseen_target_met,
+    verify_protected_node,
+    verify_seal,
+)
 
 STAGES = [
     "STAGE_0_INTAKE_AND_SYNC",
@@ -36,6 +68,9 @@ STAGE_INSTRUCTIONS: Dict[str, str] = {
         "1. Run `check-question` and inspect all reference folders/images BEFORE asking the user anything.\n"
         "2. Gather user ideas 1-by-1 and synthesize into `research/VISION_AND_MISSION.md`.\n"
         "3. Lock non-negotiable rules in `research/INVARIANTS.md`.\n"
+        "3b. TAKE STOCK in `research/INVENTORY.md`: list EVERY asset, dataset, dump and tool already provided (open them),\n"
+        "    triage the product's parts KNOWN vs UNKNOWN (KNOWN needs evidence of fit), and define the BRICK:\n"
+        "    the crudest end-to-end version that runs. Required before Stage 2.\n"
         "4. [OPTIONAL] Equip the R&D Arsenal (`ra_crawler.py` — only when the project benefits from external skills/papers/data):\n"
         "   - Priority #1 (Skill Crawler): `ra_crawler.py skill --query \"<domain>\"` (installs project-local skills).\n"
         "   - Priority #2 (Paper Crawler): `ra_crawler.py paper --query \"<topic>\"` (if prior art/equations needed).\n"
@@ -45,6 +80,7 @@ STAGE_INSTRUCTIONS: Dict[str, str] = {
         "6. Advance to Stage 1 (`ra_gate.py map-context --agent <id> [--files ...]`)."
     ),
     "STAGE_1_WORKFLOW_AND_CONTEXT_MAPPING": (
+        "0. `research/INVENTORY.md` (take stock, KNOWN/UNKNOWN triage, the brick) must be filled before leaving Stage 1.\n"
         "1. DO NOT read only surface data or 1-hop neighbors. Trace the FULL multi-hop workflow in `research/WORKFLOW_MAP.md`:\n"
         "   Upstream Producers (-N hops) -> Shared State/Counters -> Target Node -> Downstream Consumers (+N hops) -> Multi-Cycle Loopback.\n"
         "2. Prove Culprit vs. Victim (`Symptom != Culprit`): If `Function A` is working properly and `Function C` is the culprit,\n"
@@ -57,17 +93,24 @@ STAGE_INSTRUCTIONS: Dict[str, str] = {
         "6. Run `ra_gate.py advance`."
     ),
     "STAGE_2_HYPOTHESIS_FORMULATION": (
-        "1. Edit `research/hypotheses/<active_hypothesis>/REPORT.md`.\n"
-        "2. Ensure Section 2 (Workflow Context, Protected Nodes & Pre-Edit/Pre-Creation Justification) and\n"
-        "   Section 3 (First-Principles Mathematical/Structural Formulation & Assumptions) are completely filled out.\n"
-        "3. Do NOT write boilerplate. Derive from first principles.\n"
-        "4. Run `ra_gate.py advance` to unlock Stage 3 (Sandbox Prototype)."
+        "1. BRICK FIRST: if `research/INVENTORY.md` says the brick is NOT BUILT, this hypothesis IS the brick.\n"
+        "   Otherwise target the brick's weakest link only.\n"
+        "2. OPTION SWEEP in REPORT.md Section 3: >= 3 approach FAMILIES (parameter variants = one family),\n"
+        "   each with expected ceiling, cost and the inventory assets it uses. Name the baseline to beat.\n"
+        "3. Write success criteria + plateau rule, and register them WITH NUMBERS:\n"
+        "   `ra_gate.py stop-rule --component <slug> ... --metric \"<name>\" --target <x> --min-gain <g> [--lower-is-better]`.\n"
+        "   Every R&D problem has a number; if nothing else, pass-rate over real cases (0..1).\n"
+        "4. Fill Section 2 (workflow context) too. Do NOT write boilerplate. Derive from first principles.\n"
+        "   Judgment calls are yours: decide and record them (`ra_gate.py decide --what ... --why ...`), don't ask.\n"
+        "5. Run `ra_gate.py advance` to unlock Stage 3 (Sandbox Prototype)."
     ),
     "STAGE_3_SANDBOX_PROTOTYPE": (
         "1. LEAD-ORCHESTRATOR DELEGATION & CONTEXT FORKING (`ra_context_harness.py`):\n"
         "   Fork the shared snapshot to a Subagent (`ra_context_harness.py fork --subagent Subagent_A --snapshots <snap_id> --task \"...\"`),\n"
         "   let the Subagent build the prototype & write its report, then reclaim the baton (`ra_context_harness.py return-baton --subagent Subagent_A`).\n"
-        "2. Build the deployment-grade prototype inside `research/sandbox/<active_hypothesis>/`.\n"
+        "2. Build the prototype inside `research/sandbox/<active_hypothesis>/<family>/`. RACE the chosen families cheaply\n"
+        "   on the SAME real data before polishing any one of them. Use the assets in `research/INVENTORY.md`.\n"
+        "   Every program prints `RA_SCORE=<x>`; every `ra_log_engine.py run --approach <family>` is a scored round.\n"
         "3. WIRE PRODUCTION `.log` TELEMETRY (`ra_log_engine.py`): Silent code and bare `print()` are BANNED.\n"
         "   Inject/import `RALogger` (`ra_log_engine.py inject-sdk --lang <python|js|ts|php> --dest research/sandbox/<active_hypothesis>`)\n"
         "   and log every flow hop (`flow=caller->callee`, `role`, `inputs`, `state_before`, `state_after`, `output`, `contract=BC-xxx`).\n"
@@ -77,13 +120,17 @@ STAGE_INSTRUCTIONS: Dict[str, str] = {
     ),
     "STAGE_4_ADVERSARIAL_BREAK_TEST": (
         "1. Synthetic unit-test marathons (`test_xyz.py`) are BANNED. Verify in the REAL ENVIRONMENT via `.log` telemetry:\n"
-        "   `python ra_log_engine.py run --workspace . --hypothesis <active_hypothesis> --timeout-sec 60 --cmd \"<real-run-cmd>\"`\n"
+        "   `python ra_log_engine.py run --workspace . --hypothesis <active_hypothesis> --approach <family> [--unseen] --timeout-sec 60 -- <real-run-cmd>`\n"
         "2. Audit the generated `.log` file for `[PASS]`, `[DECISION]`, `[STUCK]`, `[FAIL]`, full variable values, and `BC-xxx` contracts:\n"
         "   `python ra_log_engine.py audit --workspace . --hypothesis <active_hypothesis>`\n"
         "3. USER-EYES VISUAL REALITY CHECK (if UI/CSS/game/visual output): Run `ra_visual_audit.py init --hypothesis <active_hypothesis>`,\n"
         "   capture live screenshots into `visual_captures/`, open & inspect the pixels (`read_file`), and complete `VISUAL_AUDIT.md`.\n"
         "4. If any hop is `[STUCK]` or `[FAIL]`, fix the upstream mechanism (NO `if/else` or `try/except` band-aids!).\n"
-        "5. Once `ra_log_engine.py audit` passes, run `ra_gate.py advance` to unlock Stage 5."
+        "5. SCOREBOARD (mechanical, `ra_gate.py status --scoreboard`): each `run` records its `RA_SCORE=<x>`; pass\n"
+        "   `--unseen` on held-out data. No score x3 (BLIND), last 2 under min-gain (FLAT), baseline never beaten, or\n"
+        "   the per-approach round cap = PLATEAUED -> runs LOCK until a FRESH subagent's `ra_gate.py cold-review`\n"
+        "   says CONTINUE (one grace round), SWITCH (next family) or BRICK-FIRST. Target met on unseen = WON.\n"
+        "6. Once `ra_log_engine.py audit` passes, run `ra_gate.py advance` to unlock Stage 5."
     ),
     "STAGE_5_ANTI_CHEESE_AUDIT": (
         "1. Run `python ra_cheese_audit.py --workspace . --hypothesis <active_hypothesis>`.\n"
@@ -94,15 +141,18 @@ STAGE_INSTRUCTIONS: Dict[str, str] = {
     "STAGE_6_LAB_REPORT_AND_LEARNING": (
         "1. Complete `research/hypotheses/<active_hypothesis>/REPORT.md` with raw trusted data and root-cause proof.\n"
         "2. Run `ra_gate.py conclude --verdict <PROVEN|FALSIFIED> --issue \"...\" --workflow \"...\" --found \"...\"`.\n"
-        "   - If FALSIFIED: sandbox is archived to `research/graveyard/`, main code stays clean, and you loop back to Stage 1/2.\n"
-        "   - If PROVEN: moves to Stage 7 (Graduation Review)."
+        "   - If FALSIFIED (incl. PLATEAUED): sandbox is archived to `research/graveyard/`, main code stays clean, and you loop\n"
+        "     back to Stage 1/2 with the NEXT FAMILY from the Option Sweep — never a tweak of the archived one.\n"
+        "   - If PROVEN (needs an `--unseen` round that met the stop rule's target): moves to Stage 7 (Graduation Review).\n"
+        "     After graduation, update the brick's weakest link in INVENTORY.md."
     ),
     "STAGE_7_GRADUATION_REVIEW": (
         "1. Run the forged project harness (`python research/harness/project_harness.py check-all`) and invoke the\n"
         "   Adversarial Review Agent (`.claude/agents/ra-reviewer.md` / `research/harness/REVIEW_AGENT_PROMPT.md`).\n"
         "2. STOP AND PRESENT TO USER: Show the Lab Report summary, workflow blast-radius verification, and empirical bounds.\n"
         "3. Wait for explicit user approval before merging sandbox code into the main project.\n"
-        "4. After user approval, run `ra_gate.py graduate --workspace .` to record the truth in `research/library/`."
+        "4. After user approval, run `ra_gate.py graduate --user-approved \"<the user's exact words>\"` to record the truth\n"
+        "   in `research/library/`."
     ),
 }
 
@@ -111,12 +161,66 @@ def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def read_md(path: Path) -> str:
+    # utf-8-sig: editors on Windows love to prepend a BOM.
+    return path.read_text(encoding="utf-8-sig")
+
+
+def gate_error(msg: str, code: int = 2) -> None:
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def reason_problem(text: str, flag: str, min_len: int = 30) -> Optional[str]:
+    """Why a free-text justification is too weak to accept, or None if it is acceptable."""
+    t = (text or "").strip()
+    if len(t) < min_len:
+        return f"`{flag}` must be at least {min_len} characters (got {len(t)})."
+    if len(set(t.replace(" ", "").lower())) < 4 or len(set(t.split())) < 2:
+        return f"`{flag}` looks like filler (repeated characters/words). Write the real reason."
+    return None
+
+
+def numbers_line(sr: Dict[str, Any]) -> str:
+    return (
+        f"`{sr.get('metric') or '?'}` target {fmt_score(sr.get('target'))}, min-gain {fmt_score(sr.get('min_gain'))}, "
+        f"{'lower' if sr.get('lower_is_better') else 'higher'} is better, "
+        f"cap {sr.get('max_rounds_per_approach') or DEFAULT_MAX_ROUNDS_PER_APPROACH} rounds/approach"
+    )
+
+
+def print_scoreboard(workspace: Path, state: Dict[str, Any], hyp: str, stream: Any = None) -> None:
+    out = stream or sys.stdout
+    print(f"  SCOREBOARD - `{hyp}`", file=out)
+    for line in sb_lines(workspace, state, hyp):
+        print(f"    {line}", file=out)
+
+
+def sanitize_token(raw: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", raw.strip()).strip("_-")
+
+
+def safe_research_path(rdir: Path, *parts: str) -> Path:
+    """rdir/parts resolved, refusing anything that escapes research/ (e.g. `../../src`)."""
+    base = rdir.resolve()
+    p = base.joinpath(*parts).resolve()
+    if p == base or base not in p.parents:
+        gate_error(
+            f"[RA GATE] REFUSED: `{'/'.join(parts)}` resolves outside `research/` ({p}). "
+            "Hypothesis ids/slugs may only contain [A-Za-z0-9_-]; fix `active_hypothesis` in `research/.ra_state.json`."
+        )
+    return p
+
+
+def _table_cell(text: str) -> str:
+    return " ".join(text.split()).replace("|", "\\|")
+
+
+def workspace_rel(workspace: Path, path: Path) -> Optional[str]:
+    try:
+        return path.resolve().relative_to(workspace.resolve()).as_posix()
+    except ValueError:
+        return None
 
 
 def get_skill_root() -> Path:
@@ -142,6 +246,7 @@ def ensure_initialized(workspace: Path, agent_id: str = "PRIMARY_AGENT") -> Dict
         "VISION_AND_MISSION.md": rdir / "VISION_AND_MISSION.md",
         "INVARIANTS.md": rdir / "INVARIANTS.md",
         "WORKFLOW_MAP.md": rdir / "WORKFLOW_MAP.md",
+        "INVENTORY.md": rdir / "INVENTORY.md",
         "LAB_LOG.md": rdir / "LAB_LOG.md",
         "SELF_LEARNING.md": rdir / "SELF_LEARNING.md",
         "REFERENCES_INDEX.md": rdir / "library" / "REFERENCES_INDEX.md",
@@ -149,14 +254,14 @@ def ensure_initialized(workspace: Path, agent_id: str = "PRIMARY_AGENT") -> Dict
     for tname, dest in template_map.items():
         if not dest.exists():
             src = templates_dir / tname
-            content = src.read_text(encoding="utf-8") if src.exists() else f"# {tname}\n"
+            content = read_md(src) if src.exists() else f"# {tname}\n"
             content = content.replace("<ISO-8601>", ts).replace("<YYYY-MM-DD>", ts[:10]).replace("<agent-id>", agent_id)
             dest.write_text(content, encoding="utf-8")
 
     state_path = get_state_path(workspace)
     if not state_path.exists():
         state = {
-            "version": "1.3.0",
+            "version": "1.4.0",
             "created_at": ts,
             "updated_at": ts,
             "current_stage": "STAGE_0_INTAKE_AND_SYNC",
@@ -183,7 +288,7 @@ def ensure_initialized(workspace: Path, agent_id: str = "PRIMARY_AGENT") -> Dict
         }
         save_state(workspace, state)
         return state
-    return json.loads(state_path.read_text(encoding="utf-8"))
+    return json.loads(read_md(state_path))
 
 
 def load_state(workspace: Path, auto_init: bool = False) -> Dict[str, Any]:
@@ -196,7 +301,10 @@ def load_state(workspace: Path, auto_init: bool = False) -> Dict[str, Any]:
             file=sys.stderr,
         )
         sys.exit(1)
-    return json.loads(sp.read_text(encoding="utf-8"))
+    state = json.loads(read_md(sp))
+    if maintain_state(workspace, state):
+        save_state(workspace, state)
+    return state
 
 
 def save_state(workspace: Path, state: Dict[str, Any]) -> None:
@@ -205,21 +313,108 @@ def save_state(workspace: Path, state: Dict[str, Any]) -> None:
     sp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+PASS_FLAGS = {
+    "log_audit_passed": "ra_log_engine.py audit",
+    "visual_audit_passed": "ra_visual_audit.py audit",
+    "cheese_audit_passed": "ra_cheese_audit.py",
+}
+
+
+def maintain_state(workspace: Path, state: Dict[str, Any]) -> bool:
+    """Upgrade pre-ra_common hashes and expire audit pass flags whose code changed. True if state changed."""
+    changed = False
+    for rel_path, meta in state.get("sealed_axioms", {}).items():
+        status, current = verify_seal(workspace.resolve() / rel_path, meta)
+        if status == "LEGACY_OK":
+            meta["sha256"], meta["algo"] = current, HASH_ALGO
+            changed = True
+    phashes: Dict[str, str] = state.get("protected_node_hashes", {})
+    for spec, expected in list(phashes.items()):
+        status, current = verify_protected_node(workspace, spec, expected)
+        if status == "LEGACY_OK" and current:
+            phashes[spec] = current
+            changed = True
+
+    # A pass flag is only valid for the code it was earned on.
+    hyp = state.get("active_hypothesis")
+    fps: Dict[str, str] = state.setdefault("pass_fingerprints", {})
+    current_fp = code_fingerprint(workspace, state, hyp)
+    for flag, tool in PASS_FLAGS.items():
+        if not state.get(flag):
+            if fps.pop(flag, None) is not None:
+                changed = True
+            continue
+        recorded = fps.get(flag)
+        if recorded is None:
+            # First sight of a flag set by an audit tool: anything edited after that tool's state write is unaudited.
+            sp = get_state_path(workspace)
+            state_mtime = sp.stat().st_mtime if sp.exists() else 0.0
+            newest = max((p.stat().st_mtime for p in fingerprint_files(workspace, state, hyp) if p.is_file()), default=0.0)
+            stale = newest > state_mtime
+        else:
+            stale = recorded != current_fp
+        if stale:
+            state[flag] = False
+            fps.pop(flag, None)
+            print(f"[RA GATE] Code changed since `{flag}` was earned -> cleared. Re-run `{tool}`.", file=sys.stderr)
+        else:
+            fps[flag] = current_fp
+        changed = changed or stale or recorded is None
+    return changed
+
+
 def verify_sealed_axioms(workspace: Path, state: Dict[str, Any]) -> List[str]:
     violations: List[str] = []
     sealed = state.get("sealed_axioms", {})
     for rel_path, meta in sealed.items():
-        fpath = workspace.resolve() / rel_path
-        if not fpath.exists():
-            violations.append(f"Sealed axiom file deleted: {rel_path}")
-            continue
-        current_hash = sha256_file(fpath)
-        if current_hash != meta.get("sha256"):
+        status, current_hash = verify_seal(workspace.resolve() / rel_path, meta)
+        if status == "MISSING":
             violations.append(
-                f"AXIOM SEAL VIOLATION on `{rel_path}`! Expected SHA-256 {meta.get('sha256')[:12]}..., "
-                f"got {current_hash[:12]}... Do NOT sneak hardcoded data into sealed axioms!"
+                f"Sealed axiom file deleted: {rel_path} (if intentional: `ra_gate.py unseal --file {rel_path} --reason \"...\"`)"
+            )
+        elif status == "TAMPERED":
+            violations.append(
+                f"AXIOM SEAL VIOLATION on `{rel_path}`! Expected SHA-256 {str(meta.get('sha256'))[:12]}..., "
+                f"got {str(current_hash)[:12]}... Do NOT sneak hardcoded data into sealed axioms!"
             )
     return violations
+
+
+def verify_protected_nodes(workspace: Path, state: Dict[str, Any]) -> List[str]:
+    violations: List[str] = []
+    for spec, expected in state.get("protected_node_hashes", {}).items():
+        status, _ = verify_protected_node(workspace, spec, expected)
+        if status == "MISSING":
+            violations.append(f"PROTECTED node `{spec}` was deleted or renamed.")
+        elif status == "AMBIGUOUS":
+            violations.append(
+                f"PROTECTED node `{spec}` now matches several definitions ({', '.join(describe_matches(workspace, spec))})."
+            )
+        elif status == "TAMPERED":
+            violations.append(f"PROTECTED node `{spec}` was modified since it was locked.")
+    unhashed = [n for n in state.get("protected_nodes", []) if n not in state.get("protected_node_hashes", {})]
+    for spec in unhashed:
+        violations.append(f"PROTECTED node `{spec}` has no stored hash (registered by an older RA); re-register it.")
+    return violations
+
+
+def verify_integrity(workspace: Path, state: Dict[str, Any]) -> List[str]:
+    return verify_sealed_axioms(workspace, state) + verify_protected_nodes(workspace, state)
+
+
+def block_on_integrity(workspace: Path, state: Dict[str, Any], action: str) -> None:
+    violations = verify_integrity(workspace, state)
+    if violations:
+        print(f"[RA GATE] BLOCKED ({action}): sealed axiom / protected node integrity check failed:", file=sys.stderr)
+        for v in violations:
+            print(f"  - {v}", file=sys.stderr)
+        print(
+            "  Revert the change. If real-data `.log` evidence proves a protected node is the culprit, run\n"
+            "  `ra_gate.py map-context --revoke-protected <spec> --revoke-reason \"...\"`; for a sealed file,\n"
+            "  `ra_gate.py unseal --file <path> --reason \"...\"`.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def check_context_map_staleness(workspace: Path, state: Dict[str, Any]) -> List[str]:
@@ -232,36 +427,34 @@ def check_context_map_staleness(workspace: Path, state: Dict[str, Any]) -> List[
         if not fpath.exists():
             notices.append(f"`{rel_path}` was deleted since context snapshot!")
         else:
-            curr_hash = sha256_file(fpath)
-            if curr_hash != recorded_hash:
+            curr_hash = hash_file(fpath)
+            # Snapshots taken before ra_common hashed raw bytes.
+            if curr_hash != recorded_hash and raw_sha256(fpath) != recorded_hash:
                 notices.append(
                     f"`{rel_path}` changed since snapshot ({recorded_hash[:10]}... -> {curr_hash[:10]}...)"
                 )
     return notices
 
 
+# `- **`BC-001`**:`, `- **BC-001**:`, `- `BC-001``, `- BC-001:` all count.
+def _id_line_re(prefix: str) -> "re.Pattern[str]":
+    return re.compile(rf"^[-*]\s+(?:\*\*)?`?{prefix}-\d+")
+
+
 def extract_locked_invariants(workspace: Path) -> List[str]:
     inv_file = get_research_dir(workspace) / "INVARIANTS.md"
     if not inv_file.exists():
         return []
-    lines: List[str] = []
-    for line in inv_file.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if stripped.startswith("- **`INV-") or stripped.startswith("- `INV-"):
-            lines.append(stripped)
-    return lines
+    pat = _id_line_re("INV")
+    return [ln.strip() for ln in read_md(inv_file).splitlines() if pat.match(ln.strip()) and "<e.g.," not in ln]
 
 
 def extract_behavioral_contracts(workspace: Path) -> List[str]:
     wmap_file = get_research_dir(workspace) / "WORKFLOW_MAP.md"
     if not wmap_file.exists():
         return []
-    lines: List[str] = []
-    for line in wmap_file.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if (stripped.startswith("- **`BC-") or stripped.startswith("- `BC-")) and "<e.g.," not in stripped:
-            lines.append(stripped)
-    return lines
+    pat = _id_line_re("BC")
+    return [ln.strip() for ln in read_md(wmap_file).splitlines() if pat.match(ln.strip()) and "<e.g.," not in ln]
 
 
 def print_context_refresh(workspace: Path, state: Dict[str, Any]) -> None:
@@ -270,7 +463,7 @@ def print_context_refresh(workspace: Path, state: Dict[str, Any]) -> None:
     fals_count = state.get("consecutive_falsifications", 0)
     invariants = extract_locked_invariants(workspace)
     contracts = extract_behavioral_contracts(workspace)
-    violations = verify_sealed_axioms(workspace, state)
+    violations = verify_integrity(workspace, state)
     stale_notices = check_context_map_staleness(workspace, state)
     cmap = state.get("context_map_snapshot", {})
     protected_nodes = state.get("protected_nodes", [])
@@ -278,6 +471,8 @@ def print_context_refresh(workspace: Path, state: Dict[str, Any]) -> None:
     print("=" * 78)
     print("  RA (RESEARCH ANYTHING) — STATE MACHINE & CONTEXT REFRESH")
     print("=" * 78)
+    if state.get("project_name"):
+        print(f"  Project                    : {state['project_name']}")
     print(f"  Current Stage              : {stage}")
     print(f"  Active Hypothesis          : {active_hyp}")
     print(f"  Consecutive Falsifications : {fals_count} / 5 (Autonomous Loop Threshold)")
@@ -308,7 +503,7 @@ def print_context_refresh(workspace: Path, state: Dict[str, Any]) -> None:
     snap_reg_path = get_research_dir(workspace) / "context_snapshots" / "SNAPSHOT_REGISTRY.json"
     if snap_reg_path.exists():
         try:
-            sreg = json.loads(snap_reg_path.read_text(encoding="utf-8"))
+            sreg = json.loads(read_md(snap_reg_path))
             active_snaps = len(sreg.get("snapshots", {}))
             evicted_snaps = len(sreg.get("evicted_history", []))
             baton = sreg.get("active_baton", "MAIN_ORCHESTRATOR")
@@ -320,7 +515,17 @@ def print_context_refresh(workspace: Path, state: Dict[str, Any]) -> None:
             pass
     else:
         print("  Subagent Context Snapshots : 0 active (Use `ra_context_harness.py create` / `fork` to share context)")
+    summary = sb_summary(state, state.get("active_hypothesis"))
+    if summary:
+        print(f"  Scoreboard                 : {summary}")
     print("-" * 78)
+
+    sb_lock = sb_get(state, active_hyp, create=False).get("lock") if state.get("active_hypothesis") else None
+    if sb_lock:
+        print(f"  [!!!] RUNS LOCKED for `{active_hyp}` - {sb_lock.get('reason')}")
+        for line in sb_lock_instructions(state, active_hyp):
+            print(f"        {line}")
+        print("-" * 78)
 
     if stale_notices:
         print("  [!] WORKFLOW MAP STALENESS / ALTERED CODE WARNING:")
@@ -331,15 +536,16 @@ def print_context_refresh(workspace: Path, state: Dict[str, Any]) -> None:
         print("-" * 78)
 
     if violations:
-        print("  [!!!] CRITICAL AXIOM SEAL VIOLATIONS DETECTED:")
+        print("  [!!!] CRITICAL AXIOM SEAL / PROTECTED NODE VIOLATIONS DETECTED:")
         for v in violations:
             print(f"    - {v}")
         print("-" * 78)
 
     if fals_count >= 5:
         print("  [!!!] CHECKPOINT REACHED: 5 consecutive hypotheses falsified on this track.")
-        print("        PAUSE autonomous looping and present the Lab Reports to the user")
-        print("        to confirm whether to pivot the overarching direction.")
+        print("        PAUSE autonomous looping and present the Lab Reports to the user.")
+        print("        `new-hypothesis` is LOCKED until you pass the user's own words:")
+        print("        `ra_gate.py new-hypothesis ... --user-approved \"<what the user said>\"`")
         print("-" * 78)
 
     if protected_nodes:
@@ -359,6 +565,8 @@ def print_context_refresh(workspace: Path, state: Dict[str, Any]) -> None:
             print(f"      Purpose & Reliable Split : {sr.get('purpose', '')}")
             print(f"      Success Criteria         : {sr.get('success_criteria', '')}")
             print(f"      If It Never Works Pivot  : {sr.get('if_never_works', '')}")
+            if sr.get("metric") or sr.get("target") is not None:
+                print(f"      Number                   : {numbers_line(sr)}")
             if st == "PIVOT_TRIGGERED" or f_rounds >= m_rounds:
                 print(
                     f"      [!!! STOP RULE TRIGGERED] Stop tweaking `{comp_name}`! Switch to the `If It Never Works` pivot immediately!"
@@ -389,6 +597,9 @@ def cmd_init(args: argparse.Namespace) -> None:
     rdir = get_research_dir(workspace)
     agent_id = args.agent or "PRIMARY_AGENT"
     state = ensure_initialized(workspace, agent_id=agent_id)
+    if args.project_name and state.get("project_name") != args.project_name.strip():
+        state["project_name"] = args.project_name.strip()
+        save_state(workspace, state)
     print(f"[RA GATE] Initialized research repository at: {rdir}")
     print_context_refresh(workspace, state)
 
@@ -396,7 +607,19 @@ def cmd_init(args: argparse.Namespace) -> None:
 def cmd_status(args: argparse.Namespace) -> None:
     workspace = Path(args.workspace).resolve()
     state = load_state(workspace, auto_init=True)
-    print_context_refresh(workspace, state)
+    if not args.scoreboard:
+        print_context_refresh(workspace, state)
+        return
+    hyp = (args.hypothesis or "").strip() or state.get("active_hypothesis")
+    if not hyp:
+        gate_error("[RA GATE] No active hypothesis; pass `--hypothesis <id>` to show an older scoreboard.", 1)
+    print("=" * 78)
+    print_scoreboard(workspace, state, hyp)
+    if sb_get(state, hyp, create=False).get("lock"):
+        print("  WHAT TO DO:")
+        for line in sb_lock_instructions(state, hyp):
+            print(f"    {line}")
+    print("=" * 78)
 
 
 def cmd_check_question(args: argparse.Namespace) -> None:
@@ -440,67 +663,27 @@ def cmd_check_question(args: argparse.Namespace) -> None:
     if glossary_path.exists():
         print("-" * 78)
         print("  PROJECT SHARED LANGUAGE (`GLOSSARY.md`):")
-        for line in glossary_path.read_text(encoding="utf-8", errors="ignore").splitlines()[:30]:
+        for line in glossary_path.read_text(encoding="utf-8-sig", errors="ignore").splitlines()[:30]:
             print(f"    {line}")
 
     ref_idx = rdir / "library" / "REFERENCES_INDEX.md"
     if ref_idx.exists():
         print("-" * 78)
         print("  INDEXED USER REFERENCES & PAST ANSWERS (`research/library/REFERENCES_INDEX.md`):")
-        for line in ref_idx.read_text(encoding="utf-8").splitlines()[:40]:
+        for line in ref_idx.read_text(encoding="utf-8-sig").splitlines()[:40]:
             print(f"    {line}")
 
     wmap = rdir / "WORKFLOW_MAP.md"
     if wmap.exists():
         print("-" * 78)
         print("  MAPPED SYSTEM WORKFLOW (`research/WORKFLOW_MAP.md` — check before asking how code flows):")
-        for line in wmap.read_text(encoding="utf-8").splitlines()[:25]:
+        for line in wmap.read_text(encoding="utf-8-sig").splitlines()[:25]:
             print(f"    {line}")
 
+    print("-" * 78)
+    print("  If the question is a judgment call you can make yourself, make it and record it instead of asking:")
+    print("    ra_gate.py decide --what \"<decision>\" --why \"<reason>\" [--alternatives \"<a; b>\"]")
     print("=" * 78)
-
-
-def extract_symbol_source_segment(workspace: Path, spec: str) -> Optional[str]:
-    """Extract the source text of `file:symbol` (or entire file if `:symbol` is omitted)."""
-    if ":" in spec:
-        file_part, sym_name = spec.rsplit(":", 1)
-    else:
-        file_part, sym_name = spec, ""
-    fpath = (workspace / file_part).resolve()
-    if not fpath.exists() or not fpath.is_file():
-        return None
-    try:
-        src = fpath.read_text(encoding="utf-8")
-    except Exception:
-        return None
-    if not sym_name:
-        return src
-    if fpath.suffix.lower() == ".py":
-        try:
-            import ast as _ast
-
-            tree = _ast.parse(src)
-            for node in _ast.walk(tree):
-                if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)) and node.name == sym_name:
-                    return _ast.get_source_segment(src, node) or _ast.dump(node)
-        except Exception:
-            pass
-    pat = re.compile(
-        rf"\b(?:def|function|fn|class|struct)\s+{re.escape(sym_name)}\b.*?(?=\n(?:def|function|fn|class|struct)\s+|\Z)",
-        re.DOTALL,
-    )
-    m = pat.search(src)
-    if m:
-        return m.group(0)
-    return None
-
-
-def compute_protected_symbol_hash(workspace: Path, spec: str) -> Optional[str]:
-    """Compute a deterministic SHA-256 hash of a protected `file:symbol` (or entire file if `:symbol` is omitted)."""
-    seg = extract_symbol_source_segment(workspace, spec)
-    if seg is None:
-        return None
-    return hashlib.sha256(seg.strip().encode("utf-8")).hexdigest()
 
 
 SUSPICIOUS_INNOCENCE_RE = re.compile(
@@ -509,6 +692,10 @@ SUSPICIOUS_INNOCENCE_RE = re.compile(
     r"(?:#|//)\s*(?:TODO|FIXME|hack|band-?aid|hardcoded)\b)",
     re.IGNORECASE,
 )
+
+# The template writes these lines as `> - **Last Mapped By ...`; keep whatever prefix is there.
+_STAMP_AGENT_RE = re.compile(r"^(\s*(?:>\s*)?[-*]\s+\*\*Last Mapped By \(Agent / Session\)\*\*:).*$")
+_STAMP_TS_RE = re.compile(r"^(\s*(?:>\s*)?[-*]\s+\*\*Last Snapshot Timestamp\*\*:).*$")
 
 
 def cmd_map_context(args: argparse.Namespace) -> None:
@@ -520,74 +707,123 @@ def cmd_map_context(args: argparse.Namespace) -> None:
     agent_id = args.agent or "PRIMARY_AGENT"
     ts = now_iso()
 
-    tracked: Dict[str, str] = state.get("context_map_snapshot", {}).get("tracked_files", {})
-    if args.files:
-        for fstr in args.files:
-            fpath = (workspace / fstr).resolve()
-            if not fpath.exists() or not fpath.is_file():
-                print(f"[RA GATE] WARNING: Tracked file not found: {fstr}", file=sys.stderr)
-                continue
-            rel = fpath.relative_to(workspace).as_posix()
-            tracked[rel] = sha256_file(fpath)
+    # Validate everything first: a refusal must not leave a half-applied revoke behind.
+    errors: List[str] = []
+    tracked_updates: Dict[str, str] = {}
+    for fstr in args.files or []:
+        fpath = (workspace / fstr).resolve()
+        rel = workspace_rel(workspace, fpath)
+        if rel is None:
+            errors.append(f"`--files {fstr}` is outside the workspace ({fpath}).")
+        elif not fpath.is_file():
+            print(f"[RA GATE] WARNING: Tracked file not found: {fstr}", file=sys.stderr)
+        else:
+            tracked_updates[rel] = hash_file(fpath)
 
-    protected: List[str] = state.get("protected_nodes", [])
-    protected_hashes: Dict[str, str] = state.get("protected_node_hashes", {})
+    protected: List[str] = list(state.get("protected_nodes", []))
+    protected_hashes: Dict[str, str] = dict(state.get("protected_node_hashes", {}))
+    # Older states may hold backslash specs; match nodes on their canonical form.
+    known = {canonical_spec(workspace, k) or k: k for k in protected + list(protected_hashes)}
 
-    # 1. Handle Forensic Lock Revocation (`--revoke-protected`) when real data exposes a disguised culprit
-    if getattr(args, "revoke_protected", None):
-        reason = (getattr(args, "revoke_reason", None) or "").strip()
-        if len(reason) < 10:
-            print(
-                "[RA GATE BLOCKED] Forensic Lock Revocation (`--revoke-protected`) requires `--revoke-reason` "
-                "explaining the runtime `.log` or real-data pipe evidence that exposed the node as corrupted!",
-                file=sys.stderr,
+    revokes: List[str] = []
+    reason = (args.revoke_reason or "").strip()
+    if args.revoke_protected:
+        problem = reason_problem(reason, "--revoke-reason")
+        if problem:
+            errors.append(
+                "Forensic Lock Revocation (`--revoke-protected`) needs `--revoke-reason` quoting the runtime `.log` "
+                f"or real-data evidence that exposed the node as corrupted. {problem}"
             )
-            sys.exit(2)
         for rnode in args.revoke_protected:
-            if rnode in protected:
-                protected.remove(rnode)
-            protected_hashes.pop(rnode, None)
-            state.setdefault("revoked_protected_history", []).append(
-                {
-                    "node": rnode,
-                    "revoked_by": agent_id,
-                    "revoked_at": ts,
-                    "reason": reason,
-                }
-            )
-            append_self_learning(
-                rdir,
-                state.get("active_hypothesis") or "FORENSIC_REVOCATION",
-                agent_id,
-                f"Former `PROTECTED_WORKING` node `{rnode}` exposed as corrupted under real data / `.log` trace.",
-                "Static/initial pass masked a coupled bug that only surfaced after upstream sent real production data.",
-                f"Revoked `PROTECTED_WORKING` lock on `{rnode}` ({reason}) so root-cause repair can proceed.",
-            )
-            print(
-                f"[RA GATE FORENSIC REVOCATION] Unlocked `{rnode}` (Reason: {reason}). "
-                f"You may now repair `{rnode}` to handle the real data contract."
-            )
+            key = known.get(canonical_spec(workspace, rnode) or rnode)
+            if key is None:
+                errors.append(f"`--revoke-protected {rnode}` is not a protected node (protected: {sorted(known) or 'none'}).")
+            elif key not in revokes:
+                revokes.append(key)
 
-    # 2. Handle Zero-Trust `--protected` registration
-    if args.protected:
-        for pnode in args.protected:
-            seg = extract_symbol_source_segment(workspace, pnode)
-            if seg is not None:
-                m_susp = SUSPICIOUS_INNOCENCE_RE.search(seg)
-                if m_susp:
-                    print(
-                        f"[RA GATE BLOCKED] Zero-Trust Innocence Check Failed for `{pnode}`!\n"
-                        f"  Cannot lock `{pnode}` as `PROTECTED_WORKING` because its source contains a suspicious "
-                        f"band-aid / fake-data / stub pattern: `{m_susp.group(0)}`.\n"
-                        f"  Only lock functions proven clean by runtime `[RA_LOG]` boundary traces!",
-                        file=sys.stderr,
-                    )
-                    sys.exit(2)
-            if pnode not in protected:
-                protected.append(pnode)
-            phash = compute_protected_symbol_hash(workspace, pnode)
-            if phash:
-                protected_hashes[pnode] = phash
+    registrations: Dict[str, Any] = {}
+    for pnode in args.protected or []:
+        canon = canonical_spec(workspace, pnode)
+        if canon is None:
+            errors.append(f"`--protected {pnode}` is outside the workspace ({spec_path(workspace, pnode)}).")
+            continue
+        count = find_ambiguous(workspace, canon)
+        if count == 0:
+            errors.append(
+                f"`--protected {pnode}` not found (missing file, or no def/class/function of that name). "
+                "Use `path`, `path:name` or `path:Class.method`."
+            )
+            continue
+        if count > 1:
+            errors.append(
+                f"`--protected {pnode}` is ambiguous: it matches {', '.join(describe_matches(workspace, canon))}. "
+                "Use a qualified `path:Class.method` spec."
+            )
+            continue
+        seg = extract_protected_node(workspace, canon)
+        m_susp = SUSPICIOUS_INNOCENCE_RE.search(seg) if seg is not None else None
+        if m_susp:
+            errors.append(
+                f"Zero-Trust Innocence Check Failed for `{pnode}`: its source contains a suspicious band-aid / "
+                f"fake-data / stub pattern `{m_susp.group(0)}`. Only lock functions proven clean by runtime "
+                "`[RA_LOG]` boundary traces!"
+            )
+            continue
+        phash = hash_protected_node(workspace, canon)
+        if phash is None:
+            errors.append(f"`--protected {pnode}` could not be hashed; refusing a lock that would never be enforced.")
+            continue
+        old_key = known.get(canon)
+        if old_key in protected_hashes and old_key not in revokes:
+            status, _ = verify_protected_node(workspace, old_key, protected_hashes[old_key])
+            if status not in ("OK", "LEGACY_OK"):
+                errors.append(
+                    f"`{pnode}` is already protected and is now {status} since it was locked. Re-registering would "
+                    f"silently re-baseline the tampered code. Revert it, or unlock it in the same call with "
+                    f"`--revoke-protected {old_key} --revoke-reason \"<.log evidence>\"`."
+                )
+                continue
+        where = "whole file" if ":" not in canon else ", ".join(describe_matches(workspace, canon))
+        registrations[canon] = (phash, old_key, where)
+
+    if errors:
+        print("[RA GATE BLOCKED] map-context refused; nothing was changed:", file=sys.stderr)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr)
+        sys.exit(2)
+
+    tracked: Dict[str, str] = state.get("context_map_snapshot", {}).get("tracked_files", {})
+    tracked.update(tracked_updates)
+
+    for rnode in revokes:
+        if rnode in protected:
+            protected.remove(rnode)
+        protected_hashes.pop(rnode, None)
+        state.setdefault("revoked_protected_history", []).append(
+            {"node": rnode, "revoked_by": agent_id, "revoked_at": ts, "reason": reason}
+        )
+        append_self_learning(
+            rdir,
+            state.get("active_hypothesis") or "FORENSIC_REVOCATION",
+            agent_id,
+            f"Former `PROTECTED_WORKING` node `{rnode}` exposed as corrupted under real data / `.log` trace.",
+            "Static/initial pass masked a coupled bug that only surfaced after upstream sent real production data.",
+            f"Revoked `PROTECTED_WORKING` lock on `{rnode}` ({reason}) so root-cause repair can proceed.",
+        )
+        print(
+            f"[RA GATE FORENSIC REVOCATION] Unlocked `{rnode}` (Reason: {reason}). "
+            f"You may now repair `{rnode}` to handle the real data contract."
+        )
+
+    for canon, (phash, old_key, where) in registrations.items():
+        if old_key and old_key != canon:
+            if old_key in protected:
+                protected.remove(old_key)
+            protected_hashes.pop(old_key, None)
+        if canon not in protected:
+            protected.append(canon)
+        protected_hashes[canon] = phash
+        print(f"[RA GATE] Locked `{canon}` as PROTECTED_WORKING ({where}, SHA-256 {phash[:12]}...).")
 
     state["protected_nodes"] = protected
     state["protected_node_hashes"] = protected_hashes
@@ -601,16 +837,11 @@ def cmd_map_context(args: argparse.Namespace) -> None:
         state["current_stage"] = "STAGE_1_WORKFLOW_AND_CONTEXT_MAPPING"
 
     if wmap_path.exists():
-        txt = wmap_path.read_text(encoding="utf-8")
-        lines = txt.splitlines()
         updated_lines: List[str] = []
-        for line in lines:
-            if line.strip().startswith("- **Last Mapped By (Agent / Session)**:"):
-                updated_lines.append(f"- **Last Mapped By (Agent / Session)**: `{agent_id}`")
-            elif line.strip().startswith("- **Last Snapshot Timestamp**:"):
-                updated_lines.append(f"- **Last Snapshot Timestamp**: `{ts}`")
-            else:
-                updated_lines.append(line)
+        for line in read_md(wmap_path).splitlines():
+            line = _STAMP_AGENT_RE.sub(lambda m: f"{m.group(1)} `{agent_id}`", line)
+            line = _STAMP_TS_RE.sub(lambda m: f"{m.group(1)} `{ts}`", line)
+            updated_lines.append(line)
         wmap_path.write_text("\n".join(updated_lines) + "\n", encoding="utf-8")
 
     state.setdefault("history", []).append(
@@ -634,10 +865,42 @@ def is_workflow_map_populated(rdir: Path) -> bool:
     wmap_path = rdir / "WORKFLOW_MAP.md"
     if not wmap_path.exists():
         return False
-    txt = wmap_path.read_text(encoding="utf-8")
+    txt = wmap_path.read_text(encoding="utf-8-sig")
     if "<Exact file and function/symbol>" in txt or "<Why is this the true root-cause location" in txt:
         return False
     return True
+
+
+INVENTORY_PLACEHOLDERS = ("<Asset / data / code / tool>", "| <part> |", "<input -> part -> part")
+
+
+def is_inventory_populated(rdir: Path) -> bool:
+    inv_path = rdir / "INVENTORY.md"
+    if not inv_path.exists():
+        return False
+    txt = inv_path.read_text(encoding="utf-8-sig")
+    return not any(p in txt for p in INVENTORY_PLACEHOLDERS)
+
+
+def ensure_inventory_file(rdir: Path) -> None:
+    # Projects initialised before INVENTORY.md existed get the template on first gate check.
+    inv_path = rdir / "INVENTORY.md"
+    tpl = get_skill_root() / "resources" / "templates" / "INVENTORY.md"
+    if not inv_path.exists() and tpl.exists():
+        inv_path.write_text(tpl.read_text(encoding="utf-8-sig"), encoding="utf-8")
+
+
+OPTION_SWEEP_PLACEHOLDERS = (
+    "<Which part of the brick",
+    "<The simplest or existing solution",
+    "<approach family A>",
+    "<number that means WORKS",
+    "<minimum gain per round",
+)
+
+
+def stop_rule_for(state: Dict[str, Any], hyp: str) -> bool:
+    return any(sr.get("hypothesis") == hyp for sr in state.get("stop_rules", {}).values())
 
 
 def load_context_snapshot_registry(rdir: Path) -> Dict[str, Any]:
@@ -645,7 +908,7 @@ def load_context_snapshot_registry(rdir: Path) -> Dict[str, Any]:
     if not reg_path.exists():
         return {}
     try:
-        return json.loads(reg_path.read_text(encoding="utf-8"))
+        return json.loads(reg_path.read_text(encoding="utf-8-sig"))
     except Exception:
         return {}
 
@@ -692,27 +955,53 @@ def cmd_new_hypothesis(args: argparse.Namespace) -> None:
     state = load_state(workspace)
     rdir = get_research_dir(workspace)
 
-    violations = verify_sealed_axioms(workspace, state)
-    if violations:
-        print("[RA GATE] BLOCKED: Fix sealed axiom violations before starting a hypothesis.", file=sys.stderr)
-        sys.exit(1)
+    block_on_integrity(workspace, state, "new-hypothesis")
 
-    hyp_id = args.id.strip().upper()
-    slug = args.slug.strip().lower().replace(" ", "_")
-    full_id = f"{hyp_id}_{slug}"
     agent_id = args.agent or "PRIMARY_AGENT"
-    parent_id = args.parent or "NONE"
     ts = now_iso()
+    fals_count = state.get("consecutive_falsifications", 0)
+    approval = (args.user_approved or "").strip()
+    if fals_count >= 5:
+        problem = reason_problem(approval, "--user-approved", min_len=10)
+        if problem:
+            gate_error(
+                f"[RA GATE] BLOCKED: {fals_count} consecutive hypotheses FALSIFIED. Stop the autonomous loop, present\n"
+                "          the Lab Reports to the user, and ask whether to continue or pivot the direction.\n"
+                "          Then pass their exact words: `new-hypothesis ... --user-approved \"<what the user said>\"`.\n"
+                f"          ({problem})",
+                1,
+            )
 
-    hyp_dir = rdir / "hypotheses" / full_id
-    sandbox_dir = rdir / "sandbox" / full_id
+    hyp_id = sanitize_token(args.id).upper()
+    slug = sanitize_token(args.slug.strip().lower().replace(" ", "_"))
+    if not hyp_id or not slug:
+        gate_error("[RA GATE] ERROR: `--id` and `--slug` need at least one character from [A-Za-z0-9_-].")
+    full_id = f"{hyp_id}_{slug}"
+    if full_id != f"{args.id.strip().upper()}_{args.slug.strip().lower().replace(' ', '_')}":
+        print(f"[RA GATE] NOTE: id/slug sanitised to `{full_id}` (only [A-Za-z0-9_-] allowed).", file=sys.stderr)
+    parent_id = sanitize_token(args.parent or "") or "NONE"
+
+    hyp_dir = safe_research_path(rdir, "hypotheses", full_id)
+    sandbox_dir = safe_research_path(rdir, "sandbox", full_id)
+    if fals_count >= 5:
+        state.setdefault("checkpoint_approvals", []).append(
+            {"timestamp": ts, "falsifications": fals_count, "user_approved": approval, "next_hypothesis": full_id}
+        )
+        state["consecutive_falsifications"] = 0
+        lab_log = rdir / "LAB_LOG.md"
+        if lab_log.exists():
+            with lab_log.open("a", encoding="utf-8") as f:
+                f.write(
+                    f"| `{ts}` | `{hyp_id}` | `{parent_id}` | `{agent_id}` | `CHECKPOINT_APPROVED` "
+                    f"| User: \"{_table_cell(approval)}\" | `-` |\n"
+                )
     hyp_dir.mkdir(parents=True, exist_ok=True)
     sandbox_dir.mkdir(parents=True, exist_ok=True)
 
     tpl_path = get_skill_root() / "resources" / "templates" / "HYPOTHESIS_REPORT.md"
     report_path = hyp_dir / "REPORT.md"
     if not report_path.exists():
-        tpl = tpl_path.read_text(encoding="utf-8") if tpl_path.exists() else "# Report\n"
+        tpl = tpl_path.read_text(encoding="utf-8-sig") if tpl_path.exists() else "# Report\n"
         content = (
             tpl.replace("{{HYPOTHESIS_ID}}", hyp_id)
             .replace("{{SLUG}}", slug)
@@ -725,7 +1014,7 @@ def cmd_new_hypothesis(args: argparse.Namespace) -> None:
     # Always enter Stage 1 (Workflow & Context Mapping) first unless WORKFLOW_MAP.md is populated AND a context snapshot exists
     next_stage = (
         "STAGE_2_HYPOTHESIS_FORMULATION"
-        if (is_workflow_map_populated(rdir) and has_reusable_context_snapshot(rdir))
+        if (is_workflow_map_populated(rdir) and is_inventory_populated(rdir) and has_reusable_context_snapshot(rdir))
         else "STAGE_1_WORKFLOW_AND_CONTEXT_MAPPING"
     )
 
@@ -755,12 +1044,7 @@ def cmd_advance(args: argparse.Namespace) -> None:
     state = load_state(workspace)
     rdir = get_research_dir(workspace)
 
-    violations = verify_sealed_axioms(workspace, state)
-    if violations:
-        print("[RA GATE] BLOCKED: Axiom seal violation detected!", file=sys.stderr)
-        for v in violations:
-            print(f"  - {v}", file=sys.stderr)
-        sys.exit(1)
+    block_on_integrity(workspace, state, "advance")
 
     stage = state.get("current_stage", "STAGE_0_INTAKE_AND_SYNC")
     active_hyp = state.get("active_hypothesis")
@@ -781,6 +1065,16 @@ def cmd_advance(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+        ensure_inventory_file(rdir)
+        if not is_inventory_populated(rdir):
+            print(
+                "[RA GATE] BLOCKED: `research/INVENTORY.md` is not filled in. Before any hypothesis:\n"
+                "          1. Take stock of EVERY asset, dataset, dump and tool already provided (open them).\n"
+                "          2. Triage parts KNOWN vs UNKNOWN (KNOWN needs evidence it fits this project).\n"
+                "          3. Define the brick: the crudest end-to-end version that runs, and its status.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         if not has_reusable_context_snapshot(rdir):
             print(
                 "[RA GATE] BLOCKED: You must compile a shared Context Snapshot for subagent `/fork` reuse before leaving Stage 1!\n"
@@ -791,11 +1085,10 @@ def cmd_advance(args: argparse.Namespace) -> None:
             sys.exit(1)
         if not active_hyp:
             print(
-                "[RA GATE] `research/WORKFLOW_MAP.md` and Context Snapshot verified! Now run `ra_gate.py new-hypothesis --id H001 --slug <name>` "
-                "to open your hypothesis in Stage 2.",
-                file=sys.stderr,
+                "[RA GATE] Stage 1 checks passed (WORKFLOW_MAP.md, INVENTORY.md, Context Snapshot). There is no hypothesis\n"
+                "          to advance yet. NEXT STEP: `ra_gate.py new-hypothesis --id H001 --slug <name>` opens it in Stage 2."
             )
-            sys.exit(1)
+            return
         state["current_stage"] = "STAGE_2_HYPOTHESIS_FORMULATION"
         save_state(workspace, state)
         print(f"[RA GATE] Advanced `{active_hyp}` to STAGE_2_HYPOTHESIS_FORMULATION.")
@@ -806,8 +1099,8 @@ def cmd_advance(args: argparse.Namespace) -> None:
         print("[RA GATE] ERROR: No active hypothesis. Run `new-hypothesis` first.", file=sys.stderr)
         sys.exit(1)
 
-    hyp_dir = rdir / "hypotheses" / active_hyp
-    sandbox_dir = rdir / "sandbox" / active_hyp
+    hyp_dir = safe_research_path(rdir, "hypotheses", active_hyp)
+    sandbox_dir = safe_research_path(rdir, "sandbox", active_hyp)
     report_path = hyp_dir / "REPORT.md"
 
     if stage == "STAGE_2_HYPOTHESIS_FORMULATION":
@@ -820,7 +1113,7 @@ def cmd_advance(args: argparse.Namespace) -> None:
         if not report_path.exists():
             print(f"[RA GATE] BLOCKED: Missing `{report_path}`.", file=sys.stderr)
             sys.exit(1)
-        report_txt = report_path.read_text(encoding="utf-8")
+        report_txt = report_path.read_text(encoding="utf-8-sig")
         if "<Empirical proof that this node is the root cause" in report_txt:
             print(
                 "[RA GATE] BLOCKED: You have not filled out Section 2 (Workflow Context, Culprit Proof & "
@@ -828,16 +1121,44 @@ def cmd_advance(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        if "<Write the exact equations" in report_txt:
+        missing = [p for p in OPTION_SWEEP_PLACEHOLDERS if p in report_txt]
+        if "Option Sweep" not in report_txt:
+            missing.append("Section 3 'Option Sweep, Baseline & Stop Rule' (copy it from the current HYPOTHESIS_REPORT.md template)")
+        if missing or "<Write the exact equations" in report_txt or "<Exact equations, state transitions" in report_txt:
             print(
-                "[RA GATE] BLOCKED: You have not filled out Section 3 (First-Principles Formulation) in REPORT.md!",
+                "[RA GATE] BLOCKED: Section 3 of REPORT.md is not filled out. Required: weakest link targeted,\n"
+                "          baseline to beat, an Option Sweep of >= 3 approach FAMILIES, success criteria, plateau rule,\n"
+                "          and the chosen approach's formulation. Still unfilled:\n"
+                + "\n".join(f"            - {p}..." for p in missing),
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        stop_hint = (
+            f"`ra_gate.py stop-rule --component <slug> --purpose \"...\" --success-criteria \"...\" "
+            f"--max-rounds 2 --if-never-works \"<next family from the Option Sweep>\" "
+            f"--metric \"<name>\" --target <x> --min-gain <g> [--lower-is-better]`"
+        )
+        if not stop_rule_for(state, active_hyp):
+            print(
+                f"[RA GATE] BLOCKED: No stop rule registered for `{active_hyp}`. Before building, run:\n          {stop_hint}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not any(
+            sr.get("hypothesis") == active_hyp and rule_has_numbers(sr) for sr in state.get("stop_rules", {}).values()
+        ):
+            print(
+                f"[RA GATE] BLOCKED: the stop rule for `{active_hyp}` has no number. It needs `--metric`, `--target`\n"
+                "          and `--min-gain` (plus `--lower-is-better` if smaller wins): every R&D problem has a number;\n"
+                "          if nothing else, pass-rate over real cases (0..1). Re-register the same component:\n"
+                f"          {stop_hint}",
                 file=sys.stderr,
             )
             sys.exit(1)
         state["current_stage"] = "STAGE_3_SANDBOX_PROTOTYPE"
 
     elif stage == "STAGE_3_SANDBOX_PROTOTYPE":
-        ignored_meta = {"visual_audit.md", "ra_logger.py", "ra_logger.js", "ralogger.php"}
+        ignored_meta = {"visual_audit.md", "ra_logger.py", "ra_logger.js", "ra_logger.ts", "ra_logger.mjs", "ralogger.php"}
         files = [
             f
             for f in sandbox_dir.rglob("*")
@@ -900,7 +1221,7 @@ def cmd_advance(args: argparse.Namespace) -> None:
 
     elif stage == "STAGE_7_GRADUATION_REVIEW":
         print(
-            "[RA GATE] Waiting for User Graduation Sign-Off. Run `ra_gate.py graduate --workspace .` only AFTER "
+            "[RA GATE] Waiting for User Graduation Sign-Off. Run `ra_gate.py graduate --user-approved \"<their words>\"` only AFTER "
             "the user approves the Lab Report.",
             file=sys.stderr,
         )
@@ -913,22 +1234,38 @@ def cmd_advance(args: argparse.Namespace) -> None:
 
 def append_self_learning(
     rdir: Path, hyp_id: str, agent_id: str, issue: str, workflow: str, found: str
-) -> None:
+) -> bool:
     sl_path = rdir / "SELF_LEARNING.md"
     ts = now_iso()
-    existing = sl_path.read_text(encoding="utf-8") if sl_path.exists() else "# Self-Learning Log\n"
-    count = existing.count("### `SL-")
-    sl_id = f"SL-{count:03d}"
-    entry = (
-        f"\n### `{sl_id}` ({hyp_id})\n"
-        f"- **Date / Agent**: `{ts}` / `{agent_id}`\n"
+    existing = read_md(sl_path) if sl_path.exists() else "# Self-Learning Log\n"
+    body = (
         f"- **Related Hypothesis**: `{hyp_id}`\n"
         f"- **Issue**: {issue.strip()}\n"
         f"- **Workflow**: {workflow.strip()}\n"
         f"- **Found**: {found.strip()}\n"
     )
+    # A retried command must not log the same lesson twice.
+    if body in existing:
+        return False
+    sl_id = f"SL-{existing.count('### `SL-'):03d}"
+    entry = f"\n### `{sl_id}` ({hyp_id})\n- **Date / Agent**: `{ts}` / `{agent_id}`\n" + body
+    rdir.mkdir(parents=True, exist_ok=True)
     with sl_path.open("a", encoding="utf-8") as f:
+        if not sl_path.exists() or sl_path.stat().st_size == 0:
+            f.write(existing)
         f.write(entry)
+    return True
+
+
+def append_lab_log_row(rdir: Path, ts: str, cells: str) -> None:
+    """Append `| ts | <cells>` once; a retry with the same cells is a no-op."""
+    lab_log = rdir / "LAB_LOG.md"
+    if not lab_log.exists():
+        return
+    if cells in read_md(lab_log):
+        return
+    with lab_log.open("a", encoding="utf-8") as f:
+        f.write(f"| `{ts}` {cells}\n")
 
 
 def cmd_conclude(args: argparse.Namespace) -> None:
@@ -972,38 +1309,64 @@ def cmd_conclude(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+        if not unseen_target_met(state, active_hyp):
+            comp, sr = metric_rule(state, active_hyp)
+            print(
+                f"[RA GATE] BLOCKED: Cannot mark `{active_hyp}` PROVEN: stop rule `{comp}` sets target "
+                f"{fmt_score(sr.get('target'))} on `{sr.get('metric')}`, and no `--unseen` round has met it.\n"
+                "          Run the winning approach on held-out data: `ra_log_engine.py run --approach <family> --unseen ...`.",
+                file=sys.stderr,
+            )
+            print_scoreboard(workspace, state, active_hyp, sys.stderr)
+            sys.exit(1)
+        block_on_integrity(workspace, state, "conclude PROVEN")
+    else:
+        for v in verify_integrity(workspace, state):
+            print(f"[RA GATE] WARNING (still archiving the sandbox): {v}", file=sys.stderr)
 
     agent_id = args.agent or "PRIMARY_AGENT"
     ts = now_iso()
-
-    append_self_learning(rdir, active_hyp, agent_id, args.issue, args.workflow, args.found)
-
-    hyp_dir = rdir / "hypotheses" / active_hyp
+    hyp_dir = safe_research_path(rdir, "hypotheses", active_hyp)
+    sandbox_dir = safe_research_path(rdir, "sandbox", active_hyp)
     report_path = hyp_dir / "REPORT.md"
+
+    # Files first, logs and state last: a crash part-way can simply be re-run.
     if report_path.exists():
-        txt = report_path.read_text(encoding="utf-8")
+        txt = read_md(report_path)
         txt = txt.replace("**Current Verdict**: `PENDING`", f"**Current Verdict**: `{verdict}`")
         txt = txt.replace("**Final Verdict**: `<PROVEN | FALSIFIED>`", f"**Final Verdict**: `{verdict}`")
         report_path.write_text(txt, encoding="utf-8")
 
-    lab_log = rdir / "LAB_LOG.md"
-    if lab_log.exists():
-        with lab_log.open("a", encoding="utf-8") as f:
-            f.write(
-                f"| `{ts}` | `{active_hyp}` | `-` | `{agent_id}` | `{verdict}` "
-                f"| {args.found.strip()} | `hypotheses/{active_hyp}/REPORT.md` |\n"
-            )
-
-    sandbox_dir = rdir / "sandbox" / active_hyp
+    grave_rel = ""
     if verdict == "FALSIFIED":
-        grave_dir = rdir / "graveyard" / active_hyp
+        (rdir / "graveyard").mkdir(parents=True, exist_ok=True)
+        grave_dir = safe_research_path(rdir, "graveyard", active_hyp)
         if sandbox_dir.exists():
-            if grave_dir.exists():
-                shutil.rmtree(grave_dir)
+            suffix = 2
+            while grave_dir.exists():  # an older hypothesis with the same id is already buried here
+                grave_dir = safe_research_path(rdir, "graveyard", f"{active_hyp}__{suffix}")
+                suffix += 1
             shutil.move(str(sandbox_dir), str(grave_dir))
+        else:
+            grave_dir.mkdir(parents=True, exist_ok=True)
         if report_path.exists():
             shutil.copy2(report_path, grave_dir / "REPORT.md")
+        grave_rel = workspace_rel(workspace, grave_dir) or str(grave_dir)
+        # Seals inside the archived sandbox follow it instead of reading as "deleted" forever.
+        old_prefix = f"research/sandbox/{active_hyp}/"
+        sealed = state.get("sealed_axioms", {})
+        for rel in [r for r in sealed if r.startswith(old_prefix)]:
+            sealed[f"{grave_rel}/{rel[len(old_prefix):]}"] = sealed.pop(rel)
 
+    append_self_learning(rdir, active_hyp, agent_id, args.issue, args.workflow, args.found)
+    append_lab_log_row(
+        rdir,
+        ts,
+        f"| `{active_hyp}` | `-` | `{agent_id}` | `{verdict}` | {_table_cell(args.found)} "
+        f"| `hypotheses/{active_hyp}/REPORT.md` |",
+    )
+
+    if verdict == "FALSIFIED":
         state["consecutive_falsifications"] = state.get("consecutive_falsifications", 0) + 1
         state["current_stage"] = "STAGE_1_WORKFLOW_AND_CONTEXT_MAPPING"
         state["active_hypothesis"] = None
@@ -1013,7 +1376,7 @@ def cmd_conclude(args: argparse.Namespace) -> None:
         save_state(workspace, state)
         print(
             f"[RA GATE] Hypothesis `{active_hyp}` marked FALSIFIED. "
-            f"Sandbox quarantined & moved to `research/graveyard/{active_hyp}/`. Main codebase remains clean.\n"
+            f"Sandbox quarantined & moved to `{grave_rel}/`. Main codebase remains clean.\n"
             f"          Returned to STAGE_1_WORKFLOW_AND_CONTEXT_MAPPING to re-verify workflow context before next hypothesis."
         )
     else:
@@ -1038,18 +1401,48 @@ def cmd_graduate(args: argparse.Namespace) -> None:
         print("[RA GATE] ERROR: Only a hypothesis in STAGE_7_GRADUATION_REVIEW can be graduated.", file=sys.stderr)
         sys.exit(1)
 
+    approval = (args.user_approved or "").strip()
+    problem = reason_problem(approval, "--user-approved", min_len=10)
+    if problem:
+        gate_error(
+            "[RA GATE] BLOCKED: Graduation needs the user's sign-off on the Lab Report, quoted verbatim:\n"
+            "          `ra_gate.py graduate --user-approved \"<the user's exact words>\"`\n"
+            f"          ({problem})",
+            1,
+        )
+    block_on_integrity(workspace, state, "graduate")
+    stale = [tool for flag, tool in PASS_FLAGS.items() if not state.get(flag)]
+    if stale:
+        gate_error(
+            "[RA GATE] BLOCKED: The code changed since the audits passed. Re-run before graduating: "
+            + ", ".join(f"`{t}`" for t in stale),
+            1,
+        )
+
+    agent_id = args.agent or "PRIMARY_AGENT"
     ts = now_iso()
-    lib_note = rdir / "library" / f"GRADUATED_{active_hyp}.md"
-    report_path = rdir / "hypotheses" / active_hyp / "REPORT.md"
-    report_body = report_path.read_text(encoding="utf-8") if report_path.exists() else ""
+    lib_note = safe_research_path(rdir, "library", f"GRADUATED_{active_hyp}.md")
+    report_path = safe_research_path(rdir, "hypotheses", active_hyp) / "REPORT.md"
+    report_body = read_md(report_path) if report_path.exists() else ""
+    lib_note.parent.mkdir(parents=True, exist_ok=True)
     lib_note.write_text(
         f"# [GRADUATED_LAB_TRUTH] {active_hyp}\n\n"
         f"- **Graduated Timestamp**: `{ts}`\n"
+        f"- **User Sign-Off (verbatim)**: \"{_table_cell(approval)}\"\n"
         f"- **Provenance**: Survived Stage 1 Workflow Mapping, Stage 4 Adversarial Break-Test, Stage 5 Anti-Cheese Audit, and Stage 7 User Sign-Off.\n\n"
         f"---\n\n{report_body}",
         encoding="utf-8",
     )
+    append_lab_log_row(
+        rdir,
+        ts,
+        f"| `{active_hyp}` | `-` | `{agent_id}` | `GRADUATED` | User: \"{_table_cell(approval)}\" "
+        f"| `library/GRADUATED_{active_hyp}.md` |",
+    )
 
+    state.setdefault("graduations", []).append(
+        {"hypothesis": active_hyp, "timestamp": ts, "agent": agent_id, "user_approved": approval}
+    )
     state["current_stage"] = "STAGE_0_INTAKE_AND_SYNC"
     state["active_hypothesis"] = None
     state["cheese_audit_passed"] = False
@@ -1060,19 +1453,39 @@ def cmd_graduate(args: argparse.Namespace) -> None:
     print_context_refresh(workspace, state)
 
 
+# Sandboxes move to the graveyard on FALSIFIED, so a seal there would dangle.
+UNSEALABLE_PREFIXES = ("research/sandbox/", "research/graveyard/")
+
+
 def cmd_seal_axioms(args: argparse.Namespace) -> None:
     workspace = Path(args.workspace).resolve()
     state = load_state(workspace, auto_init=True)
     fpath = (workspace / args.file).resolve()
-    if not fpath.exists():
-        print(f"[RA GATE] ERROR: Axiom file not found: {fpath}", file=sys.stderr)
-        sys.exit(1)
+    rel = workspace_rel(workspace, fpath)
+    if rel is None:
+        gate_error(f"[RA GATE] ERROR: `{args.file}` is outside the workspace ({fpath}). Seal files inside it.", 1)
+    if not fpath.is_file():
+        gate_error(f"[RA GATE] ERROR: Axiom file not found: {fpath}", 1)
+    if rel.startswith(UNSEALABLE_PREFIXES):
+        gate_error(
+            f"[RA GATE] REFUSED: `{rel}` is inside a sandbox/graveyard, which moves when a hypothesis is FALSIFIED.\n"
+            "          Put shared axioms in a stable location (e.g. `research/axioms/` or the project tree) and seal that."
+        )
+    sealed = state.setdefault("sealed_axioms", {})
+    if rel in sealed:
+        status, _ = verify_seal(fpath, sealed[rel])
+        if status == "TAMPERED":
+            gate_error(
+                f"[RA GATE] REFUSED: `{rel}` is already sealed and was modified since. Re-sealing would launder the edit.\n"
+                f"          Revert it, or `ra_gate.py unseal --file {rel} --reason \"...\"` first."
+            )
 
-    rel = fpath.relative_to(workspace).as_posix()
-    digest = sha256_file(fpath)
-    lines = len(fpath.read_text(encoding="utf-8").splitlines())
-    state.setdefault("sealed_axioms", {})[rel] = {
+    digest = hash_file(fpath)
+    text = read_text_normalised(fpath)
+    lines = len(text.splitlines()) if text is not None else 0
+    sealed[rel] = {
         "sha256": digest,
+        "algo": HASH_ALGO,
         "lines": lines,
         "sealed_at": now_iso(),
     }
@@ -1080,8 +1493,40 @@ def cmd_seal_axioms(args: argparse.Namespace) -> None:
     print(f"[RA GATE] Sealed AXIOMATIC_PRIMITIVES file `{rel}` (SHA-256: {digest[:16]}..., {lines} lines).")
 
 
+def cmd_unseal(args: argparse.Namespace) -> None:
+    workspace = Path(args.workspace).resolve()
+    state = load_state(workspace)
+    rdir = get_research_dir(workspace)
+    sealed: Dict[str, Any] = state.setdefault("sealed_axioms", {})
+    rel = workspace_rel(workspace, workspace / args.file)
+    key = next((k for k in (rel, args.file.strip().replace("\\", "/")) if k in sealed), None)
+    if key is None:
+        gate_error(f"[RA GATE] ERROR: `{args.file}` is not sealed. Sealed files: {sorted(sealed) or 'none'}.", 1)
+    problem = reason_problem(args.reason, "--reason")
+    if problem:
+        gate_error(f"[RA GATE] BLOCKED: unseal needs a real justification. {problem}")
+
+    agent_id = args.agent or "PRIMARY_AGENT"
+    reason = args.reason.strip()
+    meta = sealed.pop(key)
+    state.setdefault("unsealed_history", []).append(
+        {"file": key, "sha256": meta.get("sha256"), "unsealed_at": now_iso(), "agent": agent_id, "reason": reason}
+    )
+    append_self_learning(
+        rdir,
+        state.get("active_hypothesis") or "AXIOM_UNSEAL",
+        agent_id,
+        f"Unsealed AXIOMATIC_PRIMITIVES file `{key}`.",
+        "A sealed axiom file had to change or move; the seal was lifted explicitly instead of being bypassed.",
+        f"Reason: {reason}",
+    )
+    save_state(workspace, state)
+    print(f"[RA GATE] Unsealed `{key}` (reason logged to SELF_LEARNING.md). Re-seal it with `seal-axioms` once it is final.")
+
+
 def cmd_learn(args: argparse.Namespace) -> None:
     workspace = Path(args.workspace).resolve()
+    load_state(workspace, auto_init=True)
     rdir = get_research_dir(workspace)
     append_self_learning(
         rdir,
@@ -1116,6 +1561,8 @@ def cmd_stop_rule(args: argparse.Namespace) -> None:
         sr = stop_rules[comp]
         sr["failed_rounds"] = sr.get("failed_rounds", 0) + 1
         sr["last_failed_at"] = now_iso()
+        # The `re-evaluate` that follows this same failure must not count it again.
+        sr["failure_pending_re_evaluate"] = True
         f_rounds = sr["failed_rounds"]
         m_rounds = sr.get("max_rounds", 2)
         if f_rounds >= m_rounds:
@@ -1133,7 +1580,7 @@ def cmd_stop_rule(args: argparse.Namespace) -> None:
             print(f"  [!!!] RA STOP RULE TRIGGERED FOR `{comp}` ({f_rounds}/{m_rounds} FAILED ROUNDS)")
             print("=" * 78)
             print(f"  STOP tweaking `{comp}`! Do NOT run another `fail -> fix -> retest` round.")
-            print(f"  Execute your pre-registered 'If It Never Works' Pivot Plan immediately:")
+            print(f"  Conclude FALSIFIED (PLATEAUED); race the next Option Sweep family, or run the pivot:")
             print(f"    -> {sr.get('if_never_works')}")
             print("=" * 78)
             return
@@ -1144,7 +1591,20 @@ def cmd_stop_rule(args: argparse.Namespace) -> None:
         )
         return
 
-    if not args.purpose or not args.success_criteria or not args.if_never_works:
+    old = stop_rules.get(comp)
+    if args.reset:
+        if old is None:
+            gate_error(f"[RA GATE BLOCKED] `--reset`: no Stop Rule registered for `{comp}`.")
+        problem = reason_problem(args.reason, "--reason")
+        if problem:
+            gate_error(f"[RA GATE BLOCKED] Resetting `{comp}`'s failed rounds needs `--reason` (why a fresh budget is legitimate). {problem}")
+    elif args.reason:
+        gate_error("[RA GATE] ERROR: `--reason` only applies together with `--reset`.")
+
+    purpose = (args.purpose or (old or {}).get("purpose", "")).strip()
+    success = (args.success_criteria or (old or {}).get("success_criteria", "")).strip()
+    never = (args.if_never_works or (old or {}).get("if_never_works", "")).strip()
+    if not purpose or not success or not never:
         print(
             "[RA GATE BLOCKED] Registering a Stop Rule requires all three:\n"
             "  1. `--purpose` (what the score/mechanism is for + what is ALREADY reliable vs. weak)\n"
@@ -1154,30 +1614,96 @@ def cmd_stop_rule(args: argparse.Namespace) -> None:
         )
         sys.exit(2)
 
+    max_rounds = max(1, int(args.max_rounds)) if args.max_rounds is not None else 2
+    keep = old is not None and not args.reset
+    if keep:
+        # Re-registering never buys more rounds; only `--reset --reason` does.
+        if args.max_rounds is None or max_rounds > old.get("max_rounds", 2):
+            max_rounds = old.get("max_rounds", 2)
+
+    prev = old or {}
+    metric = (args.metric or "").strip() or None
+    if args.min_gain is not None and not args.min_gain > 0:
+        gate_error("[RA GATE BLOCKED] `--min-gain` must be > 0 (the smallest improvement per round that counts as progress).")
+    if args.max_rounds_per_approach is not None and args.max_rounds_per_approach < 1:
+        gate_error("[RA GATE BLOCKED] `--max-rounds-per-approach` must be >= 1.")
+    given = {"metric": metric, "target": args.target, "min_gain": args.min_gain, "lower_is_better": args.lower_is_better}
+    if keep and rule_has_numbers(prev):
+        # Moving the goalposts mid-race would dodge the plateau lock.
+        moved = [
+            k for k, v in given.items()
+            if v is not None and v != (bool(prev.get(k)) if k == "lower_is_better" else prev.get(k))
+        ]
+        if moved:
+            gate_error(
+                f"[RA GATE BLOCKED] `{comp}` already has its number ({numbers_line(prev)}). Changing "
+                + ", ".join(f"`{k}`" for k in moved)
+                + " needs `--reset --reason \"...\"` (logged to SELF_LEARNING.md)."
+            )
+    numbers = {k: (v if v is not None else prev.get(k)) for k, v in given.items()}
+    numbers["lower_is_better"] = bool(numbers["lower_is_better"])
+    cap = args.max_rounds_per_approach
+    old_cap = prev.get("max_rounds_per_approach")
+    if keep and old_cap is not None and (cap is None or cap > old_cap):
+        cap = old_cap
+    numbers["max_rounds_per_approach"] = cap if cap is not None else (old_cap or DEFAULT_MAX_ROUNDS_PER_APPROACH)
+
     stop_rules[comp] = {
         "component": comp,
-        "purpose": args.purpose.strip(),
-        "success_criteria": args.success_criteria.strip(),
-        "max_rounds": max(1, int(args.max_rounds)),
-        "failed_rounds": 0,
-        "if_never_works": args.if_never_works.strip(),
-        "status": "ACTIVE",
-        "registered_at": now_iso(),
+        "purpose": purpose,
+        "success_criteria": success,
+        "max_rounds": max_rounds,
+        "failed_rounds": old.get("failed_rounds", 0) if keep else 0,
+        "if_never_works": never,
+        "status": old.get("status", "ACTIVE") if keep else "ACTIVE",
+        "registered_at": old.get("registered_at", now_iso()) if keep else now_iso(),
+        "hypothesis": state.get("active_hypothesis"),
+        **numbers,
     }
+    if keep and old.get("failure_pending_re_evaluate"):
+        stop_rules[comp]["failure_pending_re_evaluate"] = True
+    if args.reset:
+        reason = args.reason.strip()
+        state.setdefault("stop_rule_resets", []).append(
+            {"component": comp, "at": now_iso(), "reason": reason, "previous": old}
+        )
+        append_self_learning(
+            rdir,
+            state.get("active_hypothesis") or comp,
+            args.agent or "PRIMARY_AGENT",
+            f"Stop Rule for `{comp}` reset at {old.get('failed_rounds', 0)}/{old.get('max_rounds', 2)} failed rounds "
+            f"(status {old.get('status', 'ACTIVE')}).",
+            "The failure budget was restarted explicitly instead of by silent re-registration.",
+            f"Reason: {reason}",
+        )
     save_state(workspace, state)
+    sr = stop_rules[comp]
     print("=" * 78)
     print(f"  RA STOP RULE & PIVOT CONTRACT LOCKED FOR `{comp}`")
     print("=" * 78)
-    print(f"  Purpose & Reliable Split : {args.purpose.strip()}")
-    print(f"  Success Criteria         : {args.success_criteria.strip()}")
-    print(f"  Max Unseen Rounds        : {max(1, int(args.max_rounds))} round(s) before kill-switch")
-    print(f"  If It Never Works Pivot  : {args.if_never_works.strip()}")
+    print(f"  Purpose & Reliable Split : {purpose}")
+    print(f"  Success Criteria         : {success}")
+    print(f"  Max Unseen Rounds        : {sr['max_rounds']} round(s) before kill-switch")
+    print(f"  If It Never Works Pivot  : {never}")
+    if rule_has_numbers(sr):
+        print(f"  Number                   : {numbers_line(sr)}")
+    else:
+        print("  Number                   : MISSING - add --metric/--target/--min-gain (Stage 2 -> 3 requires them)")
+    if keep:
+        print(
+            f"  Kept from the existing rule: {sr['failed_rounds']}/{sr['max_rounds']} failed rounds, status {sr['status']}.\n"
+            f"  Starting over needs `--reset --reason \"...\"`."
+        )
     print("=" * 78)
 
 
 LAZY_RETRY_EXCUSE_RE = re.compile(
-    r"\b(let'?s\s+retry|try\s+again|just\s+retry|re-?run\s+and\s+see|tweak\s+threshold|nudge\s+threshold|"
-    r"adjust\s+threshold|increase\s+timeout|maybe\s+flaky|random\s+glitch)\b",
+    r"\b(let'?s\s+(?:just\s+)?(?:retry|re-?run|try)|let\s+us\s+(?:just\s+)?(?:retry|re-?run|try)|"
+    r"(?:retry|re-?run|try)(?:\s+it)?\s+(?:again|once\s+more)|just\s+(?:retry|re-?run)|re-?run\s+and\s+see|"
+    r"(?:tweak|nudge|adjust|bump|raise|lower|increase|decrease|loosen|relax)\s+(?:up\s+|down\s+)?"
+    r"(?:the\s+|a\s+|our\s+|that\s+|this\s+)?(?:threshold|timeout|tolerance|epsilon|margin)s?|"
+    r"(?:maybe|probably|likely|just|seems)\s+(?:a\s+)?(?:flak(?:y|ey|iness)|fluke|glitch)|flakey|"
+    r"random\s+(?:glitch|fluke|failure))\b",
     re.IGNORECASE,
 )
 
@@ -1214,8 +1740,8 @@ def cmd_re_evaluate(args: argparse.Namespace) -> None:
             print(
                 f"[RA GATE BLOCKED — LAZY RETRY EXCUSE DETECTED IN `{field_name}`]\n"
                 f"  Matched forbidden trial-and-error phrase: `{m_lazy.group(0)}`.\n"
-                f"  Do NOT spam 'let's retry' or nudge thresholds! Re-calculate the underlying invariant/equation\n"
-                f"  or execute your `If It Never Works` Pivot Plan.",
+                f"  Do NOT spam 'let's retry' or nudge thresholds! If this approach has PLATEAUED, switch to the\n"
+                f"  next approach FAMILY in your Option Sweep (REPORT.md Section 3) or run the `If It Never Works` plan.",
                 file=sys.stderr,
             )
             sys.exit(2)
@@ -1226,7 +1752,10 @@ def cmd_re_evaluate(args: argparse.Namespace) -> None:
 
     if comp in stop_rules:
         sr = stop_rules[comp]
-        sr["failed_rounds"] = sr.get("failed_rounds", 0) + 1
+        # One failed round = one count, whether the agent ran record-failure, re-evaluate, or both.
+        pending = sr.pop("failure_pending_re_evaluate", False)
+        if not pending and sr.get("status") != "PIVOT_TRIGGERED":
+            sr["failed_rounds"] = sr.get("failed_rounds", 0) + 1
         f_rounds = sr["failed_rounds"]
         m_rounds = sr.get("max_rounds", 2)
         if f_rounds >= m_rounds or sr.get("status") == "PIVOT_TRIGGERED":
@@ -1239,8 +1768,8 @@ def cmd_re_evaluate(args: argparse.Namespace) -> None:
             )
             print("=" * 78, file=sys.stderr)
             print(
-                f"  Execution remains LOCKED for `{comp}`! Stop trying to fix this heuristic.\n"
-                f"  Switch to your pre-registered 'If It Never Works' Pivot Plan immediately:\n"
+                f"  Execution remains LOCKED for `{comp}`! Stop trying to fix this approach.\n"
+                f"  Conclude FALSIFIED (PLATEAUED) and race the next family from the Option Sweep, or run the pivot:\n"
                 f"    -> {sr.get('if_never_works')}",
                 file=sys.stderr,
             )
@@ -1279,8 +1808,235 @@ def cmd_re_evaluate(args: argparse.Namespace) -> None:
     print(f"  Why Old Failed   : {why_failed}")
     print(f"  New Calculation  : {new_calc}")
     print(f"  Why Deterministic: {why_diff}")
-    print("  Next Step        : Implement the new calculation in code (changing the code SHA-256) before running `ra_log_engine.py run`.")
+    print("  Next Step        : Implement it (changing the code SHA-256) before running `ra_log_engine.py run`.")
+    print("  Plateau check    : 2 rounds under the minimum gain = PLATEAUED. Switch family, don't tweak.")
     print("=" * 78)
+
+
+COLD_REVIEW_MIN_CHARS = 400
+_VERDICT_RE = re.compile(
+    r"^[\s>*_#`-]*VERDICT[\s*_`]*:[\s*_`]*(CONTINUE|SWITCH|BRICK[-_ ]?FIRST)\b", re.IGNORECASE | re.MULTILINE
+)
+
+
+def _iso_ts(text: Optional[str]) -> float:
+    try:
+        return dt.datetime.fromisoformat(str(text)).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def cmd_cold_review(args: argparse.Namespace) -> None:
+    """Accept a fresh reviewer's verdict on a plateau lock: CONTINUE, SWITCH or BRICK-FIRST."""
+    workspace = Path(args.workspace).resolve()
+    state = load_state(workspace)
+    rdir = get_research_dir(workspace)
+    hyp = state.get("active_hypothesis")
+    if not hyp:
+        gate_error("[RA GATE] ERROR: No active hypothesis.", 1)
+    sb = sb_get(state, hyp)
+    lock = sb.get("lock")
+    if not lock:
+        gate_error(
+            f"[RA GATE] REFUSED: `{hyp}` has no plateau lock, so there is nothing to review.\n"
+            "          To try another family voluntarily, just `run --approach <family>` (it must be in the Option Sweep)."
+        )
+    locked = lock.get("approach") or ""
+    if lock.get("rule") == "BRICK_FIRST":
+        gate_error(
+            f"[RA GATE] REFUSED: a cold review already said BRICK-FIRST for `{hyp}`. Do not shop for another verdict:\n"
+            "          " + "\n          ".join(sb_lock_instructions(state, hyp))
+        )
+
+    fpath = Path(args.file)
+    fpath = (fpath if fpath.is_absolute() else workspace / fpath).resolve()
+    rel = workspace_rel(workspace, fpath) or str(fpath)
+    if rdir.resolve() not in fpath.parents:
+        gate_error(f"[RA GATE] REFUSED: `{args.file}` must live under `research/` (expected research/hypotheses/{hyp}/COLD_REVIEW_<n>.md).")
+    if not fpath.is_file():
+        gate_error(f"[RA GATE] REFUSED: cold review file not found: {rel}")
+    text = read_md(fpath)
+    problems: List[str] = []
+    if len(text.strip()) < COLD_REVIEW_MIN_CHARS:
+        problems.append(f"it is {len(text.strip())} chars; a real review is >= {COLD_REVIEW_MIN_CHARS}.")
+    verdicts = _VERDICT_RE.findall(text)
+    if not verdicts:
+        problems.append("it has no `VERDICT: CONTINUE|SWITCH|BRICK-FIRST` line.")
+    scores = sb_all_scores(state, hyp)
+    locked_name = str(lock.get("approach") or "")
+    lock_rule = str(lock.get("rule") or "")
+    if scores:
+        quoted = quoted_score(text, scores)
+        if not quoted:
+            problems.append(
+                "it quotes none of the scoreboard's scores ("
+                + ", ".join(fmt_score(s) for s in scores[-8:])
+                + "). The reviewer must have read `ra_gate.py status --scoreboard`."
+            )
+    else:
+        # A board with no numbers at all (BLIND) has nothing to quote: name what it shows instead.
+        low = text.lower()
+        quoted = f"{locked_name}/{lock_rule}" if locked_name.lower() in low and lock_rule.lower() in low else None
+        if not quoted:
+            problems.append(
+                f"the scoreboard has no scores yet, so the review must name the locked approach `{locked_name}` "
+                f"and the lock rule `{lock_rule}` it read on `ra_gate.py status --scoreboard`."
+            )
+    if fpath.stat().st_mtime + 2 < _iso_ts(lock.get("since")):
+        problems.append(f"it was written before the lock ({lock.get('since')}); review the current scoreboard.")
+    digest = hash_file(fpath)
+    if any(c.get("sha256") == digest or c.get("file") == rel for c in sb["cold_reviews"]):
+        problems.append("this review was already used; every lock needs a new review file.")
+    reviewer = (args.reviewer or "").strip()
+    if len(reviewer) < 2:
+        problems.append("`--reviewer` must name the fresh agent that wrote it.")
+    if problems:
+        print(f"[RA GATE] REFUSED cold review `{rel}`:", file=sys.stderr)
+        for p in problems:
+            print(f"  - {p}", file=sys.stderr)
+        sys.exit(2)
+
+    verdict = re.sub(r"[-_ ]", "-", verdicts[-1].upper())
+    nxt = approach_key(args.next_approach or "")
+    if verdict != "SWITCH" and nxt:
+        gate_error(f"[RA GATE] REFUSED: `--next-approach` only applies to SWITCH; the review's last verdict is {verdict}.")
+    ap = sb["approaches"].setdefault(locked, {"rounds": [], "status": "PLATEAUED"})
+    agent_id = args.agent or "PRIMARY_AGENT"
+    ts = now_iso()
+    n = len(sb["cold_reviews"]) + 1
+    moved_to = ""
+
+    if verdict == "CONTINUE":
+        mine = [c for c in sb["cold_reviews"] if c.get("approach") == locked]
+        if mine and mine[-1].get("verdict") == "CONTINUE":
+            gate_error(
+                f"[RA GATE] REFUSED: the last cold review on `{locked}` was already CONTINUE. "
+                "Two CONTINUEs on a flat approach = switch or stop.\n"
+                "          Get a SWITCH (`--next-approach <family>`) or BRICK-FIRST verdict, or conclude FALSIFIED."
+            )
+        sb["lock"] = None
+        sb["grace"][locked] = 1
+        ap["status"] = "RACING"
+    elif verdict == "SWITCH":
+        if not nxt:
+            gate_error("[RA GATE] REFUSED: a SWITCH verdict needs `--next-approach <family>` (a family from the Option Sweep).")
+        if not FAMILY_RE.match(nxt):
+            gate_error(f"[RA GATE] REFUSED: `--next-approach {args.next_approach}` must be [A-Za-z0-9_-] (e.g. template-reader).")
+        if nxt == locked:
+            gate_error(f"[RA GATE] REFUSED: `--next-approach` must differ from the locked approach `{locked}`.")
+        if (sb["approaches"].get(nxt) or {}).get("status") == "SWITCHED":
+            gate_error(f"[RA GATE] REFUSED: `{nxt}` was already switched away from; pick a family that has not plateaued.")
+        if not family_in_report(workspace, hyp, nxt):
+            gate_error(f"[RA GATE] REFUSED: add `{nxt}` to the Option Sweep in REPORT.md Section 3 first.")
+        ap["status"] = "SWITCHED"
+        sb["grace"].pop(locked, None)
+        sandbox = safe_research_path(rdir, "sandbox", hyp)
+        src = next((d for d in sandbox.iterdir() if d.is_dir() and d.name.lower() == locked), None) if sandbox.is_dir() else None
+        if src is not None:
+            dest = safe_research_path(rdir, "graveyard", hyp, src.name)
+            suffix = 2
+            while dest.exists():
+                dest = safe_research_path(rdir, "graveyard", hyp, f"{src.name}__{suffix}")
+                suffix += 1
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dest))
+            moved_to = workspace_rel(workspace, dest) or str(dest)
+        sb["lock"] = None
+        found = metric_rule(state, hyp)
+        sr = found[1] if found else {}
+        scored = [r["score"] for r in ap.get("rounds", []) if r.get("score") is not None]
+        best = (min(scored) if sr.get("lower_is_better") else max(scored)) if scored else None
+        append_self_learning(
+            rdir,
+            hyp,
+            agent_id,
+            f"Approach `{locked}` PLATEAUED after {len(ap.get('rounds', []))} round(s); best {fmt_score(best)} "
+            f"on `{sr.get('metric')}` (target {fmt_score(sr.get('target'))}).",
+            f"{lock.get('reason')} Cold review #{n} by `{reviewer}` ({rel}) said SWITCH.",
+            f"Switched to `{nxt}`" + (f"; `{locked}` archived to `{moved_to}/`" if moved_to else "")
+            + ". Do not tweak the archived family again.",
+        )
+    else:
+        sb["lock"] = {
+            "approach": locked,
+            "rule": "BRICK_FIRST",
+            "reason": f"BRICK_FIRST: cold review #{n} by `{reviewer}` said build the end-to-end brick first",
+            "since": ts,
+            "stop_rule": lock.get("stop_rule"),
+        }
+
+    sb["cold_reviews"].append(
+        {
+            "n": n,
+            "at": ts,
+            "file": rel,
+            "sha256": digest,
+            "reviewer": reviewer,
+            "verdict": verdict,
+            "approach": locked,
+            "lock_reason": lock.get("reason"),
+            "next_approach": nxt or None,
+            "quoted_score": quoted,
+            "archived_to": moved_to or None,
+        }
+    )
+    append_lab_log_row(
+        rdir,
+        ts,
+        f"| `{hyp}` | `-` | `{reviewer}` | `COLD_REVIEW_{verdict}` | #{n} on `{locked}`: "
+        f"{_table_cell(str(lock.get('reason')))}" + (f" -> `{nxt}`" if nxt else "") + f" | `{rel}` |",
+    )
+    state.setdefault("history", []).append(
+        {"timestamp": ts, "agent": agent_id, "event": "COLD_REVIEW", "hypothesis": hyp, "verdict": verdict, "file": rel}
+    )
+    save_state(workspace, state)
+
+    print("=" * 78)
+    print(f"  RA COLD REVIEW #{n} ACCEPTED - `{hyp}` - VERDICT: {verdict} (reviewer `{reviewer}`, quoted {quoted})")
+    print("=" * 78)
+    if verdict == "CONTINUE":
+        print(f"  Lock cleared. `{locked}` gets ONE grace round: it must beat its best by min-gain or runs re-lock.")
+        print("  A second CONTINUE on this approach will be refused.")
+    elif verdict == "SWITCH":
+        print(f"  `{locked}` is SWITCHED (any `run --approach {locked}` is refused). Lock cleared.")
+        if moved_to:
+            print(f"  Archived its sandbox folder to `{moved_to}/`.")
+        print(f"  Next: build `research/sandbox/{hyp}/{nxt}/` and `run --approach {nxt}`.")
+    else:
+        print("  Runs stay LOCKED. Conclude this hypothesis FALSIFIED and open a new one whose goal is the end-to-end brick:")
+        print("    ra_gate.py conclude --verdict FALSIFIED --issue \"...\" --workflow \"...\" --found \"...\"")
+        print("    ra_gate.py new-hypothesis --id <next> --slug <brick-slug>")
+    print_scoreboard(workspace, state, hyp)
+    print("=" * 78)
+
+
+def cmd_decide(args: argparse.Namespace) -> None:
+    """Record a decision the agent made itself instead of asking the user."""
+    workspace = Path(args.workspace).resolve()
+    state = load_state(workspace, auto_init=True)
+    rdir = get_research_dir(workspace)
+    what, why = (args.what or "").strip(), (args.why or "").strip()
+    for flag, val in (("--what", what), ("--why", why)):
+        problem = reason_problem(val, flag, min_len=15)
+        if problem:
+            gate_error(f"[RA GATE BLOCKED] decide: {problem}")
+    alts = [a.strip() for a in (args.alternatives or "").split(";") if a.strip()]
+    path = rdir / "DECISIONS.md"
+    existing = read_md(path) if path.exists() else "# Decisions - made and recorded by the agent instead of asking the user\n"
+    body = f"- **What**: {what}\n- **Why**: {why}\n" + (f"- **Alternatives**: {'; '.join(alts)}\n" if alts else "")
+    if body in existing:
+        print("[RA GATE] Decision already recorded in `research/DECISIONS.md` (no change).")
+        return
+    ts = now_iso()
+    n = existing.count("\n## D-") + 1
+    hyp = state.get("active_hypothesis") or "GENERAL"
+    entry = f"\n## D-{n:03d} - {ts[:10]} ({hyp})\n- **When / Agent**: `{ts}` / `{args.agent or 'PRIMARY_AGENT'}`\n" + body
+    rdir.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        if not path.exists() or path.stat().st_size == 0:
+            f.write(existing)
+        f.write(entry)
+    print(f"[RA GATE] Recorded D-{n:03d} in `research/DECISIONS.md`: {what}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1295,6 +2051,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("status", help="Display current stage, locked invariants, and active instructions")
     p_status.add_argument("--workspace", default=".", help="Workspace root directory")
+    p_status.add_argument(
+        "--scoreboard",
+        action="store_true",
+        help="Print only the active hypothesis' scoreboard (rounds, best, last, best-unseen, status, lock)",
+    )
+    p_status.add_argument("--hypothesis", default=None, help="With --scoreboard: show this hypothesis instead of the active one")
     p_status.set_defaults(func=cmd_status)
 
     p_cq = sub.add_parser("check-question", help="Run mandatory pre-question search gate across reference folders")
@@ -1312,7 +2074,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--protected",
         nargs="*",
         default=[],
-        help="Working functions/modules verified as innocent by runtime `.log` boundaries (`file:func`) that must NOT be modified",
+        help="Working functions/modules verified as innocent by runtime `.log` boundaries (`file`, `file:func`, `file:Class.method`) that must NOT be modified",
     )
     p_mc.add_argument(
         "--revoke-protected",
@@ -1323,7 +2085,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_mc.add_argument(
         "--revoke-reason",
         default="",
-        help="Required runtime `.log` or real-data pipe evidence explaining why `--revoke-protected` is unlocking the node",
+        help="Required (>= 30 chars) runtime `.log` or real-data evidence explaining why `--revoke-protected` unlocks the node",
     )
     p_mc.set_defaults(func=cmd_map_context)
 
@@ -1333,11 +2095,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_nh.add_argument("--slug", required=True, help="Short descriptive slug")
     p_nh.add_argument("--parent", default="NONE", help="Parent hypothesis ID if branching/iterating")
     p_nh.add_argument("--agent", default="PRIMARY_AGENT", help="Agent or session ID")
+    p_nh.add_argument(
+        "--user-approved",
+        default="",
+        help="The user's exact words approving another hypothesis after 5 consecutive FALSIFIED (required then)",
+    )
     p_nh.set_defaults(func=cmd_new_hypothesis)
 
     p_adv = sub.add_parser("advance", help="Validate current stage artifacts and advance to the next stage")
     p_adv.add_argument("--workspace", default=".", help="Workspace root directory")
-    p_adv.add_argument("--to", default=None, help="Optional target stage name")
     p_adv.set_defaults(func=cmd_advance)
 
     p_conc = sub.add_parser("conclude", help="Conclude active hypothesis (PROVEN or FALSIFIED) and log self-learning")
@@ -1351,12 +2117,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_grad = sub.add_parser("graduate", help="Graduate a user-approved PROVEN hypothesis into research/library/")
     p_grad.add_argument("--workspace", default=".", help="Workspace root directory")
+    p_grad.add_argument("--user-approved", default="", help="The user's exact sign-off words (>= 10 chars, required)")
+    p_grad.add_argument("--agent", default="PRIMARY_AGENT", help="Agent or session ID")
     p_grad.set_defaults(func=cmd_graduate)
 
     p_seal = sub.add_parser("seal-axioms", help="Cryptographically seal a legitimate axioms file")
     p_seal.add_argument("--workspace", default=".", help="Workspace root directory")
     p_seal.add_argument("--file", required=True, help="Relative path to axioms file")
     p_seal.set_defaults(func=cmd_seal_axioms)
+
+    p_unseal = sub.add_parser("unseal", help="Lift the seal on an axioms file (reason logged to SELF_LEARNING.md)")
+    p_unseal.add_argument("--workspace", default=".", help="Workspace root directory")
+    p_unseal.add_argument("--file", required=True, help="Sealed file path, as sealed (workspace-relative)")
+    p_unseal.add_argument("--reason", required=True, help="Why the seal is lifted (>= 30 chars)")
+    p_unseal.add_argument("--agent", default="PRIMARY_AGENT", help="Agent or session ID")
+    p_unseal.set_defaults(func=cmd_unseal)
 
     p_learn = sub.add_parser("learn", help="Append an Issue:Workflow:Found entry to SELF_LEARNING.md")
     p_learn.add_argument("--workspace", default=".", help="Workspace root directory")
@@ -1379,7 +2154,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Accuracy on full/crowded load, false-positive vs. false-negative asymmetry, and speed budget",
     )
-    p_sr.add_argument("--max-rounds", type=int, default=2, help="Max failed unseen test rounds before triggering pivot")
+    p_sr.add_argument(
+        "--max-rounds",
+        type=int,
+        default=None,
+        help="Max failed unseen test rounds before triggering pivot (default 2; re-registering cannot raise it)",
+    )
     p_sr.add_argument(
         "--if-never-works",
         default="",
@@ -1390,8 +2170,45 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Increment failed rounds for --component and trigger the 'If It Never Works' pivot if max-rounds reached",
     )
+    p_sr.add_argument(
+        "--reset",
+        action="store_true",
+        help="Restart an existing rule's failed rounds / PIVOT_TRIGGERED status (needs --reason)",
+    )
+    p_sr.add_argument("--reason", default="", help="Why --reset is legitimate (>= 30 chars, logged to SELF_LEARNING.md)")
+    p_sr.add_argument("--metric", default=None, help="Name of the number every run prints as RA_SCORE (e.g. \"pass-rate\")")
+    p_sr.add_argument("--target", type=float, default=None, help="Score that means WORKS, met on an --unseen run")
+    p_sr.add_argument("--min-gain", type=float, default=None, help="Smallest per-round improvement that counts as progress (> 0)")
+    p_sr.add_argument(
+        "--lower-is-better", action="store_true", default=None, help="Smaller scores win (default: higher is better)"
+    )
+    p_sr.add_argument(
+        "--max-rounds-per-approach",
+        type=int,
+        default=None,
+        help=f"Rounds one approach family gets before the CAP lock (default {DEFAULT_MAX_ROUNDS_PER_APPROACH}; re-registering cannot raise it)",
+    )
     p_sr.add_argument("--agent", default="PRIMARY_AGENT", help="Agent or session ID")
     p_sr.set_defaults(func=cmd_stop_rule)
+
+    p_cr = sub.add_parser(
+        "cold-review",
+        help="Accept a FRESH subagent's verdict (read from the file's last `VERDICT:` line) on a plateau lock",
+    )
+    p_cr.add_argument("--workspace", default=".", help="Workspace root directory")
+    p_cr.add_argument("--file", required=True, help="research/hypotheses/<hyp>/COLD_REVIEW_<n>.md (>= 400 chars, quotes a score)")
+    p_cr.add_argument("--reviewer", required=True, help="Agent id of the fresh reviewer that wrote the file")
+    p_cr.add_argument("--next-approach", default=None, help="SWITCH only: the Option Sweep family to race next")
+    p_cr.add_argument("--agent", default="PRIMARY_AGENT", help="Agent or session ID running the command")
+    p_cr.set_defaults(func=cmd_cold_review)
+
+    p_dec = sub.add_parser("decide", help="Record a decision in research/DECISIONS.md instead of asking the user")
+    p_dec.add_argument("--workspace", default=".", help="Workspace root directory")
+    p_dec.add_argument("--what", required=True, help="The decision (>= 15 chars)")
+    p_dec.add_argument("--why", required=True, help="The reason (>= 15 chars)")
+    p_dec.add_argument("--alternatives", default="", help="Options considered, separated by `;`")
+    p_dec.add_argument("--agent", default="PRIMARY_AGENT", help="Agent or session ID")
+    p_dec.set_defaults(func=cmd_decide)
 
     p_re = sub.add_parser(
         "re-evaluate",
@@ -1407,7 +2224,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_re.add_argument(
         "--new-calculation",
         required=True,
-        help="Exact new equation, invariant, or structural change (NOT a lazy threshold tweak)",
+        help="Exact new equation or structural change, OR the next approach family from the Option Sweep (NOT a threshold tweak)",
     )
     p_re.add_argument(
         "--why-different",
@@ -1421,6 +2238,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    # Stage instructions must reach the agent even on cp932/cp1252 consoles.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     parser = build_parser()
     args = parser.parse_args()
     args.func(args)

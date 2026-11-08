@@ -14,10 +14,12 @@ description: >-
   novel mechanisms or building R&D projects where standard boilerplate fails.
 metadata:
   short_name: RA
-  version: "1.3.0"
+  version: "1.4.0"
 ---
 
 # RA — Research Anything (Super-Skill & Composable Suite)
+
+> **Paths:** `${CLAUDE_SKILL_DIR}` is this skill's folder; `<RA_DIR>` in `references/` means the same folder: `${CLAUDE_SKILL_DIR}`. If your harness leaves `${CLAUDE_SKILL_DIR}` unfilled, use the folder this SKILL.md is in.
 
 Use **RA (`research-anything`)** as either the **Full 8-Stage Autonomous R&D Super-Skill** OR invoke any of its **Composable Partial Skills** when you only need one part of the workflow (such as just talking through a project, mapping a multi-hop workflow, or fixing a hard bug from root cause without band-aids):
 
@@ -47,6 +49,39 @@ Standard AI coding fails on novel inventions and complex systems because models 
 
 ---
 
+## The Product Loop (Read First — Every Stage Serves This)
+
+A new product is not one guess tested in isolation. The **vision stays fixed; the architecture evolves in generations** (a wired phone → a brick → a handheld → a full screen). Every generation is a working thing, and its biggest limit drives the next one.
+
+1. **Take stock first** (`research/INVENTORY.md`): list every asset, dataset, dump and tool already provided, and open them. Never build from scratch what is already on disk.
+2. **Triage known vs. unknown**: split the product into parts. A KNOWN part reuses a proven solution only with evidence it fits *this* project ("looks similar" is the boilerplate reflex). UNKNOWN parts get R&D.
+3. **Brick first**: get the crudest end-to-end version running before polishing any part. A perfect part inside a product that has never run end to end is wasted work.
+4. **Weakest link only**: run the brick, measure it, and work on the one part that limits it most.
+5. **Option sweep, then race**: for that link, list approaches from ≥ 3 different families (e.g. recognising an item: template/pixel match, OCR, a detector model, reading game data, tapping the UI to ask). Race the promising ones cheaply on the same real data against a baseline. Pick on numbers.
+6. **Plateau = switch, not tweak — enforced by the scoreboard**: every `ra_log_engine.py run` is a round, and the program prints `RA_SCORE=<number>`. The engine **locks all further runs** of the hypothesis when progress stops: 3 rounds without a score, 2 rounds below the minimum gain, or the per-approach round cap. Only a **fresh subagent** (no history; given `INVENTORY.md`, REPORT Section 3 and `ra_gate.py status --scoreboard`) can unlock it, by writing a `COLD_REVIEW_<n>.md` that ends in `VERDICT: CONTINUE | SWITCH | BRICK-FIRST`, registered with `ra_gate.py cold-review`. A main agent deep in a run anchors on its own attempts; fresh eyes don't.
+7. **Graduate, use, repeat**: the winner graduates with the user's sign-off; the next weakest link starts the next generation.
+
+**Red flags — stop and re-read this section:**
+- Several hypotheses on the same part while the brick still doesn't run end to end.
+- Every subagent brief "improves", "tracks" or "speeds up" the same reader, model or heuristic.
+- A simpler or older solution scores better than yours, and you keep going.
+- A provided asset folder that nothing in the code reads.
+- Runs that print no `RA_SCORE` — activity you can't tell apart from progress.
+
+---
+
+## Autonomy Contract: Decide, Don't Ask
+
+RA runs like an R&D department, not a help desk. **The user owns the vision, the invariants and the final sign-off. Every other choice is yours**: which approaches to race, architecture, data, tooling, test sets, file layout, when to switch.
+
+- **Decide and record**: `ra_gate.py decide --what "<decision>" --why "<reason>" --alternatives "<a; b>"` writes it to `research/DECISIONS.md`, then keep going. A decision you can reverse is never a question for the user.
+- **Facts are your job**: answer them from disk (`ra_gate.py check-question`), the code, the assets, or by running an experiment — never by asking.
+- **Ask the user only when**: (a) a choice would change `VISION_AND_MISSION.md` or break an `INVARIANTS.md` rule; (b) the Option Sweep is exhausted or 5 hypotheses in a row were falsified; (c) an action is destructive or irreversible outside `research/`; (d) graduation sign-off. Then ask once, with your recommended answer.
+- **"Should I try A or B?" is never a question** — race both and report the scoreboard.
+- **No fake work**: a fix you can't score, a retry with a tweak, or a re-run of the same idea under a new name is not progress. The scoreboard and the plateau lock exist to catch exactly that.
+
+---
+
 ## Lead-Orchestrator Delegation, `/fork` Context Controlling & Snapshot Eviction
 
 To prevent the Main Agent's context window from bloating and decaying during deep R&D:
@@ -63,9 +98,9 @@ To prevent the Main Agent's context window from bloating and decaying during dee
 4. **Read Once $\rightarrow$ Fork Many (`/fork` Shared Context Snapshots Across `opencode`, `claude`, `codex`, and `agy`)**:
    - First-class platform support is built into `ra_context_harness.py` (`--platform auto|opencode|claude|codex|agy`):
      - **`opencode`**: Generates `opencode run --session <id> --fork --title "<subagent>"` or standalone `-f research/context_snapshots/forks/FORK_<subagent>.md` dispatches.
-     - **`claude` (`claude-code`)**: Generates `claude --resume <id> --fork-session` and native `Task(subagent_type="general-purpose", ...)` dispatches.
-     - **`codex`**: Generates `codex exec resume <id> --full-auto` and `codex exec --full-auto` dispatches.
-     - **`agy` (`antigravity` / `gemini`)**: Generates `invoke_subagent(TypeName="self", Role="...", Prompt="...")` dispatches.
+     - **`claude` (`claude-code`)**: Generates `claude --resume <id> --fork-session --permission-mode acceptEdits -p` and native `Agent(subagent_type="general-purpose", ...)` dispatches.
+     - **`codex`**: Generates `codex exec fork <id> -c sandbox_mode=workspace-write` and `codex exec -c sandbox_mode=workspace-write` dispatches.
+     - **`agy` (`antigravity` / `gemini`)**: Generates `invoke_subagent(Subagents=[{TypeName, Role, Prompt, Workspace}])` dispatches with a self-contained prompt (Antigravity subagents start without the parent conversation).
    - When `Subagent_A` and `Subagent_B` need the same framework/workflow context (e.g., both working on a Laravel subsystem), read and compile the context **once** into a snapshot (`ra_context_harness.py create`), then **fork** it (`ra_context_harness.py fork`) into `Subagent_A` and `Subagent_B` so neither re-reads the codebase from scratch.
 5. **3-Tier Snapshot Retention & Throw-Away (Eviction) Harness (`scripts/ra_context_harness.py`)**:
    - **`BASE_FRAMEWORK` (Tier 1)**: Domain/framework rules, `INVARIANTS.md`, crawled skills. Kept across the track; thrown away only when invariants or framework configs change.
@@ -83,7 +118,7 @@ To prevent context drift and attention decay during long sessions, **you must no
 At the start of every session and before transitioning between any stage, run:
 
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_gate.py" status --workspace "."
+python "${CLAUDE_SKILL_DIR}/scripts/ra_gate.py" status --workspace "."
 ```
 
 Every time `ra_gate.py` runs, it echoes **the active stage instructions**, **Workflow Map staleness warnings**, **Protected Working Nodes**, **Existing Behavioral Contracts (`BC-xxx`)**, and **Locked Project Invariants (`INV-xxx`)** to the bottom of your terminal output so you never lose sight of past decisions.
@@ -120,16 +155,20 @@ Every time `ra_gate.py` runs, it echoes **the active stage instructions**, **Wor
 ### Stage 0: Conversational Intake, R&D Crawler Suite, Project Skill/Harness Forge & Sync
 - **Look Before You Ask (Zero-Repeat Question Gate)**: Before asking the user *any* question, run `ra_gate.py check-question` and search `research/VISION_AND_MISSION.md`, `research/INVARIANTS.md`, `research/WORKFLOW_MAP.md`, `research/library/REFERENCES_INDEX.md`, `research/SELF_LEARNING.md`, and all `reference/`, `references/`, `assets/`, and `docs/` folders (including opening and viewing images/diagrams). **Never ask the user a question that is already answered in a reference image, file, or past report, or that can be answered by running a test.**
 - **1-by-1 Idea Intake**: If starting a new project or major idea, let the user talk through their thoughts 1-by-1. Synthesize them into `research/VISION_AND_MISSION.md` and lock core constraints in `research/INVARIANTS.md`. Read [intake and library rules](references/intake-and-library.md).
+- **Take Stock, Triage & Brick (`research/INVENTORY.md` — gate-enforced before Stage 2)**: List every provided asset, dataset, dump, recording and tool (open the files and images, don't list by name), mark each part of the product KNOWN (with evidence of fit) or UNKNOWN, and write down the brick — the crudest end-to-end path — with its status and current weakest link.
 - **Autonomous R&D Crawler Suite (`scripts/ra_crawler.py` — Optional / On-Demand)**: Not every project needs external skills, papers, or datasets. When entering an unfamiliar domain or when external formulations/test vectors are helpful, equip the workspace in priority order:
-  1. **Priority #1 — Skill Crawler (`ra_crawler.py skill`)**: Automatically search GitHub and skill registries for domain skills the AI needs (e.g., Game Development, Shaders, Rust, Cryptography), audit them in quarantine, and install them **strictly project-locally** (`.claude/skills/` and `.agents/skills/`—never polluting global skills):
+  1. **Priority #1 — Skill Crawler (`ra_crawler.py skill`)**: Third-party skills are untrusted code. Three steps, and the last one needs the **user's** OK:
      ```bash
-     python "~/.gemini/skills/research-anything/scripts/ra_crawler.py" skill --workspace "." --query "<domain-or-skill>"
+     python "${CLAUDE_SKILL_DIR}/scripts/ra_crawler.py" skill --workspace "." --query "<domain>"                     # 1. search only: ranked candidates
+     python "${CLAUDE_SKILL_DIR}/scripts/ra_crawler.py" skill --workspace "." --query "<domain>" --repo owner/name   # 2. clone, audit, stage in research/arsenal/skills/
+     python "${CLAUDE_SKILL_DIR}/scripts/ra_crawler.py" skill --workspace "." --approve <slug>                        # 3. after the user reviews the staged files
      ```
-  2. **Priority #2 — Research Paper Crawler (`ra_crawler.py paper`)**: Crawl arXiv and Semantic Scholar for peer-reviewed formulations and index them in `research/library/PAPERS_<slug>.md` (`[EXTERNAL_VERIFIED_LAW]`).
+     The audit is a regex tripwire, not a guarantee: show the user every file flagged `NEEDS HUMAN REVIEW` before step 3. Install goes to the project's `.claude/skills/` and `.agents/skills/` only, never from the home folder.
+  2. **Priority #2 — Research Paper Crawler (`ra_crawler.py paper`)**: Crawl arXiv and Semantic Scholar for formulations and index them in `research/library/PAPERS_<slug>.md`, tagged `[EXTERNAL_UNVERIFIED]` until a claim is checked against the paper itself.
   3. **Priority #3 — Data & Test-Vector Crawler (`ra_crawler.py data`)**: Crawl real-world test vectors and benchmark datasets into `research/arsenal/data/` so Stage 4 break-tests use real data.
 - **Self-Forging Project Skill, `.py` Harness/Hooks & Review Agent (`scripts/ra_forge.py`)**: If needed (or once project rules are locked), generate a custom project-local skill, executable Python harness (`research/harness/project_harness.py`), Claude Code hooks (`.claude/settings.local.json`), and a dedicated Adversarial Review Agent (`.claude/agents/ra-reviewer.md` & `.agents/workflows/ra-review.md`):
   ```bash
-  python "~/.gemini/skills/research-anything/scripts/ra_forge.py" --workspace "." --name "<project-slug>" --domain "<domain>"
+  python "${CLAUDE_SKILL_DIR}/scripts/ra_forge.py" --workspace "." --name "<project-slug>" --domain "<domain>"
   ```
   Read [crawler and skill forge rules](references/crawler-and-skill-forge.md).
 - **Mandatory Past-Record Check**: Read `research/WORKFLOW_MAP.md`, `research/LAB_LOG.md`, `research/SELF_LEARNING.md`, and `research/graveyard/` before proposing any hypothesis so you never repeat a falsified dead end.
@@ -146,39 +185,45 @@ Every time `ra_gate.py` runs, it echoes **the active stage instructions**, **Wor
   4. **WHAT** the $N$-hop blast radius is across the full workflow loop.
 - **Persistent Context Map with AI-Session Staleness Warning**: Record the map in `research/WORKFLOW_MAP.md` and stamp it via:
   ```bash
-  python "~/.gemini/skills/research-anything/scripts/ra_gate.py" map-context --agent "<agent-id>" --files <file1> <file2> --protected <module:func>
+  python "${CLAUDE_SKILL_DIR}/scripts/ra_gate.py" map-context --agent "<agent-id>" --files <file1> <file2> --protected <module:func>
   ```
   Future agents read `WORKFLOW_MAP.md` so they do not need to re-discover the codebase from scratch, while `ra_gate.py status` warns them that the map is an **AI session snapshot** and flags any files whose SHA-256 hashes have been altered since the snapshot.
 - **Create Read-Once Shared Context Snapshot (`ra_context_harness.py create`)**: Before advancing to Stage 2, compile the workflow context once so downstream subagents can fork from it without re-reading the codebase:
   ```bash
-  python "~/.gemini/skills/research-anything/scripts/ra_context_harness.py" create --workspace "." --id "SNAP_WORKFLOW" --tier "WORKFLOW_SLICE" --files <file1> <file2> --summary "<workflow-summary>"
+  python "${CLAUDE_SKILL_DIR}/scripts/ra_context_harness.py" create --workspace "." --id "SNAP_WORKFLOW" --tier "WORKFLOW_SLICE" --files <file1> <file2> --summary "<workflow-summary>"
   ```
 - Read [workflow and context mapping rules](references/workflow-and-context-mapping.md).
 
 ### Stage 2: Hypothesis Formulation (`research/hypotheses/Hxxx_<slug>/`)
 - Create a new hypothesis via:
   ```bash
-  python "~/.gemini/skills/research-anything/scripts/ra_gate.py" new-hypothesis --id H001 --slug "<short-name>" --agent "<agent-or-session-id>" --parent "NONE"
+  python "${CLAUDE_SKILL_DIR}/scripts/ra_gate.py" new-hypothesis --id H001 --slug "<short-name>" --agent "<agent-or-session-id>" --parent "NONE"
   ```
-- Complete both **Section 2 (Workflow Context, Culprit Proof & Pre-Edit/Pre-Creation Justification)** and **Section 3 (First-Principles Mathematical/Structural Formulation, Assumptions & Failure Boundaries)** in `research/hypotheses/Hxxx_<slug>/REPORT.md`.
+- **If the brick is NOT BUILT, the hypothesis is the brick.** Otherwise it targets the brick's weakest link, and nothing else.
+- Complete **Section 2 (Workflow Context, Culprit Proof & Pre-Edit/Pre-Creation Justification)** and **Section 3 (Option Sweep, Baseline & Stop Rule)** in `research/hypotheses/Hxxx_<slug>/REPORT.md`: ≥ 3 approach **families** (parameter variants of one approach count once), the baseline to beat, success criteria on unseen hard data, a plateau rule, and the chosen approach's first-principles formulation.
+- Register the stop rule **with a number** before building (gate-enforced). Every R&D problem has one; if nothing else, the pass-rate over real cases (0..1):
+  ```bash
+  python "${CLAUDE_SKILL_DIR}/scripts/ra_gate.py" stop-rule --workspace "." --component "<slug>" --purpose "..." --success-criteria "..." --metric "<name>" --target <x> --min-gain <dx> [--lower-is-better] --max-rounds 2 --if-never-works "<next family from the sweep>"
+  ```
 
 ### Stage 3: Quarantined Sandbox Prototype, Context Forking & Production `.log` Wiring (`research/sandbox/Hxxx_<slug>/`)
 - **Protect the Main Codebase & Protected Nodes from Poisoning**: Build and test the prototype inside `research/sandbox/Hxxx_<slug>/` (or an isolated git branch/snapshot). Never pile unverified experiment code onto the main codebase, and never touch `PROTECTED_WORKING` functions.
+- **Race Before Polishing (R&D mode)**: build each chosen family as a cheap spike in its own folder, `research/sandbox/Hxxx_<slug>/<family>/`, on the same real data (from `INVENTORY.md`). One subagent per family keeps them independent. A spike only has to run on real data and print `RA_SCORE=<number>`; run it with `ra_log_engine.py run --approach <family> [--unseen] -- <cmd>`. The production rules below (log spine, cheese audit) apply to the **winner**, not to every spike.
 - **Mandatory Subagent Context Fork & 1-Concurrency Baton Relay (`scripts/ra_context_harness.py`)**:
   - Fork the shared Stage 1 context snapshot (`WORKFLOW_SLICE` / `BASE_FRAMEWORK`) into an atomic subagent task (`REAL_RD` = strictly 1 task per subagent; `TRIVIAL_BATCH` = small surface tweaks only) across `opencode`, `claude`, or `agy`:
     ```bash
-    python "~/.gemini/skills/research-anything/scripts/ra_context_harness.py" fork --workspace "." --id "SNAP_WORKFLOW" --subagent "Subagent_A" --task-type "REAL_RD" --platform "auto" --tasks "<single-atomic-task>"
+    python "${CLAUDE_SKILL_DIR}/scripts/ra_context_harness.py" fork --workspace "." --id "SNAP_WORKFLOW" --subagent "Subagent_A" --task-type "REAL_RD" --platform "auto" --tasks "<single-atomic-task>"
     ```
   - Once the subagent completes its work and writes its report (`research/context_snapshots/reports/REPORT_Subagent_A.md`), return the 1-concurrency baton (which also auto-evicts any snapshots whose tracked files changed via `HASH_DRIFT`):
     ```bash
-    python "~/.gemini/skills/research-anything/scripts/ra_context_harness.py" return-baton --workspace "." --subagent "Subagent_A" --status "COMPLETED" --report "research/context_snapshots/reports/REPORT_Subagent_A.md"
+    python "${CLAUDE_SKILL_DIR}/scripts/ra_context_harness.py" return-baton --workspace "." --subagent "Subagent_A" --status "COMPLETED" --report "research/context_snapshots/reports/REPORT_Subagent_A.md"
     ```
-- **Mandatory Production `.log` Spine (`scripts/ra_log_engine.py`)**:
-  - **Treat all prototype and production code as real deployment code**: Silent code, bare `print("ok")` statements, and isolated synthetic unit tests are **banned**.
-  - Wire every function, branch decision, and state transition to `RALogger` (`ra_log_engine.py inject-sdk --lang <python|js|ts|php>`) so every hop emits structured `.log` records containing:
+- **Production `.log` Spine for the Winner (`scripts/ra_log_engine.py`)** — required before Stage 4 audits pass, not for losing spikes:
+  - **Treat the winning code as real deployment code**: Silent code, bare `print("ok")` statements, and isolated synthetic unit tests are **banned**.
+  - Wire every function, branch decision, and state transition to `RALogger` (`ra_log_engine.py inject-sdk --lang <python|js|esm|ts|php>`) so every hop emits structured `.log` records containing:
     `flow=caller->callee`, functional `role`, exact runtime `inputs`, `state_before`, `state_after`, `delta`, `output`, `contract=BC-xxx`, `elapsed_ms`, and status (`[PASS]`, `[DECISION]`, `[STUCK]`, or `[FAIL]`).
 - **Axiomatic Primitives vs. Hardcoded Cheese**:
-  - Legitimate mathematical/structural constants (e.g., operator symbols like `=`, physical constants, dimensional laws, core formulas) must be placed in a dedicated `axioms` module and sealed with `ra_gate.py seal-axioms`.
+  - Legitimate mathematical/structural constants (e.g., operator symbols like `=`, physical constants, dimensional laws, core formulas) must be placed in a dedicated `axioms` module and sealed with `ra_gate.py seal-axioms` (paths under `research/sandbox/` are refused; change a sealed file only via `ra_gate.py unseal --file <f> --reason "<why>"`).
   - Never label legitimate axioms as `# hardcoded data`.
   - Read [anti-cheese and recovery rules](references/anti-cheese-and-recovery.md).
 
@@ -187,20 +232,27 @@ Every time `ra_gate.py` runs, it echoes **the active stage instructions**, **Wor
 - **Execute in the Real Environment with a Hard Watchdog & Audit the `.log` (`scripts/ra_log_engine.py`)**:
   1. Run the real workflow under a hard watchdog timer (preventing 30-minute hangs and automatically logging `[STUCK]` with live variable state if any step stalls):
      ```bash
-     python "~/.gemini/skills/research-anything/scripts/ra_log_engine.py" run --workspace "." --hypothesis "Hxxx_<slug>" --timeout-sec 60 --cmd "<real-run-cmd>"
+     python "${CLAUDE_SKILL_DIR}/scripts/ra_log_engine.py" run --workspace "." --hypothesis "Hxxx_<slug>" --timeout-sec 60 -- <real-run-cmd and args>
      ```
   2. Audit the generated `.log` file to verify every hop's `[PASS]` functional + value telemetry, zero `[STUCK]`/`[FAIL]` states, and 100% of Existing Behavioral Contracts (`BC-xxx`):
      ```bash
-     python "~/.gemini/skills/research-anything/scripts/ra_log_engine.py" audit --workspace "." --hypothesis "Hxxx_<slug>"
+     python "${CLAUDE_SKILL_DIR}/scripts/ra_log_engine.py" audit --workspace "." --hypothesis "Hxxx_<slug>"
      ```
 - Read [real-environment log and boundary verification rules](references/adversarial-verification.md).
 - Once any `[STUCK]` or `[FAIL]` boundary is found in the `.log`, **build structural prevention** into the upstream mechanism—never slap an `if/else` band-aid on the symptom.
+- **Scoreboard & Plateau Lock (automatic, every round)**: each `run` records its `RA_SCORE` per approach (`--unseen` marks held-out data). The engine locks further runs on: 3 rounds with no score, 2 rounds below `--min-gain`, or the per-approach round cap. Unlock only through a fresh subagent:
+  ```bash
+  python "${CLAUDE_SKILL_DIR}/scripts/ra_gate.py" status --workspace "." --scoreboard     # hand this, INVENTORY.md and REPORT Section 3 to a FRESH subagent
+  # it writes research/hypotheses/Hxxx_<slug>/COLD_REVIEW_<n>.md ending in: VERDICT: CONTINUE | SWITCH | BRICK-FIRST
+  python "${CLAUDE_SKILL_DIR}/scripts/ra_gate.py" cold-review --workspace "." --file "<that file>" --reviewer "<subagent id>" [--next-approach <family>]
+  ```
+  The review must quote real scoreboard numbers (after a BLIND lock: name the locked approach and the word `BLIND`). Approach names are folder names: `[A-Za-z0-9_-]`, listed in REPORT Section 3. CONTINUE buys one more round (two CONTINUEs in a row on a flat approach are refused). SWITCH retires the approach to the graveyard and unlocks the next family. BRICK-FIRST means: conclude FALSIFIED and open a hypothesis for the end-to-end brick. Never re-tune a plateaued approach under a new name.
 
 ### Stage 5: Automated Anti-Cheese, Axiom & User-Eyes Visual Reality Audit
 - Run both automated auditors before concluding any hypothesis:
   ```bash
-  python "~/.gemini/skills/research-anything/scripts/ra_cheese_audit.py" --workspace "." --hypothesis "Hxxx_<slug>"
-  python "~/.gemini/skills/research-anything/scripts/ra_visual_audit.py" audit --workspace "." --hypothesis "Hxxx_<slug>"
+  python "${CLAUDE_SKILL_DIR}/scripts/ra_cheese_audit.py" --workspace "." --hypothesis "Hxxx_<slug>"
+  python "${CLAUDE_SKILL_DIR}/scripts/ra_visual_audit.py" audit --workspace "." --hypothesis "Hxxx_<slug>"
   ```
 - **Anti-Cheese Auditor (`ra_cheese_audit.py`)** scans for:
   1. Tampering with sealed `AXIOMATIC_PRIMITIVES`.
@@ -210,7 +262,7 @@ Every time `ra_gate.py` runs, it echoes **the active stage instructions**, **Wor
 - **User-Eyes Visual, Provided-Asset & Experiential Reality Auditor (`ra_visual_audit.py`)**:
   - Whenever visual, UI, CSS, game, shader, or chart files are touched, **never trust code/DOM context alone**.
   - **Detect & Fit Provided Assets (`ra_visual_audit.py scan-assets`)**: Automatically scans workspace/sandbox asset folders (`assets/`, `public/`, `static/`, `icons/`, `images/`, `sprites/`, `reference/`) for provided assets, extracts their native `WxH` dimensions and aspect ratios (`W:H`), and blocks the stage if the AI ignored the provided assets (`[IGNORED_PROVIDED_ASSETS]`), hallucinated broken asset paths (`[BROKEN_ASSET_PATH]`), or used dummy placeholder URLs (`placehold.co`).
-  - Capture real screenshots into `research/sandbox/Hxxx_<slug>/visual_captures/`, open and inspect every screenshot with your vision tool (`read_file`), and interrogate the pixels from the **User's View** in `VISUAL_AUDIT.md` (checking for wrong CSS alignment, misfitted/stretched provided assets or icons, displaced data, unloaded assets, and wrong function/image display).
+  - Capture real screenshots into `research/sandbox/Hxxx_<slug>/visual_captures/`, open and inspect every screenshot with your image-reading tool (`Read` in Claude Code, `read_file` in Gemini), and interrogate the pixels from the **User's View** in `VISUAL_AUDIT.md` (checking for wrong CSS alignment, misfitted/stretched provided assets or icons, displaced data, unloaded assets, and wrong function/image display).
   - Read [visual and user-perspective validation rules](references/visual-and-user-perspective-validation.md).
 
 ### Stage 6: Lab Report, Clean-Slate Recovery & Self-Learning
@@ -222,13 +274,15 @@ Every time `ra_gate.py` runs, it echoes **the active stage instructions**, **Wor
 - **If `FALSIFIED`**:
   - Archive the sandbox experiment to `research/graveyard/Hxxx_<slug>/` with exact proof of *why* it failed and *when* it should not be used.
   - Ensure the main codebase remains 100% clean and unpoisoned.
-  - Loop autonomously back to **Stage 1/2** to re-verify the workflow map and formulate the next hypothesis (up to **5 consecutive falsified hypotheses** on the same sub-problem before pausing to consult the user, or immediately if a core contradiction in `VISION_AND_MISSION.md` is proven).
+  - Loop autonomously back to **Stage 1/2** to re-verify the workflow map and formulate the next hypothesis **from the next family in the Option Sweep** — a falsified or plateaued approach is never re-entered as a tweak (up to **5 consecutive falsified hypotheses** on the same sub-problem, or an exhausted sweep, before pausing to consult the user; immediately if a core contradiction in `VISION_AND_MISSION.md` is proven).
+- **`PROVEN` needs an unseen round at target**: `conclude --verdict PROVEN` is refused until some `run --unseen` met the stop rule's `--target`.
+- **If `PROVEN`**: after graduation, re-measure the brick and update its weakest link in `INVENTORY.md` — that is the next generation's target.
 
 ### Stage 7: Review Agent Audit & Graduation Review (Mandatory User Sign-Off)
 - **Run Project Harness & Dedicated Review Agent First**: Execute `python research/harness/project_harness.py check-all` and run the forged **Review Agent** (`.claude/agents/ra-reviewer.md` / `research/harness/REVIEW_AGENT_PROMPT.md`) to cold-audit the diff against `WORKFLOW_MAP.md`, `PROTECTED_WORKING` nodes, and `BC-xxx` behavioral contracts.
 - **Never merge a proven hypothesis from the sandbox into the main project silently.**
 - Even when a hypothesis passes all adversarial breaking tests, behavioral contract checks, `ra_cheese_audit.py`, and the Review Agent audit, present the **Lab Report summary, N-hop blast-radius verification, and architectural approach** to the user first.
-- Wait for the user's explicit sign-off before graduating the mechanism into the main codebase and recording verified discoveries into `research/library/`.
+- Wait for the user's explicit sign-off before graduating the mechanism into the main codebase and recording verified discoveries into `research/library/`. Record it with `ra_gate.py graduate --user-approved "<the user's exact words>"`.
 
 ---
 

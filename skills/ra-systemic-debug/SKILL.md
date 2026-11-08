@@ -15,13 +15,13 @@ When exploring the codebase, read `GLOSSARY.md`, `research/INVARIANTS.md`, and `
 
 **Do not theorize or edit code until you have a fast, deterministic command that reproduces the exact bug in the real environment.**
 - **Trash synthetic unit-test marathons (`test_xyz.py` with mocks) are banned.**
-- Inject or wire `RALogger` (`ra_log_engine.py inject-sdk --lang <python|js|ts|php>`) and run the real workflow under the OS watchdog timer:
+- Inject or wire `RALogger` (`ra_log_engine.py inject-sdk --lang <python|js|esm|ts|php>`) and run the real workflow under the OS watchdog timer:
   ```bash
-  python "~/.gemini/skills/research-anything/scripts/ra_log_engine.py" run \
+  python "${CLAUDE_SKILL_DIR}/../research-anything/scripts/ra_log_engine.py" run \
     --workspace "." \
     --hypothesis "STANDALONE" \
     --timeout-sec 60 \
-    --cmd "<real-repro-command>"
+    -- <real-repro-command and args>
   ```
 - **Phase 1 Completion Criterion**: You have run one fast, deterministic command in the real environment that goes red (`[FAIL]` or `[STUCK]` in the `.log`, or demonstrates the exact wrong state delta) on the user's reported symptom.
 - Shrink the reproduction scenario until every remaining input/step is load-bearing.
@@ -37,7 +37,7 @@ Never inspect only the crash line or the function the user accused. Call the Ski
    - **Never mark a function `PROTECTED_WORKING` just by reading its code statically** (a subtle bug or backdoor always looks legit in source code). Every node starts as **`SUSPECT`** until its runtime `[RA_LOG]` input $\rightarrow$ output boundary and zero hidden side-effects are verified.
    - Lock every runtime-verified innocent function as **`PROTECTED_WORKING`** (`ra_gate.py` hashes its AST and blocks any function containing internal band-aids or fake data):
      ```bash
-     python "~/.gemini/skills/research-anything/scripts/ra_gate.py" map-context \
+     python "${CLAUDE_SKILL_DIR}/../research-anything/scripts/ra_gate.py" map-context \
        --workspace "." \
        --agent "DEBUGGER" \
        --files <mapped_files...> \
@@ -45,7 +45,7 @@ Never inspect only the crash line or the function the user accused. Call the Ski
      ```
    - **Forensic Lock Revocation (`--revoke-protected`) for Coupled Illusions**: If `Function A` passed initially only because `Function B` was feeding it fake/simplified/clamped data, and after you fix `Function B` to send **real production data**, `[RA_LOG]` proves `Function A` cannot handle the real data contract, formally revoke `Function A`'s lock with `.log` evidence before repairing `Function A`:
      ```bash
-     python "~/.gemini/skills/research-anything/scripts/ra_gate.py" map-context \
+     python "${CLAUDE_SKILL_DIR}/../research-anything/scripts/ra_gate.py" map-context \
        --workspace "." \
        --revoke-protected <file:Function_A> \
        --revoke-reason "After fixing Function_B to pass real data, [RA_LOG] proves Function_A fails on real schema"
@@ -65,15 +65,16 @@ Before changing any logic, write **3–5 ranked root-cause hypotheses** AND regi
 2. **Lock the Stop Rule, Success Criteria & "If It Never Works" Pivot (`ra_gate.py stop-rule`)**:
    - **Never loop `fail -> tweak threshold -> retest` without a written stop rule, and NEVER spawn optimization subagents for a heuristic that hasn't passed worst-case/full-load unseen tests.**
    ```bash
-   python "~/.gemini/skills/research-anything/scripts/ra_gate.py" stop-rule \
+   python "${CLAUDE_SKILL_DIR}/../research-anything/scripts/ra_gate.py" stop-rule \
      --workspace "." \
      --component "<component_slug>" \
      --purpose "<What it is for + what is ALREADY reliable vs. the only weak part>" \
      --success-criteria "<Accuracy on full/crowded unseen load, false-positive vs. false-negative cost, speed budget>" \
+     --metric "<repro pass-rate or other number>" --target <x> --min-gain <dx> \
      --max-rounds 2 \
      --if-never-works "<1. Live ground-truth read (e.g. tap/query card); 2. End-of-run native summary; 3. Lean on already-reliable metrics>"
    ```
-   - After each failed unseen test round, run `ra_gate.py stop-rule --component "<component_slug>" --record-failure`. When `failed_rounds == max_rounds`, **STOP tweaking the heuristic and execute the `"If It Never Works"` pivot immediately**.
+   - After each failed unseen test round, run `ra_gate.py stop-rule --component "<component_slug>" --record-failure`, then `ra_gate.py re-evaluate` (the pair counts as one round). When `failed_rounds == max_rounds`, **STOP tweaking the heuristic and execute the `"If It Never Works"` pivot immediately**.
 
 ---
 

@@ -12,7 +12,7 @@ Use this skill standalone (or during Stage 1/3 of `research-anything`) to preven
 When multiple subagents (`Subagent_A`, `Subagent_B`) need the same project or subsystem context, compile it **once** into a snapshot:
 
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_context_harness.py" create \
+python "${CLAUDE_SKILL_DIR}/../research-anything/scripts/ra_context_harness.py" create \
   --workspace "." \
   --id "SNAP_WORKFLOW" \
   --tier "WORKFLOW_SLICE" \
@@ -32,7 +32,7 @@ python "~/.gemini/skills/research-anything/scripts/ra_context_harness.py" create
 Enforce the **Task-Sizing Rule** (`REAL_RD` = strictly **1 atomic task per subagent**; `TRIVIAL_BATCH` = small surface tweaks like CSS/icon/label changes allowed together) and the **1-Concurrency Baton Relay**:
 
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_context_harness.py" fork \
+python "${CLAUDE_SKILL_DIR}/../research-anything/scripts/ra_context_harness.py" fork \
   --workspace "." \
   --snapshots "SNAP_WORKFLOW" \
   --subagent "Subagent_A" \
@@ -43,9 +43,9 @@ python "~/.gemini/skills/research-anything/scripts/ra_context_harness.py" fork \
 
 `ra_context_harness.py fork` generates `research/context_snapshots/forks/FORK_Subagent_A.md` and outputs ready-to-run dispatch commands for:
 - **OpenCode (`opencode`)**: `opencode run --session <id> --fork --title "Subagent_A" --auto -f ...`
-- **Claude Code (`claude`)**: `claude --resume <id> --fork-session ...` / `Task(subagent_type="general-purpose", ...)`
-- **Codex (`codex`)**: `codex exec resume <id> --full-auto ...` / `codex exec --full-auto ...`
-- **Antigravity / Gemini (`agy`)**: `invoke_subagent(TypeName="self", Role="Subagent_A", ...)`
+- **Claude Code (`claude`)**: `claude --resume <id> --fork-session --permission-mode acceptEdits -p ...` / `Agent(subagent_type="general-purpose", ...)`
+- **Codex (`codex`)**: `codex exec fork <id> -c sandbox_mode=workspace-write ...` / `codex exec -c sandbox_mode=workspace-write ...`
+- **Antigravity / Gemini (`agy`)**: `invoke_subagent(Subagents=[{"TypeName": "self", "Role": "Subagent_A", "Prompt": "<self-contained>", "Workspace": "inherit"}])`
 
 ---
 
@@ -54,7 +54,7 @@ python "~/.gemini/skills/research-anything/scripts/ra_context_harness.py" fork \
 When `Subagent_A` finishes and writes `research/context_snapshots/reports/REPORT_Subagent_A.md`, reclaim the baton (which also auto-evicts any snapshots whose tracked files changed via `HASH_DRIFT`):
 
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_context_harness.py" return-baton \
+python "${CLAUDE_SKILL_DIR}/../research-anything/scripts/ra_context_harness.py" return-baton \
   --workspace "." \
   --subagent "Subagent_A" \
   --report-file "research/context_snapshots/reports/REPORT_Subagent_A.md"
@@ -67,7 +67,7 @@ python "~/.gemini/skills/research-anything/scripts/ra_context_harness.py" return
 When switching harnesses (`Claude <-> Codex <-> OpenCode <-> AGY`), moving directories, or saving state for another session, generate a portable handoff file (saved to the OS temp directory by default, pointing to `GLOSSARY.md`, `WORKFLOW_MAP.md`, `INVARIANTS.md`, and active snapshots by path):
 
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_context_harness.py" handoff \
+python "${CLAUDE_SKILL_DIR}/../research-anything/scripts/ra_context_harness.py" handoff \
   --workspace "." \
   --focus "<what the next session will focus on>" \
   --summary "<concise summary of decisions and current state>" \

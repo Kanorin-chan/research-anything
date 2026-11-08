@@ -11,7 +11,7 @@ Use this skill when the user wants to **talk through a project, brainstorm a des
 ## Mandatory Step 1: Look Before You Ask (`check-question`)
 Before asking the user a single question, run the RA Pre-Question Search Gate:
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_gate.py" check-question --workspace "."
+python "${CLAUDE_SKILL_DIR}/../research-anything/scripts/ra_gate.py" check-question --workspace "."
 ```
 Open and read any discovered `GLOSSARY.md`, `research/VISION_AND_MISSION.md`, `research/INVARIANTS.md`, `research/WORKFLOW_MAP.md`, and any images/diagrams in `reference/`, `references/`, `assets/`, or `docs/`. **Never ask the user for a fact that is already on disk.**
 

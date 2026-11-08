@@ -17,10 +17,13 @@ real-environment deployment logging that captures:
 
 Provides:
 - Importable Python SDK (`RALogger`) for direct wiring into Python deployment code.
-- Multi-Language SDK Generator (`inject-sdk --lang python|js|ts|php`) for any project stack.
-- Watchdog Process Runner (`run --timeout-sec 60 --cmd "..."`) that prevents 30-minute hangs.
+- Multi-Language SDK Generator (`inject-sdk --lang python|js|esm|ts|php`) for any project stack.
+- Watchdog Process Runner that kills the whole process tree on timeout and writes one fresh
+  `.log` per run (`research/sandbox/<hyp>/logs/run_<YYYYmmdd-HHMMSS-mmm>.log`, path in `$RA_LOG_FILE`):
+    run --timeout-sec 60 -- python app.py --flag     (argv form, no shell, same on every OS)
+    run --timeout-sec 60 --cmd "python app.py"       (string run by the platform shell: cmd.exe on Windows)
 - Deep `.log` Flow & Value Auditor (`audit`) that rejects bare "ok/pass" AI slop and verifies
-  every workflow hop and behavioral contract (`BC-xxx`) from real `.log` files.
+  every workflow hop and behavioral contract (`BC-xxx`) of the latest `run` log.
 """
 
 from __future__ import annotations
@@ -29,12 +32,15 @@ import argparse
 import copy
 import datetime as dt
 import hashlib
-import inspect
 import json
 import os
 import re
+import shlex
+import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -42,6 +48,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="milliseconds")
+
+
+_SDK_CODE_FILE = now_iso.__code__.co_filename
 
 
 def safe_serialize(val: Any, max_len: int = 400) -> Any:
@@ -105,15 +114,18 @@ class RALogger:
         self.trace_id = trace_id
         self.hop_counter = 0
 
-    def _caller_chain(self, depth: int = 2) -> str:
-        stack = inspect.stack()
-        if len(stack) <= depth:
-            return "root->entry"
-        curr_frame = stack[depth]
-        caller_frame = stack[depth + 1] if len(stack) > depth + 1 else curr_frame
-        caller_file = Path(caller_frame.filename).name
-        curr_file = Path(curr_frame.filename).name
-        return f"{caller_file}:{caller_frame.function}:L{caller_frame.lineno}->{curr_file}:{curr_frame.function}:L{curr_frame.lineno}"
+    def _caller_chain(self) -> str:
+        """`caller->callee` for the nearest two frames outside this SDK file (also skips `trace_step` wrappers)."""
+        sites: List[str] = []
+        frame = sys._getframe(1)
+        while frame is not None and len(sites) < 2:
+            fname = frame.f_code.co_filename
+            if fname != _SDK_CODE_FILE and not fname.startswith("<frozen"):
+                sites.append(f"{Path(fname).name}:{frame.f_code.co_name}:L{frame.f_lineno}")
+            frame = frame.f_back
+        if not sites:
+            return "root->unknown"
+        return f"{sites[1] if len(sites) > 1 else 'root'}->{sites[0]}"
 
     def _write_record(self, status: str, payload: Dict[str, Any]) -> None:
         self.hop_counter += 1
@@ -147,12 +159,13 @@ class RALogger:
             "reason": reason,
         }
 
+        # role/reason are JSON-quoted so a multi-line traceback cannot split the record across lines
         line = (
             f"{ts} | TRACE={self.trace_id} | HOP={hop:04d} | [{status}] "
-            f"| flow={flow} | role=\"{role}\" | inputs={inputs} "
+            f"| flow={flow} | role={json.dumps(role, ensure_ascii=False)} | inputs={inputs} "
             f"| state_before={s_before} | state_after={s_after} | delta={delta} "
             f"| output={output} | contract={contract} | elapsed_ms={elapsed_ms:.3f}"
-            + (f" | reason=\"{reason}\"" if reason else "")
+            + (f" | reason={json.dumps(reason, ensure_ascii=False)}" if reason else "")
             + f" || RA_JSON={json.dumps(full_json, ensure_ascii=False)}\n"
         )
         with self.log_path.open("a", encoding="utf-8") as f:
@@ -174,7 +187,7 @@ class RALogger:
         self._write_record(
             "PASS",
             {
-                "flow": flow or self._caller_chain(depth=2),
+                "flow": flow or self._caller_chain(),
                 "role": role,
                 "inputs": inputs,
                 "state_before": state_before,
@@ -199,7 +212,7 @@ class RALogger:
         self._write_record(
             "DECISION",
             {
-                "flow": flow or self._caller_chain(depth=2),
+                "flow": flow or self._caller_chain(),
                 "role": role,
                 "inputs": {"condition": condition, "evaluated_values": evaluated_values},
                 "state_before": state_snapshot,
@@ -224,7 +237,7 @@ class RALogger:
         self._write_record(
             "STUCK",
             {
-                "flow": flow or self._caller_chain(depth=2),
+                "flow": flow or self._caller_chain(),
                 "role": role,
                 "inputs": {"waiting_on": waiting_on, "current_values": current_values},
                 "state_before": state_snapshot,
@@ -253,7 +266,7 @@ class RALogger:
         self._write_record(
             "FAIL",
             {
-                "flow": flow or self._caller_chain(depth=2),
+                "flow": flow or self._caller_chain(),
                 "role": role,
                 "inputs": inputs,
                 "state_before": state_before,
@@ -275,7 +288,7 @@ class RALogger:
         actual_values: Dict[str, Any],
         state_snapshot: Dict[str, Any],
     ) -> None:
-        flow = self._caller_chain(depth=2)
+        flow = self._caller_chain()
         if not condition:
             self.log_fail(
                 role=role,
@@ -310,12 +323,8 @@ class RALogger:
 
         def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
             def wrapper(*args: Any, **kwargs: Any) -> Any:
-                stack = inspect.stack()
-                if len(stack) > 1:
-                    cframe = stack[1]
-                    caller_str = f"{Path(cframe.filename).name}:{cframe.function}:L{cframe.lineno}"
-                else:
-                    caller_str = "root"
+                cframe = sys._getframe(1)
+                caller_str = f"{Path(cframe.f_code.co_filename).name}:{cframe.f_code.co_name}:L{cframe.f_lineno}"
                 callee_file = Path(func.__code__.co_filename).name if hasattr(func, "__code__") else "module"
                 callee_line = func.__code__.co_firstlineno if hasattr(func, "__code__") else 0
                 flow = f"{caller_str}->{callee_file}:{func.__name__}:L{callee_line}"
@@ -367,13 +376,37 @@ class RALogger:
         return decorator
 
 
-JS_TS_LOGGER_SDK = '''/**
- * ra_logger.js — Production-Grade Real-Environment Flow & Value Logger for RA.
- * Logs [PASS], [DECISION], [STUCK], and [FAIL] with full caller->callee flow,
- * functional purpose, inputs, state_before -> state_after, delta, and elapsed_ms.
- */
-const fs = require('fs');
-const path = require('path');
+# Shared JS body for the CommonJS (.js), ES module (.mjs) and TypeScript (.ts) SDK files.
+_JS_LOGGER_BODY = r'''
+const SDK_FILE_RE = /^ra_logger\.(?:c|m)?[jt]s$/;
+
+function computeDelta(before, after) {
+  const b = before || {};
+  const a = after || {};
+  const delta = {};
+  for (const k of [...new Set([...Object.keys(b), ...Object.keys(a)])].sort()) {
+    const from = k in b ? b[k] : '<UNSET>';
+    const to = k in a ? a[k] : '<DELETED>';
+    if (JSON.stringify(from) !== JSON.stringify(to)) delta[k] = { from, to };
+  }
+  return delta;
+}
+
+// Nearest two stack frames outside this file, as "caller->callee".
+function deriveFlow() {
+  const sites = [];
+  for (const line of String(new Error().stack).split('\n').slice(1)) {
+    const m = line.match(/^\s*at (?:(.*?) \()?(.*?):(\d+):\d+\)?$/);
+    if (!m || m[2].startsWith('node:')) continue;
+    const file = m[2].split(/[\\/]/).pop();
+    if (SDK_FILE_RE.test(file)) continue;
+    const fn = (m[1] || '<module>').replace(/^(?:async |new )/, '');
+    sites.push(`${file}:${fn}:L${m[3]}`);
+    if (sites.length === 2) break;
+  }
+  if (!sites.length) return 'unknown->unknown';
+  return `${sites[1] || 'root'}->${sites[0]}`;
+}
 
 class RALogger {
   constructor(logPath, traceId = 'REAL_RUN_01') {
@@ -386,23 +419,25 @@ class RALogger {
   _write(status, payload) {
     this.hopCounter += 1;
     const ts = new Date().toISOString();
+    const before = payload.state_before || {};
+    const after = payload.state_after || {};
     const record = {
       timestamp: ts,
       trace_id: this.traceId,
       hop: this.hopCounter,
       status,
-      flow: payload.flow || 'caller->callee',
+      flow: payload.flow || deriveFlow(),
       role: payload.role || 'unspecified',
       inputs: payload.inputs || {},
-      state_before: payload.state_before || {},
-      state_after: payload.state_after || {},
-      state_delta: payload.state_delta || {},
+      state_before: before,
+      state_after: after,
+      state_delta: payload.state_delta || computeDelta(before, after),
       output: payload.output ?? null,
       contract: payload.contract || 'NONE',
-      elapsed_ms: Number((payload.elapsed_ms || 0).toFixed(3)),
+      elapsed_ms: Number(Number(payload.elapsed_ms || 0).toFixed(3)),
       reason: payload.reason || ''
     };
-    const line = `${ts} | TRACE=${this.traceId} | HOP=${String(this.hopCounter).padStart(4, '0')} | [${status}] | flow=${record.flow} | role="${record.role}" | inputs=${JSON.stringify(record.inputs)} | state_before=${JSON.stringify(record.state_before)} | state_after=${JSON.stringify(record.state_after)} | delta=${JSON.stringify(record.state_delta)} | output=${JSON.stringify(record.output)} | contract=${record.contract} | elapsed_ms=${record.elapsed_ms}${record.reason ? ` | reason="${record.reason}"` : ''} || RA_JSON=${JSON.stringify(record)}\\n`;
+    const line = `${ts} | TRACE=${this.traceId} | HOP=${String(this.hopCounter).padStart(4, '0')} | [${status}] | flow=${record.flow} | role=${JSON.stringify(record.role)} | inputs=${JSON.stringify(record.inputs)} | state_before=${JSON.stringify(record.state_before)} | state_after=${JSON.stringify(record.state_after)} | delta=${JSON.stringify(record.state_delta)} | output=${JSON.stringify(record.output)} | contract=${record.contract} | elapsed_ms=${record.elapsed_ms}${record.reason ? ` | reason=${JSON.stringify(record.reason)}` : ''} || RA_JSON=${JSON.stringify(record)}\n`;
     fs.appendFileSync(this.logPath, line, { encoding: 'utf8' });
   }
 
@@ -440,20 +475,53 @@ class RALogger {
   }
 
   assertContract(contractId, condition, { flow, role, actual_values, state_snapshot }) {
+    const site = flow || deriveFlow();
     if (!condition) {
-      this.logFail({ flow, role, reason: `Behavioral Contract ${contractId} violated`, inputs: actual_values, state_before: state_snapshot, state_after: state_snapshot, contract: contractId });
+      this.logFail({ flow: site, role, reason: `Behavioral Contract ${contractId} violated`, inputs: actual_values, state_before: state_snapshot, state_after: state_snapshot, contract: contractId });
       throw new Error(`[RA CONTRACT BREACH] ${contractId}`);
     }
-    this.logPass({ flow, role: `Contract Verification (${contractId}): ${role}`, inputs: actual_values, state_before: state_snapshot, state_after: state_snapshot, output: 'CONTRACT_HOLDING', contract: contractId, elapsed_ms: 0.1 });
+    this.logPass({ flow: site, role: `Contract Verification (${contractId}): ${role}`, inputs: actual_values, state_before: state_snapshot, state_after: state_snapshot, output: 'CONTRACT_HOLDING', contract: contractId, elapsed_ms: 0.1 });
   }
 }
-
-module.exports = { RALogger };
 '''
 
-PHP_LOGGER_SDK = '''<?php
+_JS_DOC = '''/**
+ * {name} — Production-Grade Real-Environment Flow & Value Logger for RA ({kind}).
+ * Logs [PASS], [DECISION], [STUCK], and [FAIL] with full caller->callee flow,
+ * functional purpose, inputs, state_before -> state_after, delta, and elapsed_ms.
+ * `flow` and `state_delta` are derived automatically when omitted.
+ */
+'''
+
+JS_TS_LOGGER_SDK = (
+    _JS_DOC.format(name="ra_logger.js", kind="CommonJS")
+    + "const fs = require('fs');\nconst path = require('path');\n"
+    + _JS_LOGGER_BODY
+    + "\nmodule.exports = { RALogger, computeDelta };\n"
+)
+
+JS_ESM_LOGGER_SDK = (
+    _JS_DOC.format(name="ra_logger.mjs", kind="ES module")
+    + "import * as fs from 'node:fs';\nimport * as path from 'node:path';\n"
+    + _JS_LOGGER_BODY
+    + "\nexport { RALogger, computeDelta };\n"
+)
+
+TS_LOGGER_SDK = (
+    "// @ts-nocheck -- vendored untyped SDK; keeps strict project settings from failing on it\n"
+    + _JS_DOC.format(name="ra_logger.ts", kind="TypeScript / ES module")
+    + "import * as fs from 'node:fs';\nimport * as path from 'node:path';\n"
+    + _JS_LOGGER_BODY
+    + "\nexport { RALogger, computeDelta };\n"
+)
+
+PHP_LOGGER_SDK = r'''<?php
 /**
  * RALogger.php — Production-Grade Real-Environment Flow & Value Logger for RA (Laravel / PHP).
+ * Every method takes one associative array, e.g.
+ *   $log->logPass(['role' => '...', 'inputs' => [...], 'state_before' => [...], 'state_after' => [...], 'output' => $x]);
+ *   $log->logDecision(['role' => '...', 'condition' => 'n > 1', 'evaluated_values' => [...], 'branch_taken' => 'big', 'state_snapshot' => [...]]);
+ * `flow` and `state_delta` are derived automatically when omitted.
  */
 class RALogger {
     private string $logPath;
@@ -469,35 +537,131 @@ class RALogger {
         }
     }
 
+    public static function computeDelta(array $before, array $after): array {
+        $delta = [];
+        $keys = array_unique(array_merge(array_keys($before), array_keys($after)));
+        sort($keys);
+        foreach ($keys as $k) {
+            $from = array_key_exists($k, $before) ? $before[$k] : '<UNSET>';
+            $to = array_key_exists($k, $after) ? $after[$k] : '<DELETED>';
+            if ($from !== $to) {
+                $delta[$k] = ['from' => $from, 'to' => $to];
+            }
+        }
+        return $delta;
+    }
+
+    // Nearest two call sites outside this file, as "caller->callee".
+    private function deriveFlow(): string {
+        $bt = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS);
+        $sites = [];
+        foreach ($bt as $i => $frame) {
+            if (!isset($frame['file']) || $frame['file'] === __FILE__) {
+                continue;
+            }
+            $fn = $bt[$i + 1]['function'] ?? '<main>';
+            $sites[] = basename($frame['file']) . ':' . $fn . ':L' . ($frame['line'] ?? 0);
+            if (count($sites) === 2) {
+                break;
+            }
+        }
+        if (!$sites) {
+            return 'unknown->unknown';
+        }
+        return ($sites[1] ?? 'root') . '->' . $sites[0];
+    }
+
     public function writeRecord(string $status, array $payload): void {
         $this->hopCounter++;
-        $ts = (new DateTimeImmutable())->format('Y-m-d\\TH:i:s.vP');
+        $ts = (new DateTimeImmutable())->format('Y-m-d\TH:i:s.vP');
+        $before = $payload['state_before'] ?? [];
+        $after = $payload['state_after'] ?? [];
+        $delta = $payload['state_delta'] ?? ((is_array($before) && is_array($after)) ? self::computeDelta($before, $after) : []);
         $record = [
             'timestamp' => $ts,
             'trace_id' => $this->traceId,
             'hop' => $this->hopCounter,
             'status' => $status,
-            'flow' => $payload['flow'] ?? 'caller->callee',
+            'flow' => $payload['flow'] ?? $this->deriveFlow(),
             'role' => $payload['role'] ?? 'unspecified',
             'inputs' => $payload['inputs'] ?? [],
-            'state_before' => $payload['state_before'] ?? [],
-            'state_after' => $payload['state_after'] ?? [],
-            'state_delta' => $payload['state_delta'] ?? [],
+            'state_before' => $before,
+            'state_after' => $after,
+            'state_delta' => $delta,
             'output' => $payload['output'] ?? null,
             'contract' => $payload['contract'] ?? 'NONE',
             'elapsed_ms' => round((float)($payload['elapsed_ms'] ?? 0.0), 3),
             'reason' => $payload['reason'] ?? '',
         ];
-        $json = json_encode($record, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        $flags = JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE;
+        $enc = fn($v) => json_encode($v, $flags);
         $hopStr = str_pad((string)$this->hopCounter, 4, '0', STR_PAD_LEFT);
-        $line = "{$ts} | TRACE={$this->traceId} | HOP={$hopStr} | [{$status}] | flow={$record['flow']} | role=\\"{$record['role']}\\" | inputs=" . json_encode($record['inputs'], JSON_UNESCAPED_UNICODE) . " | state_before=" . json_encode($record['state_before'], JSON_UNESCAPED_UNICODE) . " | state_after=" . json_encode($record['state_after'], JSON_UNESCAPED_UNICODE) . " | delta=" . json_encode($record['state_delta'], JSON_UNESCAPED_UNICODE) . " | output=" . json_encode($record['output'], JSON_UNESCAPED_UNICODE) . " | contract={$record['contract']} | elapsed_ms={$record['elapsed_ms']} || RA_JSON={$json}\\n";
+        $line = "{$ts} | TRACE={$this->traceId} | HOP={$hopStr} | [{$status}] | flow={$record['flow']}"
+            . " | role=" . $enc($record['role'])
+            . " | inputs=" . $enc($record['inputs'])
+            . " | state_before=" . $enc($record['state_before'])
+            . " | state_after=" . $enc($record['state_after'])
+            . " | delta=" . $enc($record['state_delta'])
+            . " | output=" . $enc($record['output'])
+            . " | contract={$record['contract']} | elapsed_ms={$record['elapsed_ms']}"
+            . ($record['reason'] !== '' ? " | reason=" . $enc($record['reason']) : '')
+            . " || RA_JSON=" . $enc($record) . "\n";
         file_put_contents($this->logPath, $line, FILE_APPEND | LOCK_EX);
     }
 
-    public function logPass(array $payload): void { $this->writeRecord('PASS', $payload); }
-    public function logDecision(array $payload): void { $this->writeRecord('DECISION', $payload); }
-    public function logStuck(array $payload): void { $this->writeRecord('STUCK', $payload); }
-    public function logFail(array $payload): void { $this->writeRecord('FAIL', $payload); }
+    public function logPass(array $payload): void {
+        $this->writeRecord('PASS', $payload);
+    }
+
+    public function logDecision(array $payload): void {
+        $snapshot = $payload['state_snapshot'] ?? [];
+        $this->writeRecord('DECISION', [
+            'flow' => $payload['flow'] ?? null,
+            'role' => $payload['role'] ?? null,
+            'inputs' => ['condition' => $payload['condition'] ?? null, 'evaluated_values' => $payload['evaluated_values'] ?? []],
+            'state_before' => $snapshot,
+            'state_after' => $snapshot,
+            'output' => ['branch_taken' => $payload['branch_taken'] ?? null],
+            'contract' => 'BRANCH_TRACE',
+        ]);
+    }
+
+    public function logStuck(array $payload): void {
+        $snapshot = $payload['state_snapshot'] ?? [];
+        $waitingOn = $payload['waiting_on'] ?? 'unknown';
+        $elapsed = (float)($payload['elapsed_ms'] ?? 0.0);
+        $this->writeRecord('STUCK', [
+            'flow' => $payload['flow'] ?? null,
+            'role' => $payload['role'] ?? null,
+            'inputs' => ['waiting_on' => $waitingOn, 'current_values' => $payload['current_values'] ?? []],
+            'state_before' => $snapshot,
+            'state_after' => $snapshot,
+            'output' => 'STUCK_TIMEOUT',
+            'contract' => 'WATCHDOG_BREACH',
+            'elapsed_ms' => $elapsed,
+            'reason' => "Stuck waiting on {$waitingOn} for {$elapsed}ms",
+        ]);
+    }
+
+    public function logFail(array $payload): void {
+        $payload['output'] = 'FAILED';
+        $this->writeRecord('FAIL', $payload);
+    }
+
+    public function assertContract(string $contractId, bool $condition, array $payload): void {
+        $snapshot = $payload['state_snapshot'] ?? [];
+        $values = $payload['actual_values'] ?? [];
+        $flow = $payload['flow'] ?? $this->deriveFlow();
+        $role = $payload['role'] ?? 'unspecified';
+        if (!$condition) {
+            $this->logFail(['flow' => $flow, 'role' => $role, 'reason' => "Behavioral Contract {$contractId} violated",
+                'inputs' => $values, 'state_before' => $snapshot, 'state_after' => $snapshot, 'contract' => $contractId]);
+            throw new RuntimeException("[RA CONTRACT BREACH] {$contractId}");
+        }
+        $this->logPass(['flow' => $flow, 'role' => "Contract Verification ({$contractId}): {$role}", 'inputs' => $values,
+            'state_before' => $snapshot, 'state_after' => $snapshot, 'output' => 'CONTRACT_HOLDING',
+            'contract' => $contractId, 'elapsed_ms' => 0.1]);
+    }
 }
 '''
 
@@ -512,9 +676,15 @@ def cmd_inject_sdk(args: argparse.Namespace) -> None:
         dest_file = target_dir / "ra_logger.py"
         src_text = Path(__file__).resolve().read_text(encoding="utf-8")
         dest_file.write_text(src_text, encoding="utf-8")
-    elif lang in ("js", "ts", "node"):
+    elif lang in ("js", "node"):
         dest_file = target_dir / "ra_logger.js"
         dest_file.write_text(JS_TS_LOGGER_SDK, encoding="utf-8")
+    elif lang in ("esm", "mjs"):
+        dest_file = target_dir / "ra_logger.mjs"
+        dest_file.write_text(JS_ESM_LOGGER_SDK, encoding="utf-8")
+    elif lang == "ts":
+        dest_file = target_dir / "ra_logger.ts"
+        dest_file.write_text(TS_LOGGER_SDK, encoding="utf-8")
     elif lang in ("php", "laravel"):
         dest_file = target_dir / "RALogger.php"
         dest_file.write_text(PHP_LOGGER_SDK, encoding="utf-8")
@@ -529,34 +699,390 @@ def cmd_inject_sdk(args: argparse.Namespace) -> None:
     print(f"  SDK Path : {rel_sdk}")
     print("  Usage    : Wire every real workflow hop to emit `[PASS]`, `[DECISION]`, `[STUCK]`, and `[FAIL]`")
     print("             records with full `flow`, `role`, `inputs`, `state_before`, `state_after`, and `output`.")
+    print("             Under `ra_log_engine.py run`, log to the path in the `RA_LOG_FILE` environment variable.")
     print("=" * 78)
 
 
+_FP_SKIP_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", ".tox", ".nox",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", "build", "dist", "target", "obj", ".next",
+    ".nuxt", ".gradle", ".idea", ".vscode", "coverage", ".cache", "vendor",
+}
+_FP_DOC_SUFFIXES = {".md", ".markdown", ".rst", ".txt", ".log"}
+_FP_SOURCE_SUFFIXES = {
+    ".py", ".pyx", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts", ".vue", ".svelte",
+    ".rs", ".go", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".cs", ".java", ".kt", ".kts",
+    ".scala", ".swift", ".m", ".mm", ".rb", ".php", ".lua", ".dart", ".zig", ".ex", ".exs", ".erl",
+    ".hs", ".ml", ".r", ".jl", ".sh", ".bash", ".ps1", ".psm1", ".bat", ".cmd", ".sql", ".html",
+    ".htm", ".css", ".scss", ".sass", ".less", ".glsl", ".hlsl", ".wgsl", ".shader", ".json",
+    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".xml", ".gradle", ".cmake", ".mk",
+}
+_FP_SOURCE_NAMES = {"Makefile", "Dockerfile", "CMakeLists.txt"}
+_FP_MAX_HASHED_BYTES = 5 * 1024 * 1024
+_FP_MAX_WALKED_FILES = 20000
+
+
+def _fp_rel_ok(rel: str) -> bool:
+    parts = rel.split("/")
+    return parts[0] != "research" and not any(p in _FP_SKIP_DIRS for p in parts[:-1])
+
+
+def _git_source_files(workspace: Path) -> Optional[List[str]]:
+    """Tracked + untracked-but-not-ignored files under the workspace, or None outside a git repo."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(workspace), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    rels = {r for r in proc.stdout.decode("utf-8", errors="replace").split("\0") if r}
+    return sorted(
+        r for r in rels
+        if _fp_rel_ok(r) and Path(r).suffix.lower() not in _FP_DOC_SUFFIXES
+    )
+
+
+def _walk_source_files(workspace: Path) -> List[str]:
+    found: List[str] = []
+    for root, dirs, files in os.walk(workspace):
+        root_p = Path(root)
+        dirs[:] = sorted(
+            d for d in dirs
+            if d not in _FP_SKIP_DIRS
+            and not (root_p == workspace and d == "research")
+            and not (root_p / d / "pyvenv.cfg").exists()
+        )
+        for name in sorted(files):
+            suffix = Path(name).suffix.lower()
+            if name in _FP_SOURCE_NAMES or (suffix in _FP_SOURCE_SUFFIXES and suffix not in _FP_DOC_SUFFIXES):
+                found.append((root_p / name).relative_to(workspace).as_posix())
+                if len(found) >= _FP_MAX_WALKED_FILES:
+                    return found
+    return found
+
+
 def compute_code_fingerprint(workspace: Path, hyp: str, state: Dict[str, Any]) -> str:
-    """Compute a combined SHA-256 fingerprint of tracked / sandbox code files to detect identical-code retry spam."""
-    h = hashlib.sha256()
-    candidate_files: List[Path] = []
+    """
+    SHA-256 over the workspace's source files (git ls-files + untracked when in a git repo, else a
+    recursive source walk), the hypothesis sandbox code, and ra_gate tracked files. Returns "" when
+    no file was found, so callers never lock on an empty set.
+    """
+    rels = _git_source_files(workspace)
+    if rels is None:
+        rels = _walk_source_files(workspace)
+    selected = set(rels)
+
     sandbox_dir = workspace / "research" / "sandbox" / hyp
     if sandbox_dir.exists():
-        candidate_files.extend(
-            f for f in sorted(sandbox_dir.rglob("*"))
-            if f.is_file() and f.suffix.lower() not in {".log", ".json", ".md"}
-        )
-    for rel_t in sorted(state.get("context_map_snapshot", {}).get("tracked_files", {}).keys()):
-        fp = (workspace / rel_t).resolve()
-        if fp.exists() and fp.is_file():
-            candidate_files.append(fp)
-    if not candidate_files:
-        for f in sorted(workspace.glob("*")):
-            if f.is_file() and f.suffix.lower() in {".py", ".js", ".ts", ".rs", ".go", ".cpp", ".c"}:
-                candidate_files.append(f)
-    for cf in candidate_files:
+        for f in sandbox_dir.rglob("*"):
+            rel_in = f.relative_to(sandbox_dir).parts
+            if (
+                f.is_file()
+                and f.suffix.lower() not in {".log", ".json", ".md", ".txt"}
+                and not ({"logs", "visual_captures"} & set(rel_in[:-1]))
+            ):
+                selected.add(f.relative_to(workspace).as_posix())
+    for rel_t in state.get("context_map_snapshot", {}).get("tracked_files", {}).keys():
+        rel_t = Path(rel_t).as_posix()
+        if _fp_rel_ok(rel_t):
+            selected.add(rel_t)
+
+    h = hashlib.sha256()
+    hashed = 0
+    for rel in sorted(selected):
+        fp = workspace / rel
         try:
-            h.update(str(cf.name).encode("utf-8"))
-            h.update(cf.read_bytes())
-        except Exception:
+            st = fp.stat()
+            if not fp.is_file():
+                continue
+            h.update(rel.encode("utf-8") + b"\0")
+            if st.st_size > _FP_MAX_HASHED_BYTES:
+                h.update(f"{st.st_size}:{st.st_mtime_ns}".encode("ascii"))
+            else:
+                h.update(fp.read_bytes())
+            h.update(b"\0")
+            hashed += 1
+        except OSError:
+            continue
+    return h.hexdigest() if hashed else ""
+
+
+def _load_state(state_path: Path) -> Dict[str, Any]:
+    return json.loads(state_path.read_text(encoding="utf-8-sig")) if state_path.exists() else {}
+
+
+def _save_state(state_path: Path, state: Dict[str, Any]) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def _lock_for(state: Dict[str, Any], hyp: str) -> Optional[Dict[str, Any]]:
+    """
+    The engaged retry lock that applies to `hyp`. A parked lock is swapped into `retry_lock` so that
+    `ra_gate.py re-evaluate` (which only edits `retry_lock`) acts on it. Locks without a
+    `hypothesis` key predate scoping and apply to every hypothesis.
+    """
+    current = state.get("retry_lock") or {}
+    owner = current.get("hypothesis")
+    if current.get("locked") and owner in (None, hyp):
+        return current
+    parked = state.get("retry_lock_parked") or {}
+    lock = parked.pop(hyp, None)
+    if not (lock and lock.get("locked")):
+        return None
+    if current.get("locked") and owner:
+        parked[owner] = current
+    state["retry_lock_parked"] = parked
+    state["retry_lock"] = lock
+    return lock
+
+
+def _engage_lock(state: Dict[str, Any], hyp: str, *, failed_cmd: str, code_fp: str, failed_log: str) -> None:
+    current = state.get("retry_lock") or {}
+    owner = current.get("hypothesis")
+    if current.get("locked") and owner == hyp and failed_log and current.get("failed_log") == failed_log:
+        return  # same failed run already locked: keep any re-evaluation done since
+    if current.get("locked") and owner and owner != hyp:
+        state.setdefault("retry_lock_parked", {})[owner] = current
+    (state.get("retry_lock_parked") or {}).pop(hyp, None)
+    state["retry_lock"] = {
+        "locked": True,
+        "re_evaluated": False,
+        "hypothesis": hyp,
+        "failed_cmd": failed_cmd,
+        "failed_code_hash": code_fp,
+        "failed_log": failed_log,
+        "failed_at": now_iso(),
+    }
+
+
+def _clear_lock(state: Dict[str, Any], hyp: str) -> None:
+    current = state.get("retry_lock") or {}
+    if current.get("hypothesis") in (None, hyp):
+        state["retry_lock"] = {"locked": False, "re_evaluated": False, "failed_code_hash": "", "hypothesis": hyp}
+    (state.get("retry_lock_parked") or {}).pop(hyp, None)
+
+
+def _repro_done(state: Dict[str, Any], hyp: str) -> bool:
+    repro: Dict[str, Any] = state.setdefault("initial_repro", {})
+    if state.pop("initial_repro_done", False) and not repro:
+        repro[hyp] = "legacy"  # old global flag: attribute it to the hypothesis now in use
+    return hyp in repro
+
+
+def _record_failure(state: Dict[str, Any], hyp: str, *, failed_cmd: str, code_fp: str, failed_log: str) -> bool:
+    """First failure of a hypothesis is its initial repro; every later failure engages the retry lock."""
+    if _repro_done(state, hyp):
+        _engage_lock(state, hyp, failed_cmd=failed_cmd, code_fp=code_fp, failed_log=failed_log)
+        return True
+    state["initial_repro"][hyp] = now_iso()
+    return False
+
+
+def _sha256_file(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _rel_to(workspace: Path, path: Path) -> str:
+    return path.relative_to(workspace).as_posix() if path.is_relative_to(workspace) else str(path)
+
+
+def _tail(text: str, max_lines: int = 15, max_chars: int = 2000) -> str:
+    lines = text.rstrip().splitlines()[-max_lines:]
+    return "\n".join(lines)[-max_chars:]
+
+
+def _count_records(path: Path) -> int:
+    try:
+        with path.open(encoding="utf-8", errors="replace") as f:
+            return sum(1 for line in f if "|| RA_JSON=" in line)
+    except OSError:
+        return 0
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=30)
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
             pass
-    return h.hexdigest()
+
+
+def _run_watchdog(
+    command: Any, *, shell: bool, cwd: Path, env: Dict[str, str], timeout_sec: float
+) -> Tuple[Optional[int], str, str, bool]:
+    """
+    Run under a hard timeout and kill the whole process tree on expiry. Output goes to temp files,
+    not pipes, so a surviving grandchild holding the handles cannot block the runner.
+    """
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+        kw: Dict[str, Any] = {"cwd": str(cwd), "env": env, "shell": shell, "stdout": out_f, "stderr": err_f}
+        if os.name == "nt":
+            kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kw["start_new_session"] = True
+        proc = subprocess.Popen(command, **kw)
+        timed_out = False
+        try:
+            rc: Optional[int] = proc.wait(timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _kill_tree(proc)
+            try:
+                rc = proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                rc = None
+        except BaseException:
+            _kill_tree(proc)
+            raise
+        streams = []
+        for fh in (out_f, err_f):
+            fh.seek(0)
+            streams.append(fh.read().decode("utf-8", errors="replace").replace("\r\n", "\n"))
+    return rc, streams[0], streams[1], timed_out
+
+
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _prepare_argv(argv: List[str], workspace: Path, env: Dict[str, str]) -> List[str]:
+    """Apply leading NAME=VALUE tokens to env (like `env`) and resolve the program for CreateProcess."""
+    argv = list(argv)
+    while argv and _ENV_ASSIGN_RE.match(argv[0]):
+        name, _, value = argv.pop(0).partition("=")
+        env[name] = value
+    if not argv:
+        raise ValueError("no program given after `--` (only NAME=VALUE assignments)")
+    if os.name == "nt":
+        prog = argv[0]
+        if "/" in prog or "\\" in prog:
+            candidate = Path(prog) if Path(prog).is_absolute() else workspace / prog
+            if candidate.exists():
+                argv[0] = str(candidate)
+        else:
+            # CreateProcess ignores PATHEXT, so `npm` / `npx` (.cmd shims) need resolving here
+            resolved = shutil.which(prog, path=env.get("PATH"))
+            if resolved:
+                argv[0] = resolved
+    return argv
+
+
+def _display_argv(argv: List[str]) -> str:
+    return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+
+
+def _ra_common() -> Any:
+    """ra_common.py beside the skill's copy of this file; None in an SDK copy inside a project."""
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    try:
+        import ra_common
+    except ImportError:
+        return None
+    return ra_common
+
+
+def _score_from_log(log_file: Path) -> Optional[float]:
+    """Fallback score: the last log record whose role is `RA_SCORE` and whose output is a number."""
+    score: Optional[float] = None
+    try:
+        lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if "|| RA_JSON=" not in line:
+            continue
+        try:
+            rec = json.loads(line.split("|| RA_JSON=", 1)[1])
+        except ValueError:
+            continue
+        out = rec.get("output")
+        if rec.get("role") == "RA_SCORE" and isinstance(out, (int, float)) and not isinstance(out, bool):
+            score = float(out)
+    return score
+
+
+def _print_plateau_lock(common: Any, workspace: Path, state: Dict[str, Any], hyp: str, header: str, stream: Any) -> None:
+    lock = common.sb_get(state, hyp, create=False).get("lock") or {}
+    print("=" * 78, file=stream)
+    print(f"  {header}", file=stream)
+    print(f"  Reason : {lock.get('reason')}", file=stream)
+    print("-" * 78, file=stream)
+    print(f"  SCOREBOARD - `{hyp}`", file=stream)
+    for line in common.sb_lines(workspace, state, hyp):
+        print(f"    {line}", file=stream)
+    print("-" * 78, file=stream)
+    print("  WHAT TO DO:", file=stream)
+    for line in common.sb_lock_instructions(state, hyp):
+        print(f"    {line}", file=stream)
+    print("=" * 78, file=stream)
+
+
+def _scoreboard_gate(args: argparse.Namespace, workspace: Path, state: Dict[str, Any], hyp: str) -> Tuple[Any, Optional[str]]:
+    """(ra_common or None, approach key or None); exits 2 when the plateau lock or approach rules refuse the run."""
+    if hyp == "STANDALONE":
+        return None, None
+    board = (state.get("scoreboard") or {}).get(hyp) or {}
+    numeric = any(
+        sr.get("hypothesis") == hyp and sr.get("min_gain") is not None for sr in (state.get("stop_rules") or {}).values()
+    )
+    common = _ra_common()
+    if common is None:
+        if board.get("lock") or numeric:
+            print(
+                "[RA LOG ENGINE BLOCKED] This copy has no ra_common.py beside it, so it cannot keep the scoreboard.\n"
+                "  Run the skill's own scripts/ra_log_engine.py for this hypothesis.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        return None, None
+    sb = common.sb_get(state, hyp, create=False)
+    if sb.get("lock"):
+        _print_plateau_lock(
+            common, workspace, state, hyp, f"[RA LOG ENGINE BLOCKED - PLATEAU LOCK] `{hyp}`: nothing was run.", sys.stderr
+        )
+        sys.exit(2)
+    found = common.metric_rule(state, hyp)
+    required = bool(found and found[1].get("min_gain") is not None)
+    raw = (args.approach or "").strip()
+    if not raw:
+        if required:
+            print(
+                f"[RA LOG ENGINE BLOCKED] `--approach <family>` is required: stop rule `{found[0]}` has a min-gain, so\n"
+                "  every round must name its Option Sweep family (REPORT.md Section 3).",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        return common, common.DEFAULT_APPROACH
+    if not common.FAMILY_RE.match(raw):
+        print(f"[RA LOG ENGINE] `--approach {raw}` must be [A-Za-z0-9_-] (e.g. template-reader).", file=sys.stderr)
+        sys.exit(2)
+    key = common.approach_key(raw)
+    if (sb["approaches"].get(key) or {}).get("status") == "SWITCHED":
+        print(
+            f"[RA LOG ENGINE BLOCKED] `{key}` was SWITCHED away from by a cold review; its sandbox is in the graveyard.\n"
+            "  Race a different family from the Option Sweep.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if required and not common.family_in_report(workspace, hyp, key):
+        print(
+            f"[RA LOG ENGINE BLOCKED] add `{raw}` to the Option Sweep in REPORT.md Section 3 first "
+            f"(research/hypotheses/{hyp}/REPORT.md).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return common, key
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -565,17 +1091,27 @@ def cmd_run(args: argparse.Namespace) -> None:
     rdir = workspace / "research"
     rdir.mkdir(parents=True, exist_ok=True)
     state_path = rdir / ".ra_state.json"
-    state: Dict[str, Any] = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
-
+    state = _load_state(state_path)
     hyp = args.hypothesis.strip()
+
+    argv_form: List[str] = list(getattr(args, "argv", None) or [])
+    if bool(args.cmd) == bool(argv_form):
+        print(
+            "[RA LOG ENGINE] Give exactly one command: `--cmd \"<shell string>\"` OR `-- <program> [args...]`.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    common, approach = _scoreboard_gate(args, workspace, state, hyp)
     code_fp = compute_code_fingerprint(workspace, hyp, state)
-    retry_lock: Dict[str, Any] = state.get("retry_lock", {})
+    lock = _lock_for(state, hyp)
 
     # Anti-Lazy-Retry Gate: Block un-reasoned "let's retry" spam or identical-code re-runs after a failed fix attempt
-    if retry_lock.get("locked") and not getattr(args, "initial_repro", False):
-        if not retry_lock.get("re_evaluated"):
+    if lock is not None:
+        if not lock.get("re_evaluated"):
+            _save_state(state_path, state)
             print(
-                "[RA LOG ENGINE BLOCKED — LAZY RETRY / INFINITE LOOP PREVENTED!]\n"
+                f"[RA LOG ENGINE BLOCKED — LAZY RETRY / INFINITE LOOP PREVENTED!] (hypothesis `{hyp}`)\n"
                 "  Your previous execution failed. Spamming 'let's retry' or re-running without a first-principles\n"
                 "  re-calculation is BANNED.\n"
                 "  Before you can run again, you MUST perform a formal re-evaluation:\n"
@@ -583,12 +1119,13 @@ def cmd_run(args: argparse.Namespace) -> None:
                 "      --workspace \".\" \\\n"
                 "      --component \"<component_slug>\" \\\n"
                 "      --why-failed \"<Mathematical/structural proof of WHY the previous calculation/model failed>\" \\\n"
-                "      --new-calculation \"<Exact new equation, invariant, or structural change (NOT a threshold tweak)>\" \\\n"
+                "      --new-calculation \"<New equation/structural change, OR the next Option Sweep family if this one PLATEAUED>\" \\\n"
                 "      --why-different \"<Why this new calculation deterministically resolves the failure>\"",
                 file=sys.stderr,
             )
             sys.exit(2)
-        if code_fp == retry_lock.get("failed_code_hash"):
+        if code_fp and code_fp == lock.get("failed_code_hash"):
+            _save_state(state_path, state)
             print(
                 "[RA LOG ENGINE BLOCKED — IDENTICAL CODE RETRY DETECTED!]\n"
                 "  You unlocked `re-evaluate`, but attempted to re-run `ra_log_engine.py run` with the EXACT SAME\n"
@@ -598,93 +1135,165 @@ def cmd_run(args: argparse.Namespace) -> None:
             )
             sys.exit(2)
 
+    if args.initial_repro and _repro_done(state, hyp):
+        print(
+            f"  NOTE: `--initial-repro` was already used for `{hyp}` "
+            f"({state['initial_repro'][hyp]}); this is a normal run under the retry lock."
+        )
+
     logs_dir = rdir / "sandbox" / hyp / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
-    log_file = Path(args.log_file).resolve() if args.log_file else (logs_dir / "runtime_real.log")
+    if args.log_file:
+        log_file = Path(args.log_file).resolve()
+        if log_file.suffix.lower() != ".log":
+            print(f"[RA LOG ENGINE] --log-file must end in `.log` (it is overwritten per run): {log_file}", file=sys.stderr)
+            sys.exit(2)
+    else:
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        log_file = logs_dir / f"run_{stamp}.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text("", encoding="utf-8")
+    rel_log = _rel_to(workspace, log_file)
 
     timeout_sec = args.timeout_sec
-    logger = RALogger(log_file, trace_id=f"RUN_{hyp}")
-
-    print("=" * 78)
-    print(f"  RA REAL-ENVIRONMENT WATCHDOG RUNNER — `{hyp}` (MAX TIMEOUT: {timeout_sec}s)")
-    print("=" * 78)
-    print(f"  Command  : {args.cmd}")
-    print(f"  Log File : {log_file.relative_to(workspace).as_posix() if log_file.is_relative_to(workspace) else log_file}")
-    print("-" * 78)
-
-    t0 = time.perf_counter()
     env = os.environ.copy()
     env["RA_LOG_FILE"] = str(log_file)
     env["PYTHONUTF8"] = "1"
 
+    if argv_form:
+        try:
+            command: Any = _prepare_argv(argv_form, workspace, env)
+        except ValueError as exc:
+            print(f"[RA LOG ENGINE] {exc}", file=sys.stderr)
+            sys.exit(2)
+        shell = False
+        shown_cmd = _display_argv(argv_form)
+    else:
+        command = args.cmd
+        shell = True
+        shown_cmd = args.cmd
+
+    print("=" * 78)
+    print(f"  RA REAL-ENVIRONMENT WATCHDOG RUNNER — `{hyp}` (MAX TIMEOUT: {timeout_sec}s)")
+    print("=" * 78)
+    print(f"  Command  : {shown_cmd}" + ("" if argv_form else "   (via platform shell)"))
+    print(f"  Log File : {rel_log}")
+    if os.name == "nt" and not argv_form and "'" in args.cmd:
+        print("  WARNING  : cmd.exe does not treat '...' as quotes. Use the argv form: run [opts] -- prog arg ...")
+    print("-" * 78)
+
+    t0 = time.perf_counter()
     try:
-        proc = subprocess.run(
-            args.cmd,
-            shell=True,
-            cwd=str(workspace),
-            env=env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_sec,
-        )
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        if proc.returncode != 0:
-            logger.log_fail(
-                role="Real-Environment Process Execution",
-                reason=f"Process exited with code {proc.returncode}: {proc.stderr.strip()[:240]}",
-                inputs={"cmd": args.cmd},
-                state_before={"process": "STARTING"},
-                state_after={"process": f"EXIT_{proc.returncode}", "stdout_tail": proc.stdout[-300:]},
-                contract="PROCESS_CLEAN_EXIT",
-                elapsed_ms=elapsed_ms,
-                flow="ra_log_engine:cmd_run->subprocess",
-            )
-            # If initial repro was already done (or this is a fix attempt), engage the Anti-Lazy-Retry Lock!
-            if state.get("initial_repro_done") and not getattr(args, "initial_repro", False):
-                state["retry_lock"] = {
-                    "locked": True,
-                    "re_evaluated": False,
-                    "failed_cmd": args.cmd,
-                    "failed_code_hash": code_fp,
-                    "failed_at": now_iso(),
-                }
-            else:
-                state["initial_repro_done"] = True
-            state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-            print(f"  [FAIL] Process exited with code {proc.returncode} ({elapsed_ms:.1f}ms). Logged to `{log_file.name}`.")
-            sys.exit(proc.returncode)
-        else:
-            state["retry_lock"] = {"locked": False, "re_evaluated": False, "failed_code_hash": ""}
-            state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-            print(f"  [COMPLETED] Real-environment run finished in {elapsed_ms:.1f}ms. Running `.log` audit...")
-    except subprocess.TimeoutExpired as exc:
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        out_tail = (exc.stdout or "")[-300:] if isinstance(exc.stdout, str) else ""
-        err_tail = (exc.stderr or "")[-300:] if isinstance(exc.stderr, str) else ""
+        rc, out, err, timed_out = _run_watchdog(command, shell=shell, cwd=workspace, env=env, timeout_sec=timeout_sec)
+    except OSError as exc:
+        log_file.unlink(missing_ok=True)
+        print(f"  [ERROR] Could not start the command: {exc}", file=sys.stderr)
+        sys.exit(127)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    logger = RALogger(log_file, trace_id=f"RUN_{hyp}")
+    logger.hop_counter = _count_records(log_file)
+    if timed_out:
         logger.log_stuck(
             role="Real-Environment Process Execution Watchdog",
-            waiting_on=f"Command `{args.cmd}` hung past {timeout_sec}s watchdog limit",
-            current_values={"stdout_tail": out_tail, "stderr_tail": err_tail},
-            state_snapshot={"process": "KILLED_BY_WATCHDOG"},
+            waiting_on=f"Command `{shown_cmd}` hung past {timeout_sec}s watchdog limit",
+            current_values={"stdout_tail": out.strip()[-600:], "stderr_tail": err.strip()[-600:]},
+            state_snapshot={"process": "KILLED_BY_WATCHDOG" if rc is not None else "KILL_UNCONFIRMED"},
             elapsed_ms=elapsed_ms,
             flow="ra_log_engine:cmd_run->subprocess_timeout",
         )
-        state["retry_lock"] = {
-            "locked": True,
-            "re_evaluated": False,
-            "failed_cmd": args.cmd,
-            "failed_code_hash": code_fp,
-            "failed_at": now_iso(),
-        }
-        state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        outcome, exit_code = "STUCK", 124
+    elif rc != 0:
+        detail = (err.strip() or out.strip())[-600:]
+        logger.log_fail(
+            role="Real-Environment Process Execution",
+            reason=f"Process exited with code {rc}: {detail}",
+            inputs={"cmd": shown_cmd},
+            state_before={"process": "STARTING"},
+            state_after={"process": f"EXIT_{rc}", "stdout_tail": out.strip()[-300:]},
+            contract="PROCESS_CLEAN_EXIT",
+            elapsed_ms=elapsed_ms,
+            flow="ra_log_engine:cmd_run->subprocess",
+        )
+        outcome = "FAIL"
+        exit_code = rc if 0 < rc < 256 else (128 - rc if -64 < rc < 0 else 1)
+    else:
+        outcome, exit_code = "PASS", 0
+
+    score: Optional[float] = None
+    if common is not None:
+        score = common.parse_ra_score(out)
+        if score is None:
+            score = _score_from_log(log_file)
+
+    # Only the log `run` wrote, byte-identical, may later pass `audit` and release the retry lock.
+    state.setdefault("log_runs", {})[hyp] = {
+        "log": rel_log,
+        "sha256": _sha256_file(log_file),
+        "outcome": outcome,
+        "exit_code": rc,
+        "cmd": shown_cmd,
+        "at": now_iso(),
+        "approach": approach,
+        "score": score,
+        "unseen": bool(args.unseen),
+    }
+    state["log_audit_passed"] = False  # an older audit no longer describes the latest run
+    locked = False
+    if outcome == "PASS":
+        _clear_lock(state, hyp)
+    else:
+        locked = _record_failure(state, hyp, failed_cmd=shown_cmd, code_fp=code_fp, failed_log=rel_log)
+    sb_notes: List[str] = []
+    plateau = None
+    if common is not None and approach:
+        sb_notes, plateau = common.sb_record_round(
+            workspace, state, hyp, approach, score=score, unseen=bool(args.unseen), log=rel_log, exit_code=rc
+        )
+    _save_state(state_path, state)
+
+    for label, text in (("stdout", out), ("stderr", err)):
+        if text.strip():
+            print(f"  --- {label} (tail) ---")
+            for tl in _tail(text).splitlines():
+                print(f"  | {tl}")
+    print("-" * 78)
+
+    audit_hint = f"python ra_log_engine.py audit --workspace \"{args.workspace}\" --hypothesis {hyp}"
+    sys.stdout.flush()
+    if outcome == "STUCK":
         print(
-            f"  [STUCK / KILLED BY WATCHDOG] Command hung past {timeout_sec}s limit! "
-            f"Recorded `[STUCK]` state in `{log_file.name}`.",
+            f"  [STUCK / KILLED BY WATCHDOG] Command hung past {timeout_sec}s limit! Process tree killed. "
+            f"Recorded `[STUCK]` state in `{rel_log}`.",
             file=sys.stderr,
         )
-        sys.exit(124)
+    elif outcome == "FAIL":
+        print(f"  [FAIL] Process exited with code {rc} ({elapsed_ms:.1f}ms). Logged to `{rel_log}`.")
+    else:
+        print(f"  [COMPLETED] Process exited 0 in {elapsed_ms:.1f}ms. Log: `{rel_log}`.")
+        print(f"  Next     : {audit_hint}")
+    if outcome != "PASS":
+        print("  Retry lock ENGAGED for this hypothesis." if locked else "  Recorded as the hypothesis' initial reproduction (no retry lock).")
+    if common is not None and approach:
+        ap = common.sb_get(state, hyp)["approaches"][approach]
+        found = common.metric_rule(state, hyp)
+        cap = (found[1].get("max_rounds_per_approach") if found else None) or common.DEFAULT_MAX_ROUNDS_PER_APPROACH
+        shown = common.fmt_score(score) if score is not None else "NONE (no `RA_SCORE=<x>` line on stdout)"
+        print(
+            f"  Score    : {shown} | approach `{approach}` round {len(ap['rounds'])}"
+            + (f"/{cap}" if found else "")
+            + (" | unseen" if args.unseen else "")
+            + f" | {ap['status']}"
+        )
+        for note in sb_notes:
+            print(f"  {note}")
+        if plateau:
+            sys.stdout.flush()
+            _print_plateau_lock(
+                common, workspace, state, hyp,
+                f"[PLATEAU LOCK ENGAGED] `{hyp}`: further runs are refused until a cold review.", sys.stdout,
+            )
+    sys.exit(exit_code)
 
 
 def extract_required_contracts(workspace: Path) -> List[str]:
@@ -692,11 +1301,15 @@ def extract_required_contracts(workspace: Path) -> List[str]:
     if not wmap.exists():
         return []
     contracts: List[str] = []
-    for line in wmap.read_text(encoding="utf-8").splitlines():
-        m = re.match(r"^\s*-\s*(?:\*\*)?`(BC-\d+)`(?:\*\*)?:(.*)$", line)
+    for line in wmap.read_text(encoding="utf-8-sig").splitlines():
+        # `- **BC-001**: ...`, `- **`BC-001`**: ...`, `- BC-001: ...`, `- **BC-001:** ...`
+        m = re.match(r"^\s*[-*]\s*(?:\*\*)?`?(BC-\d+)`?(?:\*\*)?\s*:(?:\*\*)?(.*)$", line)
         if m and "<e.g.," not in m.group(2):
             contracts.append(m.group(1))
     return contracts
+
+
+_PLACEHOLDER_FLOWS = {"caller->callee", "unknown->unknown", "root->unknown"}
 
 
 def parse_log_file(log_path: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -722,15 +1335,16 @@ def parse_log_file(log_path: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
                 if rec.get("status") == "PASS":
                     role = str(rec.get("role", "")).strip()
                     flow = str(rec.get("flow", "")).strip()
+                    caller, _, callee = flow.partition("->")
                     if not role or role == "unspecified" or len(role) < 5:
                         slop_violations.append(
                             f"{log_path.name}:{idx}: `[PASS]` record missing meaningful functional `role` description."
                         )
-                    if "->" not in flow:
+                    if not caller.strip() or not callee.strip() or flow in _PLACEHOLDER_FLOWS:
                         slop_violations.append(
-                            f"{log_path.name}:{idx}: `[PASS]` record `flow='{flow}'` must state `caller->callee` lineage."
+                            f"{log_path.name}:{idx}: `[PASS]` record `flow='{flow}'` must state the real `caller->callee` lineage."
                         )
-                    empty_vals = (None, {}, "", {"args": [], "kwargs": {}})
+                    empty_vals = (None, {}, [], "", {"args": [], "kwargs": {}})
                     if (
                         rec.get("inputs") in empty_vals
                         and rec.get("state_before") in empty_vals
@@ -754,34 +1368,55 @@ def parse_log_file(log_path: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
     return records, slop_violations
 
 
+def _resolve_audit_target(
+    args: argparse.Namespace, workspace: Path, hyp: str, state: Dict[str, Any]
+) -> Tuple[Optional[Path], bool, str]:
+    """(log to audit, trusted?, provenance note). Trusted = the latest `run` log for `hyp`, unmodified."""
+    sandbox_dir = workspace / "research" / "sandbox" / hyp
+    rec = (state.get("log_runs") or {}).get(hyp)
+    rec_path: Optional[Path] = None
+    if rec and rec.get("log"):
+        rec_path = Path(rec["log"])
+        rec_path = (rec_path if rec_path.is_absolute() else workspace / rec_path).resolve()
+
+    if args.log_file:
+        target: Optional[Path] = Path(args.log_file).resolve()
+    elif rec_path is not None:
+        target = rec_path
+    else:
+        candidates = [p for p in sandbox_dir.rglob("*.log")] if sandbox_dir.exists() else []
+        target = max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
+
+    if target is None or not target.exists():
+        return target, False, "missing"
+    if rec_path is None:
+        return target, False, f"no `run` recorded for `{hyp}`"
+    if target != rec_path:
+        return target, False, f"not the latest `run` log (latest: {rec['log']})"
+    if _sha256_file(target) != rec.get("sha256"):
+        return target, False, "modified after `run` finished (sha256 mismatch)"
+    return target, True, f"written by `run` at {rec.get('at')}"
+
+
 def cmd_audit(args: argparse.Namespace) -> None:
     workspace = Path(args.workspace).resolve()
     rdir = workspace / "research"
     state_path = rdir / ".ra_state.json"
     hyp = args.hypothesis.strip()
-    sandbox_dir = rdir / "sandbox" / hyp
-    logs_dir = sandbox_dir / "logs"
+    state = _load_state(state_path)
 
-    log_files: List[Path] = []
-    if args.log_file:
-        lf = Path(args.log_file).resolve()
-        if lf.exists():
-            log_files.append(lf)
-    else:
-        if logs_dir.exists():
-            log_files.extend(sorted(logs_dir.rglob("*.log")))
-        if sandbox_dir.exists():
-            for f in sorted(sandbox_dir.glob("*.log")):
-                if f not in log_files:
-                    log_files.append(f)
+    target, trusted, provenance = _resolve_audit_target(args, workspace, hyp, state)
+    log_files: List[Path] = [target] if target is not None and target.exists() else []
 
     violations: List[str] = []
     all_records: List[Dict[str, Any]] = []
 
     if not log_files:
+        where = f"`{target}`" if target is not None else f"`research/sandbox/{hyp}/`"
         violations.append(
-            f"No `.log` files found in `research/sandbox/{hyp}/logs/` (or `research/sandbox/{hyp}/*.log`)! "
-            f"RA forbids synthetic unit-test marathons — wire `RALogger` into the real execution path and produce a `.log` trace."
+            f"No `.log` file found at {where}! Run the real workflow with `ra_log_engine.py run` "
+            f"(it writes `research/sandbox/{hyp}/logs/run_<timestamp>.log`) and wire `RALogger` to `$RA_LOG_FILE`. "
+            f"RA forbids synthetic unit-test marathons."
         )
 
     for lf in log_files:
@@ -797,14 +1432,14 @@ def cmd_audit(args: argparse.Namespace) -> None:
     if log_files and not pass_records and not stuck_records and not fail_records:
         violations.append(
             "Zero structured `[PASS]`, `[STUCK]`, or `[FAIL]` records found in `.log` files! "
-            "Instrument the code with `RALogger` (`ra_log_engine.py`) and run in the real environment."
+            "Instrument the code with `RALogger` (`ra_log_engine.py`), log to `$RA_LOG_FILE`, and run it via `run`."
         )
 
     if stuck_records:
         for sr in stuck_records:
             violations.append(
                 f"[STUCK AT HOP {sr.get('hop')}] flow=`{sr.get('flow')}` | role=\"{sr.get('role')}\" | "
-                f"reason=\"{sr.get('reason')}\" | values={json.dumps(sr.get('inputs'), ensure_ascii=False)} | "
+                f"reason={json.dumps(sr.get('reason'), ensure_ascii=False)} | values={json.dumps(sr.get('inputs'), ensure_ascii=False)} | "
                 f"state={json.dumps(sr.get('state_after'), ensure_ascii=False)}"
             )
 
@@ -812,7 +1447,7 @@ def cmd_audit(args: argparse.Namespace) -> None:
         for fr in fail_records:
             violations.append(
                 f"[FAIL AT HOP {fr.get('hop')}] flow=`{fr.get('flow')}` | role=\"{fr.get('role')}\" | "
-                f"reason=\"{fr.get('reason')}\" | state_before={json.dumps(fr.get('state_before'), ensure_ascii=False)} -> "
+                f"reason={json.dumps(fr.get('reason'), ensure_ascii=False)} | state_before={json.dumps(fr.get('state_before'), ensure_ascii=False)} -> "
                 f"state_after={json.dumps(fr.get('state_after'), ensure_ascii=False)}"
             )
 
@@ -829,7 +1464,8 @@ def cmd_audit(args: argparse.Namespace) -> None:
     print("=" * 78)
     print(f"  RA REAL-ENVIRONMENT `.log` FLOW & VALUE AUDIT — `{hyp}`")
     print("=" * 78)
-    print(f"  Audited `.log` Files : {len(log_files)}")
+    print(f"  Audited `.log` File  : {_rel_to(workspace, target) if target is not None else 'NONE'}")
+    print(f"  Provenance           : {provenance}" + ("" if trusted else "  [ADVISORY ONLY - state unchanged]"))
     print(f"  Total Flow Hops      : {len(all_records)}")
     print(
         f"  Status Breakdown     : [PASS]={len(pass_records)} | [DECISION]={len(decision_records)} | "
@@ -853,77 +1489,162 @@ def cmd_audit(args: argparse.Namespace) -> None:
         print("-" * 78)
 
     if violations:
-        rdir.mkdir(parents=True, exist_ok=True)
-        state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
-        state["log_audit_passed"] = False
-        code_fp = compute_code_fingerprint(workspace, hyp, state)
-        if state.get("initial_repro_done"):
-            state["retry_lock"] = {
-                "locked": True,
-                "re_evaluated": False,
-                "failed_cmd": "audit",
-                "failed_code_hash": code_fp,
-                "failed_at": now_iso(),
-            }
-        else:
-            state["initial_repro_done"] = True
-        state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        locked = False
+        if trusted:
+            state["log_audit_passed"] = False
+            run_rec = state["log_runs"][hyp]
+            # A failed/stuck run already did its own lock accounting in `run`.
+            if run_rec.get("outcome") == "PASS":
+                locked = _record_failure(
+                    state,
+                    hyp,
+                    failed_cmd="audit",
+                    code_fp=compute_code_fingerprint(workspace, hyp, state),
+                    failed_log=run_rec["log"],
+                )
+            _save_state(state_path, state)
         print("  [FAIL] REAL-ENVIRONMENT `.log` AUDIT REJECTED THE RUN:")
         for v in violations:
             print(f"    - {v}")
         print("-" * 78)
-        print(
-            "  [ANTI-LAZY-RETRY LOCK] Before re-running after a failed fix attempt, you MUST run:\n"
-            "    python ra_gate.py re-evaluate --component <slug> --why-failed \"...\" --new-calculation \"...\" --why-different \"...\""
-        )
+        if locked or (trusted and _lock_for(state, hyp)):
+            print(
+                "  [ANTI-LAZY-RETRY LOCK] Before re-running after a failed fix attempt, you MUST run:\n"
+                "    python ra_gate.py re-evaluate --component <slug> --why-failed \"...\" --new-calculation \"...\" --why-different \"...\""
+            )
         print("=" * 78)
         sys.exit(1)
 
+    if not trusted:
+        print(
+            "  [NOT ACCEPTED] The trace is clean, but only the latest log written by `ra_log_engine.py run`\n"
+            "  (unmodified) can pass the audit gate. Re-run the workflow via `run`, then audit again."
+        )
+        print("=" * 78)
+        sys.exit(2)
+
     if state_path.exists():
-        state = json.loads(state_path.read_text(encoding="utf-8"))
         state["log_audit_passed"] = True
-        state["retry_lock"] = {"locked": False, "re_evaluated": False, "failed_code_hash": ""}
-        state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        common = _ra_common()  # lazy: this file doubles as the Python SDK copied into projects without ra_common
+        if common is not None:
+            state.setdefault("pass_fingerprints", {})["log_audit_passed"] = common.code_fingerprint(workspace, state, hyp)
+        _clear_lock(state, hyp)
+        _save_state(state_path, state)
 
     print("  [PASS] Real-Environment `.log` Flow, Functional Roles, State Deltas & Contracts Verified!")
     print("=" * 78)
 
 
+RUN_EPILOG = """\
+command forms (give exactly one):
+  --cmd "<string>"      run through the platform shell: cmd.exe on Windows, /bin/sh on POSIX.
+                        cmd.exe does NOT understand '...' quotes or `NAME=value prog` prefixes.
+  -- PROG [ARGS...]     argv form, no shell, identical on every OS. Leading NAME=value
+                        tokens set environment variables for the program.
+
+examples:
+  run --hypothesis H001 --timeout-sec 60 -- python app.py --flag
+  run --hypothesis H001 -- DEBUG=1 node server.js
+  run --hypothesis H001 --cmd "npm test"
+
+every run writes a fresh log research/sandbox/<hyp>/logs/run_<YYYYmmdd-HHMMSS-mmm>.log; its path
+is exported to the program as $RA_LOG_FILE. `audit` checks the latest one by default.
+
+scoreboard: every run is a round. The program prints `RA_SCORE=<x>` (the last such stdout line
+counts). With a numeric stop rule, pass --approach <family> (from REPORT.md Section 3) and --unseen
+on held-out data. BLIND / FLAT / BASELINE / CAP plateaus lock all runs of the hypothesis until
+`ra_gate.py cold-review`; target met on an --unseen round = WON. See `ra_gate.py status --scoreboard`.
+
+exit codes: the program's exit code, 124 = killed by the watchdog, 127 = could not start,
+2 = blocked by the retry lock / plateau lock / usage error.
+"""
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="RA Production-Grade Real-Environment `.log` Telemetry & Flow Auditor")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="subcommand", required=True)
 
     p_sdk = sub.add_parser("inject-sdk", help="Generate production RALogger SDK into a project directory")
     p_sdk.add_argument("--workspace", default=".", help="Workspace root")
-    p_sdk.add_argument("--lang", required=True, choices=["python", "js", "ts", "node", "php", "laravel"])
+    p_sdk.add_argument(
+        "--lang",
+        required=True,
+        choices=["python", "js", "node", "esm", "mjs", "ts", "php", "laravel"],
+        help="python -> ra_logger.py | js/node -> ra_logger.js (CommonJS) | esm/mjs -> ra_logger.mjs (ES module) "
+        "| ts -> ra_logger.ts (ES module) | php/laravel -> RALogger.php",
+    )
     p_sdk.add_argument("--dest", default=".", help="Destination directory relative to workspace")
     p_sdk.set_defaults(func=cmd_inject_sdk)
 
-    p_run = sub.add_parser("run", help="Run real-environment command under a strict watchdog timer and log `[STUCK]` on hang")
-    p_run.add_argument("--workspace", default=".", help="Workspace root")
+    p_run = sub.add_parser(
+        "run",
+        help="Run a real-environment command under a strict watchdog timer and log `[STUCK]` on hang",
+        usage="%(prog)s [options] (--cmd \"<shell string>\" | -- PROG [ARGS...])",
+        epilog=RUN_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_run.add_argument("--workspace", default=".", help="Workspace root (the command runs here)")
     p_run.add_argument("--hypothesis", default="STANDALONE", help="Active hypothesis folder (e.g., H001_slug) or STANDALONE")
-    p_run.add_argument("--cmd", required=True, help="Command to execute in the real environment")
-    p_run.add_argument("--timeout-sec", type=int, default=60, help="Hard watchdog timeout in seconds (prevents 30m hangs)")
-    p_run.add_argument("--log-file", default=None, help="Optional custom `.log` file path")
+    p_run.add_argument(
+        "--cmd",
+        default=None,
+        help="Command string run through the platform shell (cmd.exe on Windows, /bin/sh on POSIX). "
+        "For portable quoting use the argv form after `--` instead.",
+    )
+    p_run.add_argument("--timeout-sec", type=int, default=60, help="Hard watchdog timeout in seconds; the whole process tree is killed")
+    p_run.add_argument("--log-file", default=None, help="Optional custom `.log` path (must end in .log; overwritten each run)")
     p_run.add_argument(
         "--initial-repro",
         action="store_true",
-        help="Mark this run as the Phase 1 initial bug reproduction (does not trigger the post-fix retry lock)",
+        help="Mark this run as the hypothesis' Phase 1 bug reproduction. Allowed once per hypothesis; "
+        "the first failing run of a hypothesis never engages the retry lock, every later one does",
     )
+    p_run.add_argument(
+        "--approach",
+        default=None,
+        help="Option Sweep family this round belongs to (required once the stop rule has --min-gain; "
+        "must appear in REPORT.md Section 3). Default: main",
+    )
+    p_run.add_argument("--unseen", action="store_true", help="This run used held-out data (only unseen rounds can be WON)")
     p_run.set_defaults(func=cmd_run)
 
-    p_audit = sub.add_parser("audit", help="Audit real-environment `.log` files for flow, values, `[PASS]`/`[STUCK]`/`[FAIL]`, and contracts")
+    p_audit = sub.add_parser(
+        "audit",
+        help="Audit the latest `run` log for flow, values, `[PASS]`/`[STUCK]`/`[FAIL]`, and contracts",
+    )
     p_audit.add_argument("--workspace", default=".", help="Workspace root")
     p_audit.add_argument("--hypothesis", default="STANDALONE", help="Active hypothesis folder (e.g., H001_slug) or STANDALONE")
-    p_audit.add_argument("--log-file", default=None, help="Optional explicit `.log` file path to audit")
+    p_audit.add_argument(
+        "--log-file",
+        default=None,
+        help="Audit this `.log` instead of the latest `run` log. Only an unmodified log written by `run` "
+        "can pass the gate; any other file is audited as advisory (state unchanged)",
+    )
     p_audit.set_defaults(func=cmd_audit)
 
     return p
 
 
-def main() -> None:
+def _utf8_console() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    _utf8_console()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    tail: Optional[List[str]] = None
+    if "--" in argv:
+        split = argv.index("--")
+        argv, tail = argv[:split], argv[split + 1:]
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if tail is not None and args.subcommand != "run":
+        parser.error("`-- PROG [ARGS...]` is only valid for `run`")
+    args.argv = tail or []
     args.func(args)
 
 

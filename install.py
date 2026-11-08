@@ -102,13 +102,20 @@ def copy_skill_tree(src_skill: Path, dest_skill: Path) -> None:
     shutil.copytree(src_skill, dest_skill)
 
 
-def rewrite_skill_paths(skill_dir: Path, target_base_path: str) -> None:
-    skill_md = skill_dir / "SKILL.md"
-    if not skill_md.exists():
+def rewrite_skill_paths(skill_dir: Path, ra_dir: str | None) -> None:
+    """Fill ${CLAUDE_SKILL_DIR} for harnesses that don't substitute it. ra_dir=None keeps the token (Claude Code)."""
+    if ra_dir is None:
         return
-    txt = skill_md.read_text(encoding="utf-8")
-    txt = txt.replace("~/.gemini/skills/research-anything", target_base_path)
-    skill_md.write_text(txt, encoding="utf-8")
+    own_dir = ra_dir if skill_dir.name == "research-anything" else ra_dir.rsplit("/", 1)[0] + "/" + skill_dir.name
+    for md in skill_dir.rglob("*.md"):
+        raw = md.read_bytes().decode("utf-8")
+        txt = (
+            raw.replace("${CLAUDE_SKILL_DIR}/../research-anything", ra_dir)
+            .replace("${CLAUDE_SKILL_DIR}", own_dir)
+            .replace("~/.gemini/skills/research-anything", ra_dir)
+        )
+        if txt != raw:
+            md.write_bytes(txt.encode("utf-8"))
 
 
 def build_distributions(repo_root: Path) -> None:
@@ -116,12 +123,13 @@ def build_distributions(repo_root: Path) -> None:
     skills_root = repo_root / "skills"
     dist_root = repo_root / "distributions"
 
+    # $HOME (not ~) so quoted paths still expand in bash and PowerShell on the user's machine.
     platforms = [
-        ("opencode", ".agents/skills", "~/.agents/skills/research-anything", "AGENTS.md.snippet", OPENCODE_SNIPPET),
-        ("claude", ".claude/skills", "~/.claude/skills/research-anything", "CLAUDE.md.snippet", CLAUDE_SNIPPET),
-        ("codex", ".agents/skills", "~/.agents/skills/research-anything", "AGENTS.md.snippet", CODEX_SNIPPET),
-        ("antigravity", ".agents/skills", "~/.agents/skills/research-anything", "AGENTS.md.snippet", ANTIGRAVITY_SNIPPET),
-        ("gemini", ".gemini/skills", "~/.gemini/skills/research-anything", "GEMINI.md.snippet", GEMINI_SNIPPET),
+        ("opencode", ".agents/skills", "$HOME/.agents/skills/research-anything", "AGENTS.md.snippet", OPENCODE_SNIPPET),
+        ("claude", ".claude/skills", None, "CLAUDE.md.snippet", CLAUDE_SNIPPET),
+        ("codex", ".agents/skills", "$HOME/.agents/skills/research-anything", "AGENTS.md.snippet", CODEX_SNIPPET),
+        ("antigravity", ".agents/skills", "$HOME/.agents/skills/research-anything", "AGENTS.md.snippet", ANTIGRAVITY_SNIPPET),
+        ("gemini", ".gemini/skills", "$HOME/.gemini/skills/research-anything", "GEMINI.md.snippet", GEMINI_SNIPPET),
     ]
 
     for plat_name, rel_skills_dir, script_base, snippet_name, snippet_body in platforms:
@@ -165,9 +173,10 @@ def install_skill_dir_safe(src_skill: Path, dst_skill: Path, is_repo_root: bool 
 
 
 def install_suite_to_base(
-    skills_root: Path, target_skills_base: Path, repo_root: Path, script_base: str
+    skills_root: Path, target_skills_base: Path, repo_root: Path, substitutes_skill_dir: bool = False
 ) -> None:
     target_skills_base.mkdir(parents=True, exist_ok=True)
+    ra_dir = None if substitutes_skill_dir else (target_skills_base / "research-anything").resolve().as_posix()
     for sname in ALL_SKILLS:
         src_s = skills_root / sname
         if not src_s.exists():
@@ -175,8 +184,9 @@ def install_suite_to_base(
         dst_s = target_skills_base / sname
         is_root = dst_s.resolve() == repo_root.resolve()
         install_skill_dir_safe(src_s, dst_s, is_repo_root=is_root)
-        if not is_root and not (dst_s / ".git").exists():
-            rewrite_skill_paths(dst_s, script_base)
+        # A stale .git in the target must not skip the rewrite; only the source repo itself is left as-is.
+        if not is_root:
+            rewrite_skill_paths(dst_s, ra_dir)
 
 
 def install_global(repo_root: Path, target: str) -> None:
@@ -187,32 +197,32 @@ def install_global(repo_root: Path, target: str) -> None:
     if target in ("opencode", "all"):
         dst1 = home / ".agents" / "skills"
         dst2 = home / ".config" / "opencode" / "skills"
-        install_suite_to_base(skills_root, dst1, repo_root, "~/.agents/skills/research-anything")
-        install_suite_to_base(skills_root, dst2, repo_root, "~/.agents/skills/research-anything")
+        install_suite_to_base(skills_root, dst1, repo_root)
+        install_suite_to_base(skills_root, dst2, repo_root)
         print(f"[RA INSTALLER] Installed {len(ALL_SKILLS)} skills for OpenCode     -> {dst1} & {dst2}")
 
     if target in ("claude", "all"):
         dst = home / ".claude" / "skills"
-        install_suite_to_base(skills_root, dst, repo_root, "~/.claude/skills/research-anything")
+        install_suite_to_base(skills_root, dst, repo_root, substitutes_skill_dir=True)
         print(f"[RA INSTALLER] Installed {len(ALL_SKILLS)} skills for Claude Code  -> {dst}")
 
     if target in ("codex", "all"):
         dst1 = home / ".agents" / "skills"
         dst2 = home / ".codex" / "skills"
-        install_suite_to_base(skills_root, dst1, repo_root, "~/.agents/skills/research-anything")
-        install_suite_to_base(skills_root, dst2, repo_root, "~/.agents/skills/research-anything")
+        install_suite_to_base(skills_root, dst1, repo_root)
+        install_suite_to_base(skills_root, dst2, repo_root)
         print(f"[RA INSTALLER] Installed {len(ALL_SKILLS)} skills for Codex        -> {dst1} & {dst2}")
 
     if target in ("antigravity", "all"):
         dst1 = home / ".agents" / "skills"
         dst2 = home / ".gemini" / "config" / "skills"
-        install_suite_to_base(skills_root, dst1, repo_root, "~/.agents/skills/research-anything")
-        install_suite_to_base(skills_root, dst2, repo_root, "~/.agents/skills/research-anything")
+        install_suite_to_base(skills_root, dst1, repo_root)
+        install_suite_to_base(skills_root, dst2, repo_root)
         print(f"[RA INSTALLER] Installed {len(ALL_SKILLS)} skills for Antigravity  -> {dst1} & {dst2}")
 
     if target in ("gemini", "all"):
         dst = home / ".gemini" / "skills"
-        install_suite_to_base(skills_root, dst, repo_root, "~/.gemini/skills/research-anything")
+        install_suite_to_base(skills_root, dst, repo_root)
         print(f"[RA INSTALLER] Installed {len(ALL_SKILLS)} skills for Gemini CLI   -> {dst}")
 
 

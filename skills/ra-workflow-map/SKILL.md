@@ -19,7 +19,7 @@ Never read only the target function and its immediate caller/callee. Trace the c
 - Mark every runtime-verified innocent function as **`PROTECTED_WORKING`** (`--protected <file:func>`) so neither you nor any subagent modifies it.
 - **Forensic Lock Revocation (`--revoke-protected`)**: If `Function A` passed initially only because `Function B` fed it fake/simplified data, and after fixing `Function B` to pass **real production data**, `[RA_LOG]` proves `Function A` cannot handle the real data contract, unlock `Function A` with forensic evidence:
   ```bash
-  python "~/.gemini/skills/research-anything/scripts/ra_gate.py" map-context \
+  python "${CLAUDE_SKILL_DIR}/../research-anything/scripts/ra_gate.py" map-context \
     --workspace "." \
     --revoke-protected <file:Function_A> \
     --revoke-reason "After fixing Function_B to pass real data, [RA_LOG] proves Function_A fails on real schema"
@@ -37,7 +37,7 @@ Fill out Section 4 of `research/WORKFLOW_MAP.md`:
 
 ## 5. Stamp the Session Snapshot & SHA-256 File Hashes
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_gate.py" map-context \
+python "${CLAUDE_SKILL_DIR}/../research-anything/scripts/ra_gate.py" map-context \
   --workspace "." \
   --agent "WORKFLOW_MAPPER" \
   --files <file1> <file2> \

@@ -21,12 +21,12 @@ Instead, **RA treats every piece of code as real deployment code wired to a stru
 When writing or modifying code in Stage 3, **silent code and lazy `print("ok")` statements are forbidden**. Inject or import `RALogger`:
 
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_log_engine.py" inject-sdk \
+python "<RA_DIR>/scripts/ra_log_engine.py" inject-sdk \
   --workspace "." \
   --lang python \
   --dest "research/sandbox/H001_slug"
 ```
-*(Supports `--lang python | js | ts | php | laravel`)*
+*(Supports `--lang python | js | esm | ts | php | laravel`; `ts` writes an ES-module `ra_logger.ts`)*
 
 Every function, branch decision, and state mutation along the workflow must log:
 1. **`[PASS]` (`logger.log_pass(...)` or `@logger.trace_step(...)`)**:
@@ -47,15 +47,15 @@ Every function, branch decision, and state mutation along the workflow must log:
 
 1. **Execute in the Real Environment Under the Watchdog Timer**:
    ```bash
-   python "~/.gemini/skills/research-anything/scripts/ra_log_engine.py" run \
+   python "<RA_DIR>/scripts/ra_log_engine.py" run \
      --workspace "." \
      --hypothesis "H001_slug" \
      --timeout-sec 60 \
-     --cmd "<real-environment-execution-command>"
+     -- <real-environment-execution-command and args>
    ```
 2. **Audit the Real `.log` File (`ra_log_engine.py audit`)**:
    ```bash
-   python "~/.gemini/skills/research-anything/scripts/ra_log_engine.py" audit \
+   python "<RA_DIR>/scripts/ra_log_engine.py" audit \
      --workspace "." \
      --hypothesis "H001_slug"
    ```

@@ -9,29 +9,25 @@
 Not every project requires external skills, research papers, or external datasets (for example, self-contained codebase debugging or pure internal logic fixes). However, when entering a specialized domain or when prior art / benchmark vectors are useful, use `ra_crawler.py` in priority order:
 
 ### Priority #1: Skill Crawler (`ra_crawler.py skill`)
-When entering a domain (e.g., Game Development, Shader/GPU Programming, Physics Simulation, Cryptography, Embedded Systems, Custom Compilers), first check if the workspace already has the required domain skill. If not, crawl it automatically:
+When entering a domain (e.g., Game Development, Shader/GPU Programming, Physics Simulation, Cryptography, Embedded Systems, Custom Compilers), first check if the workspace already has the required domain skill. If not, search (nothing is downloaded):
 
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_crawler.py" skill \
-  --workspace "." \
-  --query "game development"
+python "<RA_DIR>/scripts/ra_crawler.py" skill --workspace "." --query "game development"
 ```
 
-Or pull directly from a known GitHub skill repository:
+Stage one candidate from a known repository (clone → audit → `research/arsenal/skills/<slug>/` only):
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_crawler.py" skill \
-  --workspace "." \
-  --query "game development" \
-  --repo "anthropics/skills"
+python "<RA_DIR>/scripts/ra_crawler.py" skill --workspace "." --query "game development" --repo "owner/name"
+```
+
+Install it only after the user has reviewed the staged files:
+```bash
+python "<RA_DIR>/scripts/ra_crawler.py" skill --workspace "." --approve <slug>
 ```
 
 #### Strict Skill Crawler Rules:
-1. **Quarantine & Security Audit First**: Every crawled skill is cloned into `research/arsenal/quarantine/` first and scanned for dangerous shell/eval payloads before installation.
-2. **Project-Local Installation ONLY (Never Global)**: Verified skills are installed strictly inside the project workspace:
-   - `.claude/skills/<skill-name>/SKILL.md`
-   - `.agents/skills/<skill-name>/SKILL.md`
-   - `research/arsenal/skills/<skill-name>/SKILL.md`
-   Global skills (`~/.gemini/skills/` or `~/.claude/skills/`) are never polluted.
+1. **Third-party skills are untrusted code.** The audit is a regex tripwire, not a guarantee. Every staged file is listed; scripts, hooks, `settings*.json`, `.claude-plugin` and frontmatter `hooks:` / `allowed-tools:` are flagged `NEEDS HUMAN REVIEW`. Show them to the user before `--approve`.
+2. **Project-Local Installation ONLY (Never Global)**: `--approve` copies into the project's `.claude/skills/<slug>/` and `.agents/skills/<slug>/`. It refuses the home folder as a workspace, existing targets (unless `--force`), symlinks and junctions.
 
 ---
 
@@ -39,12 +35,12 @@ python "~/.gemini/skills/research-anything/scripts/ra_crawler.py" skill \
 When inventing or refining an equation, algorithm, or physical/system model, crawl peer-reviewed papers from arXiv and Semantic Scholar:
 
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_crawler.py" paper \
+python "<RA_DIR>/scripts/ra_crawler.py" paper \
   --workspace "." \
   --query "state space model long horizon stability" \
   --max-results 5
 ```
-- Saves structured titles, authors, publication years, URLs, and abstracts to `research/library/PAPERS_<slug>.md` with the `[EXTERNAL_VERIFIED_LAW]` provenance tag and indexes them in `research/library/REFERENCES_INDEX.md`.
+- Saves structured titles, authors, publication years, URLs, and abstracts to `research/library/PAPERS_<slug>.md` with the `[EXTERNAL_UNVERIFIED]` provenance tag (promote a claim to `[EXTERNAL_VERIFIED_LAW]` only after checking it against the paper itself) and indexes them in `research/library/REFERENCES_INDEX.md`.
 
 ---
 
@@ -52,7 +48,7 @@ python "~/.gemini/skills/research-anything/scripts/ra_crawler.py" paper \
 To prevent using fake toy inputs during Stage 4 (`ADVERSARIAL_BREAK_TEST`), crawl real-world benchmark datasets or test vectors:
 
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_crawler.py" data \
+python "<RA_DIR>/scripts/ra_crawler.py" data \
   --workspace "." \
   --query "nist cryptographic test vectors" \
   --url "<optional-direct-dataset-url>"
@@ -66,7 +62,7 @@ python "~/.gemini/skills/research-anything/scripts/ra_crawler.py" data \
 When off-the-shelf crawled skills do not cover your project's unique workflow—or as soon as you lock `INVARIANTS.md` and `WORKFLOW_MAP.md`—forge a **project-specific skill, executable Python harness, multi-agent hooks, and dedicated Review Agent**:
 
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_forge.py" \
+python "<RA_DIR>/scripts/ra_forge.py" \
   --workspace "." \
   --name "<project-slug>" \
   --domain "<e.g., Game Development / Autonomous State Engine>"

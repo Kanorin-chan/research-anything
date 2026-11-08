@@ -22,7 +22,7 @@ Whenever a hypothesis, bug fix, or feature touches **any visual, UI, layout, gam
 ### Step 1: Scan Provided Assets & Native Aspect Ratios (`ra_visual_audit.py scan-assets`)
 Before writing or finalizing UI/rendering code, scan the workspace and sandbox for provided assets:
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_visual_audit.py" scan-assets \
+python "<RA_DIR>/scripts/ra_visual_audit.py" scan-assets \
   --workspace "." \
   --hypothesis "Hxxx_<slug>"
 ```
@@ -32,7 +32,7 @@ python "~/.gemini/skills/research-anything/scripts/ra_visual_audit.py" scan-asse
 ### Step 2: Initialize & Capture Multi-State Screenshots (`visual_captures/`)
 Initialize the visual audit workspace for the active hypothesis (which also populates the **Provided Assets Inventory Table** in `VISUAL_AUDIT.md`):
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_visual_audit.py" init \
+python "<RA_DIR>/scripts/ra_visual_audit.py" init \
   --workspace "." \
   --hypothesis "Hxxx_<slug>"
 ```
@@ -42,7 +42,7 @@ Launch/render the live output (via headless browser, Playwright, window/frame ca
 - **`CAP-03` (Boundary / Stress State)**: Long text, empty data, dense items, or alternate viewport/resolution.
 
 ### Step 3: Open Every Capture & Bridge "AI Intent" vs. "User Pixels"
-You **must** open every captured `.png`/`.jpg`/`.webp` file using your file/image reading tool (`read_file`) and compare:
+You **must** open every captured `.png`/`.jpg`/`.webp` file using your file/image reading tool (`Read` in Claude Code, `read_file` in Gemini) and compare:
 - **What I (the AI) thought my code drew** vs. **What is literally visible in the pixels**.
 - Never write vague summaries like *"UI rendered properly."* State concrete visual facts (exact element positions, bounding boxes, margins, alignment, asset aspect ratios, colors, and legibility).
 
@@ -59,7 +59,7 @@ Assume the visual output is broken until you disprove all five defect categories
 
 ### Step 5: Run the Automated Visual & Provided-Asset Gate (`ra_visual_audit.py audit`)
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_visual_audit.py" audit \
+python "<RA_DIR>/scripts/ra_visual_audit.py" audit \
   --workspace "." \
   --hypothesis "Hxxx_<slug>"
 ```

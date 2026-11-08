@@ -9,7 +9,7 @@
     {
       "name": "research-anything",
       "source": "./",
-      "description": "RA (Research Anything) v1.3.0 — Composable Super-Skill Suite: full 8-stage R&D (/research-anything), project conversation & grilling (/ra-talk), systemic root-cause debugging (/ra-systemic-debug), multi-hop workflow mapping (/ra-workflow-map), /fork context controller (/ra-context-fork), real .log watchdog (/ra-log-verify), and visual/provided-asset gate (/ra-visual-audit).",
+      "description": "RA (Research Anything) v1.4.0 — Composable Super-Skill Suite: full 8-stage R&D (/research-anything), project conversation & grilling (/ra-talk), systemic root-cause debugging (/ra-systemic-debug), multi-hop workflow mapping (/ra-workflow-map), /fork context controller (/ra-context-fork), real .log watchdog (/ra-log-verify), and visual/provided-asset gate (/ra-visual-audit).",
       "category": "engineering",
       "keywords": [
         "research-anything",

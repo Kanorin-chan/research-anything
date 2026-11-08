@@ -10,7 +10,7 @@ Use this skill standalone (or during Stage 4/5 of `research-anything`) whenever 
 ## 1. Scan Provided Assets & Native Aspect Ratios (`scan-assets`)
 Before finalizing UI/rendering code, scan the workspace (`assets/`, `public/`, `static/`, `icons/`, `images/`, `sprites/`, `reference/`) for provided assets:
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_visual_audit.py" scan-assets \
+python "${CLAUDE_SKILL_DIR}/../research-anything/scripts/ra_visual_audit.py" scan-assets \
   --workspace "." \
   --hypothesis "STANDALONE"
 ```
@@ -20,16 +20,16 @@ python "~/.gemini/skills/research-anything/scripts/ra_visual_audit.py" scan-asse
 
 ## 2. Initialize & Capture Real Screenshots (`init`)
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_visual_audit.py" init \
+python "${CLAUDE_SKILL_DIR}/../research-anything/scripts/ra_visual_audit.py" init \
   --workspace "." \
   --hypothesis "STANDALONE"
 ```
 Render the live output and capture real screenshots (`.png`, `.jpg`, `.webp`) into `research/sandbox/<hypothesis>/visual_captures/`.
 
 ## 3. Inspect Pixels From the User's Point of View & Run `audit`
-Open every screenshot with your vision tool (`read_file`), complete the 5-point User-Eyes & Asset-Fit checklist in `VISUAL_AUDIT.md`, and run the automated gate:
+Open every screenshot with your image-reading tool (`Read` in Claude Code, `read_file` in Gemini), complete the 5-point User-Eyes & Asset-Fit checklist in `VISUAL_AUDIT.md`, and run the automated gate:
 ```bash
-python "~/.gemini/skills/research-anything/scripts/ra_visual_audit.py" audit \
+python "${CLAUDE_SKILL_DIR}/../research-anything/scripts/ra_visual_audit.py" audit \
   --workspace "." \
   --hypothesis "STANDALONE"
 ```

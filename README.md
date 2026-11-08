@@ -1,4 +1,4 @@
-# RA — Research Anything (`research-anything`) v1.3.0
+# RA — Research Anything (`research-anything`) v1.4.0
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Version: 1.3.0](https://img.shields.io/badge/Version-1.3.0-orange.svg)](#)
@@ -214,7 +214,7 @@ python scripts/ra_gate.py status --workspace .
 
 # Start a new hypothesis, seal axioms, advance, conclude, or graduate
 python scripts/ra_gate.py new-hypothesis --workspace . --id H001 --slug "retry_fix" --agent "MAIN_ORCHESTRATOR"
-python scripts/ra_gate.py seal-axioms --workspace . --file "research/sandbox/H001_retry_fix/axioms.py"
+python scripts/ra_gate.py seal-axioms --workspace . --file "src/axioms.py"   # sandbox paths are refused
 python scripts/ra_gate.py advance --workspace .
 python scripts/ra_gate.py conclude --workspace . --verdict PROVEN \
   --issue "Upstream retry recovery cleared session dispatch ledger" \

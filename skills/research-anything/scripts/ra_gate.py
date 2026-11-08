@@ -1175,6 +1175,114 @@ def cmd_stop_rule(args: argparse.Namespace) -> None:
     print("=" * 78)
 
 
+LAZY_RETRY_EXCUSE_RE = re.compile(
+    r"\b(let'?s\s+retry|try\s+again|just\s+retry|re-?run\s+and\s+see|tweak\s+threshold|nudge\s+threshold|"
+    r"adjust\s+threshold|increase\s+timeout|maybe\s+flaky|random\s+glitch)\b",
+    re.IGNORECASE,
+)
+
+
+def cmd_re_evaluate(args: argparse.Namespace) -> None:
+    """
+    Mandatory First-Principles Re-Evaluation Gate to unlock execution after a failed run.
+    Blocks lazy 'let's retry' or threshold-tweaking loops and enforces the hard Stop Rule.
+    """
+    workspace = Path(args.workspace).resolve()
+    state = load_state(workspace, auto_init=True)
+    rdir = get_research_dir(workspace)
+
+    comp = args.component.strip()
+    why_failed = args.why_failed.strip()
+    new_calc = args.new_calculation.strip()
+    why_diff = args.why_different.strip()
+
+    for field_name, val in (
+        ("--why-failed", why_failed),
+        ("--new-calculation", new_calc),
+        ("--why-different", why_diff),
+    ):
+        if len(val) < 20:
+            print(
+                f"[RA GATE BLOCKED — LAZY REASONING REJECTED]\n"
+                f"  `{field_name}` is too brief (`{val}`). You must write a real first-principles mathematical\n"
+                f"  or structural analysis (>= 20 chars), not a one-word excuse!",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        m_lazy = LAZY_RETRY_EXCUSE_RE.search(val)
+        if m_lazy:
+            print(
+                f"[RA GATE BLOCKED — LAZY RETRY EXCUSE DETECTED IN `{field_name}`]\n"
+                f"  Matched forbidden trial-and-error phrase: `{m_lazy.group(0)}`.\n"
+                f"  Do NOT spam 'let's retry' or nudge thresholds! Re-calculate the underlying invariant/equation\n"
+                f"  or execute your `If It Never Works` Pivot Plan.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    stop_rules: Dict[str, Any] = state.setdefault("stop_rules", {})
+    re_eval_counts: Dict[str, int] = state.setdefault("re_evaluation_counts", {})
+    re_eval_counts[comp] = re_eval_counts.get(comp, 0) + 1
+
+    if comp in stop_rules:
+        sr = stop_rules[comp]
+        sr["failed_rounds"] = sr.get("failed_rounds", 0) + 1
+        f_rounds = sr["failed_rounds"]
+        m_rounds = sr.get("max_rounds", 2)
+        if f_rounds >= m_rounds or sr.get("status") == "PIVOT_TRIGGERED":
+            sr["status"] = "PIVOT_TRIGGERED"
+            save_state(workspace, state)
+            print("=" * 78, file=sys.stderr)
+            print(
+                f"  [!!!] RA HARD STOP RULE REACHED FOR `{comp}` ({f_rounds}/{m_rounds} FAILED ROUNDS)",
+                file=sys.stderr,
+            )
+            print("=" * 78, file=sys.stderr)
+            print(
+                f"  Execution remains LOCKED for `{comp}`! Stop trying to fix this heuristic.\n"
+                f"  Switch to your pre-registered 'If It Never Works' Pivot Plan immediately:\n"
+                f"    -> {sr.get('if_never_works')}",
+                file=sys.stderr,
+            )
+            print("=" * 78, file=sys.stderr)
+            sys.exit(2)
+    elif re_eval_counts[comp] >= 2:
+        save_state(workspace, state)
+        print(
+            f"[RA GATE BLOCKED — UNBOUNDED RE-EVALUATION LOOP ON `{comp}`!]\n"
+            f"  You have failed `{comp}` {re_eval_counts[comp]} times without registering a Stop Rule!\n"
+            f"  Run `ra_gate.py stop-rule --component {comp} --purpose \"...\" --success-criteria \"...\" "
+            f"--max-rounds 2 --if-never-works \"...\"` first.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    retry_lock: Dict[str, Any] = state.setdefault("retry_lock", {})
+    retry_lock["re_evaluated"] = True
+    retry_lock["last_re_evaluated_at"] = now_iso()
+    retry_lock["component"] = comp
+    retry_lock["new_calculation"] = new_calc
+    save_state(workspace, state)
+
+    append_self_learning(
+        rdir,
+        state.get("active_hypothesis") or comp,
+        args.agent or "PRIMARY_AGENT",
+        f"Previous calculation on `{comp}` failed: {why_failed}",
+        f"Replaced trial-and-error retry with new calculation: {new_calc}",
+        f"Deterministic separation proof: {why_diff}",
+    )
+
+    print("=" * 78)
+    print(f"  RA FIRST-PRINCIPLES RE-EVALUATION ACCEPTED FOR `{comp}`")
+    print("=" * 78)
+    print(f"  Why Old Failed   : {why_failed}")
+    print(f"  New Calculation  : {new_calc}")
+    print(f"  Why Deterministic: {why_diff}")
+    print("  Next Step        : Implement the new calculation in code (changing the code SHA-256) before running `ra_log_engine.py run`.")
+    print("=" * 78)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="RA (research-anything) State-Machine Gatekeeper")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1284,6 +1392,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_sr.add_argument("--agent", default="PRIMARY_AGENT", help="Agent or session ID")
     p_sr.set_defaults(func=cmd_stop_rule)
+
+    p_re = sub.add_parser(
+        "re-evaluate",
+        help="Mandatory First-Principles Re-Evaluation Gate to unlock `ra_log_engine.py run` after a failed attempt (blocks lazy 'let's retry' loops)",
+    )
+    p_re.add_argument("--workspace", default=".", help="Workspace root directory")
+    p_re.add_argument("--component", required=True, help="Component/mechanism slug being re-evaluated")
+    p_re.add_argument(
+        "--why-failed",
+        required=True,
+        help="Mathematical or structural proof of WHY the previous calculation/model failed",
+    )
+    p_re.add_argument(
+        "--new-calculation",
+        required=True,
+        help="Exact new equation, invariant, or structural change (NOT a lazy threshold tweak)",
+    )
+    p_re.add_argument(
+        "--why-different",
+        required=True,
+        help="Why this new calculation deterministically separates the failure case",
+    )
+    p_re.add_argument("--agent", default="PRIMARY_AGENT", help="Agent or session ID")
+    p_re.set_defaults(func=cmd_re_evaluate)
 
     return p
 

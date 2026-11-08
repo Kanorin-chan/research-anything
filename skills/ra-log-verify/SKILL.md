@@ -35,3 +35,18 @@ python "~/.gemini/skills/research-anything/scripts/ra_log_engine.py" audit \
   --workspace "." \
   --hypothesis "STANDALONE"
 ```
+
+## 4. Anti-Lazy-Retry & Mandatory First-Principles Re-Evaluation Gate (`ra_gate.py re-evaluate`)
+**Spamming "let's retry" or nudging a threshold and re-running after a failed attempt is BANNED.**
+When a fix attempt fails in `ra_log_engine.py run` or `audit`, `ra_log_engine.py` engages a **Retry Lock** (and hashes your current code files). It will block any subsequent `run` until you:
+1. Run `ra_gate.py re-evaluate` with a real mathematical/structural diagnosis (lazy phrases like `"let's retry"`, `"tweak threshold"`, or `"maybe flaky"` are rejected):
+   ```bash
+   python "~/.gemini/skills/research-anything/scripts/ra_gate.py" re-evaluate \
+     --workspace "." \
+     --component "<component_slug>" \
+     --why-failed "<Mathematical/structural proof of WHY the previous calculation failed>" \
+     --new-calculation "<Exact new equation, invariant, or structural change>" \
+     --why-different "<Why this new calculation deterministically separates the failure case>"
+   ```
+2. Actually modify the code to implement the new calculation (re-running with an identical code SHA-256 is blocked!).
+3. If `failed_rounds` reaches your `stop-rule` limit, `re-evaluate` triggers the **Hard Stop Rule** and forces you onto the `"If It Never Works"` Pivot Plan.

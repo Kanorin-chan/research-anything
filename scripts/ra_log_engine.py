@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime as dt
+import hashlib
 import inspect
 import json
 import os
@@ -531,11 +532,72 @@ def cmd_inject_sdk(args: argparse.Namespace) -> None:
     print("=" * 78)
 
 
+def compute_code_fingerprint(workspace: Path, hyp: str, state: Dict[str, Any]) -> str:
+    """Compute a combined SHA-256 fingerprint of tracked / sandbox code files to detect identical-code retry spam."""
+    h = hashlib.sha256()
+    candidate_files: List[Path] = []
+    sandbox_dir = workspace / "research" / "sandbox" / hyp
+    if sandbox_dir.exists():
+        candidate_files.extend(
+            f for f in sorted(sandbox_dir.rglob("*"))
+            if f.is_file() and f.suffix.lower() not in {".log", ".json", ".md"}
+        )
+    for rel_t in sorted(state.get("context_map_snapshot", {}).get("tracked_files", {}).keys()):
+        fp = (workspace / rel_t).resolve()
+        if fp.exists() and fp.is_file():
+            candidate_files.append(fp)
+    if not candidate_files:
+        for f in sorted(workspace.glob("*")):
+            if f.is_file() and f.suffix.lower() in {".py", ".js", ".ts", ".rs", ".go", ".cpp", ".c"}:
+                candidate_files.append(f)
+    for cf in candidate_files:
+        try:
+            h.update(str(cf.name).encode("utf-8"))
+            h.update(cf.read_bytes())
+        except Exception:
+            pass
+    return h.hexdigest()
+
+
 def cmd_run(args: argparse.Namespace) -> None:
-    """Run a real-environment execution command under a strict OS-level watchdog timer (preventing 30-min hangs)."""
+    """Run a real-environment execution command under a strict OS-level watchdog timer (preventing 30-min hangs & lazy retry loops)."""
     workspace = Path(args.workspace).resolve()
     rdir = workspace / "research"
+    rdir.mkdir(parents=True, exist_ok=True)
+    state_path = rdir / ".ra_state.json"
+    state: Dict[str, Any] = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+
     hyp = args.hypothesis.strip()
+    code_fp = compute_code_fingerprint(workspace, hyp, state)
+    retry_lock: Dict[str, Any] = state.get("retry_lock", {})
+
+    # Anti-Lazy-Retry Gate: Block un-reasoned "let's retry" spam or identical-code re-runs after a failed fix attempt
+    if retry_lock.get("locked") and not getattr(args, "initial_repro", False):
+        if not retry_lock.get("re_evaluated"):
+            print(
+                "[RA LOG ENGINE BLOCKED — LAZY RETRY / INFINITE LOOP PREVENTED!]\n"
+                "  Your previous execution failed. Spamming 'let's retry' or re-running without a first-principles\n"
+                "  re-calculation is BANNED.\n"
+                "  Before you can run again, you MUST perform a formal re-evaluation:\n"
+                "    python ra_gate.py re-evaluate \\\n"
+                "      --workspace \".\" \\\n"
+                "      --component \"<component_slug>\" \\\n"
+                "      --why-failed \"<Mathematical/structural proof of WHY the previous calculation/model failed>\" \\\n"
+                "      --new-calculation \"<Exact new equation, invariant, or structural change (NOT a threshold tweak)>\" \\\n"
+                "      --why-different \"<Why this new calculation deterministically resolves the failure>\"",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if code_fp == retry_lock.get("failed_code_hash"):
+            print(
+                "[RA LOG ENGINE BLOCKED — IDENTICAL CODE RETRY DETECTED!]\n"
+                "  You unlocked `re-evaluate`, but attempted to re-run `ra_log_engine.py run` with the EXACT SAME\n"
+                "  code SHA-256 fingerprint as the failed run!\n"
+                "  Re-running identical code hoping for a different outcome is banned. Implement your new calculation first!",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
     logs_dir = rdir / "sandbox" / hyp / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_file = Path(args.log_file).resolve() if args.log_file else (logs_dir / "runtime_real.log")
@@ -579,9 +641,23 @@ def cmd_run(args: argparse.Namespace) -> None:
                 elapsed_ms=elapsed_ms,
                 flow="ra_log_engine:cmd_run->subprocess",
             )
+            # If initial repro was already done (or this is a fix attempt), engage the Anti-Lazy-Retry Lock!
+            if state.get("initial_repro_done") and not getattr(args, "initial_repro", False):
+                state["retry_lock"] = {
+                    "locked": True,
+                    "re_evaluated": False,
+                    "failed_cmd": args.cmd,
+                    "failed_code_hash": code_fp,
+                    "failed_at": now_iso(),
+                }
+            else:
+                state["initial_repro_done"] = True
+            state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
             print(f"  [FAIL] Process exited with code {proc.returncode} ({elapsed_ms:.1f}ms). Logged to `{log_file.name}`.")
             sys.exit(proc.returncode)
         else:
+            state["retry_lock"] = {"locked": False, "re_evaluated": False, "failed_code_hash": ""}
+            state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
             print(f"  [COMPLETED] Real-environment run finished in {elapsed_ms:.1f}ms. Running `.log` audit...")
     except subprocess.TimeoutExpired as exc:
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -595,6 +671,14 @@ def cmd_run(args: argparse.Namespace) -> None:
             elapsed_ms=elapsed_ms,
             flow="ra_log_engine:cmd_run->subprocess_timeout",
         )
+        state["retry_lock"] = {
+            "locked": True,
+            "re_evaluated": False,
+            "failed_cmd": args.cmd,
+            "failed_code_hash": code_fp,
+            "failed_at": now_iso(),
+        }
+        state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         print(
             f"  [STUCK / KILLED BY WATCHDOG] Command hung past {timeout_sec}s limit! "
             f"Recorded `[STUCK]` state in `{log_file.name}`.",
@@ -769,19 +853,36 @@ def cmd_audit(args: argparse.Namespace) -> None:
         print("-" * 78)
 
     if violations:
-        if state_path.exists():
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-            state["log_audit_passed"] = False
-            state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        rdir.mkdir(parents=True, exist_ok=True)
+        state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+        state["log_audit_passed"] = False
+        code_fp = compute_code_fingerprint(workspace, hyp, state)
+        if state.get("initial_repro_done"):
+            state["retry_lock"] = {
+                "locked": True,
+                "re_evaluated": False,
+                "failed_cmd": "audit",
+                "failed_code_hash": code_fp,
+                "failed_at": now_iso(),
+            }
+        else:
+            state["initial_repro_done"] = True
+        state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         print("  [FAIL] REAL-ENVIRONMENT `.log` AUDIT REJECTED THE RUN:")
         for v in violations:
             print(f"    - {v}")
+        print("-" * 78)
+        print(
+            "  [ANTI-LAZY-RETRY LOCK] Before re-running after a failed fix attempt, you MUST run:\n"
+            "    python ra_gate.py re-evaluate --component <slug> --why-failed \"...\" --new-calculation \"...\" --why-different \"...\""
+        )
         print("=" * 78)
         sys.exit(1)
 
     if state_path.exists():
         state = json.loads(state_path.read_text(encoding="utf-8"))
         state["log_audit_passed"] = True
+        state["retry_lock"] = {"locked": False, "re_evaluated": False, "failed_code_hash": ""}
         state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     print("  [PASS] Real-Environment `.log` Flow, Functional Roles, State Deltas & Contracts Verified!")
@@ -804,6 +905,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--cmd", required=True, help="Command to execute in the real environment")
     p_run.add_argument("--timeout-sec", type=int, default=60, help="Hard watchdog timeout in seconds (prevents 30m hangs)")
     p_run.add_argument("--log-file", default=None, help="Optional custom `.log` file path")
+    p_run.add_argument(
+        "--initial-repro",
+        action="store_true",
+        help="Mark this run as the Phase 1 initial bug reproduction (does not trigger the post-fix retry lock)",
+    )
     p_run.set_defaults(func=cmd_run)
 
     p_audit = sub.add_parser("audit", help="Audit real-environment `.log` files for flow, values, `[PASS]`/`[STUCK]`/`[FAIL]`, and contracts")

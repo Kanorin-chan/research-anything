@@ -348,6 +348,23 @@ def print_context_refresh(workspace: Path, state: Dict[str, Any]) -> None:
             print(f"    - [PROTECTED] {pn}")
         print("-" * 78)
 
+    stop_rules: Dict[str, Any] = state.get("stop_rules", {})
+    if stop_rules:
+        print("  REGISTERED STOP RULES & 'IF IT NEVER WORKS' PIVOT PLANS (NO INFINITE FAIL->FIX->RETEST):")
+        for comp_name, sr in stop_rules.items():
+            f_rounds = sr.get("failed_rounds", 0)
+            m_rounds = sr.get("max_rounds", 2)
+            st = sr.get("status", "ACTIVE")
+            print(f"    - [{st}] `{comp_name}` (Failed Rounds: {f_rounds}/{m_rounds})")
+            print(f"      Purpose & Reliable Split : {sr.get('purpose', '')}")
+            print(f"      Success Criteria         : {sr.get('success_criteria', '')}")
+            print(f"      If It Never Works Pivot  : {sr.get('if_never_works', '')}")
+            if st == "PIVOT_TRIGGERED" or f_rounds >= m_rounds:
+                print(
+                    f"      [!!! STOP RULE TRIGGERED] Stop tweaking `{comp_name}`! Switch to the `If It Never Works` pivot immediately!"
+                )
+        print("-" * 78)
+
     if contracts:
         print("  EXISTING BEHAVIORAL CONTRACTS (`WORKFLOW_MAP.md` — DO NOT REGRESS):")
         for bc in contracts:
@@ -1077,6 +1094,87 @@ def cmd_learn(args: argparse.Namespace) -> None:
     print("[RA GATE] Recorded lesson in `research/SELF_LEARNING.md`.")
 
 
+def cmd_stop_rule(args: argparse.Namespace) -> None:
+    """
+    Register or enforce a hard Stop Rule, Success Criteria, and 'If It Never Works' Pivot Plan
+    for a component/mechanism so the AI never enters an open-ended `fail -> fix -> retest` loop.
+    """
+    workspace = Path(args.workspace).resolve()
+    state = load_state(workspace, auto_init=True)
+    rdir = get_research_dir(workspace)
+    stop_rules: Dict[str, Any] = state.setdefault("stop_rules", {})
+    comp = args.component.strip()
+
+    if args.record_failure:
+        if comp not in stop_rules:
+            print(
+                f"[RA GATE BLOCKED] No Stop Rule registered for `{comp}`! "
+                f"Register `--purpose`, `--success-criteria`, `--max-rounds`, and `--if-never-works` BEFORE testing/looping.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        sr = stop_rules[comp]
+        sr["failed_rounds"] = sr.get("failed_rounds", 0) + 1
+        sr["last_failed_at"] = now_iso()
+        f_rounds = sr["failed_rounds"]
+        m_rounds = sr.get("max_rounds", 2)
+        if f_rounds >= m_rounds:
+            sr["status"] = "PIVOT_TRIGGERED"
+            save_state(workspace, state)
+            append_self_learning(
+                rdir,
+                state.get("active_hypothesis") or comp,
+                args.agent or "PRIMARY_AGENT",
+                f"Component `{comp}` reached hard Stop Rule ({f_rounds}/{m_rounds} failed unseen rounds).",
+                "Avoided infinite `fail -> fix -> retest` rabbit hole on a brittle heuristic.",
+                f"Triggered `If It Never Works` Pivot Plan for `{comp}`: {sr.get('if_never_works')}",
+            )
+            print("=" * 78)
+            print(f"  [!!!] RA STOP RULE TRIGGERED FOR `{comp}` ({f_rounds}/{m_rounds} FAILED ROUNDS)")
+            print("=" * 78)
+            print(f"  STOP tweaking `{comp}`! Do NOT run another `fail -> fix -> retest` round.")
+            print(f"  Execute your pre-registered 'If It Never Works' Pivot Plan immediately:")
+            print(f"    -> {sr.get('if_never_works')}")
+            print("=" * 78)
+            return
+        save_state(workspace, state)
+        print(
+            f"[RA GATE] Recorded failed round {f_rounds}/{m_rounds} for `{comp}` "
+            f"({m_rounds - f_rounds} round(s) remaining before Stop Rule triggers)."
+        )
+        return
+
+    if not args.purpose or not args.success_criteria or not args.if_never_works:
+        print(
+            "[RA GATE BLOCKED] Registering a Stop Rule requires all three:\n"
+            "  1. `--purpose` (what the score/mechanism is for + what is ALREADY reliable vs. weak)\n"
+            "  2. `--success-criteria` (accuracy on full/crowded load, false-positive vs. false-negative cost, speed)\n"
+            "  3. `--if-never-works` (ground-truth pivot plan so the main project never waits on a brittle heuristic)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    stop_rules[comp] = {
+        "component": comp,
+        "purpose": args.purpose.strip(),
+        "success_criteria": args.success_criteria.strip(),
+        "max_rounds": max(1, int(args.max_rounds)),
+        "failed_rounds": 0,
+        "if_never_works": args.if_never_works.strip(),
+        "status": "ACTIVE",
+        "registered_at": now_iso(),
+    }
+    save_state(workspace, state)
+    print("=" * 78)
+    print(f"  RA STOP RULE & PIVOT CONTRACT LOCKED FOR `{comp}`")
+    print("=" * 78)
+    print(f"  Purpose & Reliable Split : {args.purpose.strip()}")
+    print(f"  Success Criteria         : {args.success_criteria.strip()}")
+    print(f"  Max Unseen Rounds        : {max(1, int(args.max_rounds))} round(s) before kill-switch")
+    print(f"  If It Never Works Pivot  : {args.if_never_works.strip()}")
+    print("=" * 78)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="RA (research-anything) State-Machine Gatekeeper")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1160,6 +1258,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_learn.add_argument("--workflow", required=True, help="Where the workflow/thinking failed")
     p_learn.add_argument("--found", required=True, help="Permanent rule discovered")
     p_learn.set_defaults(func=cmd_learn)
+
+    p_sr = sub.add_parser(
+        "stop-rule",
+        help="Register or enforce a hard Stop Rule, Success Criteria, and 'If It Never Works' Pivot Plan",
+    )
+    p_sr.add_argument("--workspace", default=".", help="Workspace root directory")
+    p_sr.add_argument("--component", required=True, help="Component/mechanism slug (e.g., pixel_god_tracker)")
+    p_sr.add_argument("--purpose", default="", help="What the score/mechanism is for + what is already reliable vs. weak")
+    p_sr.add_argument(
+        "--success-criteria",
+        default="",
+        help="Accuracy on full/crowded load, false-positive vs. false-negative asymmetry, and speed budget",
+    )
+    p_sr.add_argument("--max-rounds", type=int, default=2, help="Max failed unseen test rounds before triggering pivot")
+    p_sr.add_argument(
+        "--if-never-works",
+        default="",
+        help="Ground-truth fallback/pivot plan so the main project never waits on a brittle heuristic",
+    )
+    p_sr.add_argument(
+        "--record-failure",
+        action="store_true",
+        help="Increment failed rounds for --component and trigger the 'If It Never Works' pivot if max-rounds reached",
+    )
+    p_sr.add_argument("--agent", default="PRIMARY_AGENT", help="Agent or session ID")
+    p_sr.set_defaults(func=cmd_stop_rule)
 
     return p
 

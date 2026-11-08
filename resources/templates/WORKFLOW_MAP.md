@@ -55,3 +55,25 @@ Before editing any existing function or creating any new function, answer all fo
    - `<If creating a new function: prove no existing function in the workflow map already owns or should own this logic. If editing existing: write N/A.>`
 4. **WHAT is the N-Hop Blast Radius?**:
    - `<Trace the impact 2, 3, and N hops away across all callers, shared state variables, and multi-cycle runs.>`
+
+---
+
+## 5. Success Criteria, Hard Stop Rule & "If It Never Works" Pivot Plan (Anti-Rabbit-Hole Gate)
+**NEVER enter an open-ended `fail -> fix -> retest` loop or spawn optimization subagents for an unvalidated heuristic.** Before writing code, lock all 5 answers below:
+
+1. **What This Mechanism / Metric Is Actually For (Reliable vs. Weak Split)**:
+   - **Core Purpose**: `<What real decision or goal does this serve? (e.g., telling whether the new bot beats the old 10-11 baseline towards the 16 target)>`
+   - **Already Reliable Parts (Do Not Rebuild)**: `<List metrics/modules that already work 100% reliably>`
+   - **The Only Weak Part**: `<Isolate the exact narrow sub-problem>`
+2. **Success Criteria (Must Include Full-Load / Crowded Cases & Error Asymmetry)**:
+   - **Accuracy on Hard / Full-Load Cases**: `<e.g., Within +-1 on full boards (12-16 units), not just light/easy test cases>`
+   - **Error Direction Asymmetry**: `<Which is worse: False Positive or False Negative, and why?>`
+   - **Speed / Latency Budget**: `<e.g., < 5 min offline or 1-2 s live cycle>`
+3. **Hard Stop Rule (Kill-Switch Round Budget)**:
+   - **Max Rounds Before Stopping**: `<e.g., 1 more unseen test round. If it fails on an unseen full-load test, STOP tweaking this medium/heuristic.>`
+4. **"If It Never Works" Pivot Plan (Deterministic / Ground-Truth Fallback)**:
+   - **Fallback 1 (Live / Direct Read)**: `<e.g., Tap/query the authoritative UI card or state directly instead of guessing from noisy pixels>`
+   - **Fallback 2 (End-of-Run / Native Summary)**: `<e.g., Read the application/game's own summary screen or ledger>`
+   - **Fallback 3 (Baseline Comparison)**: `<Lean on the already-reliable metrics so the main project NEVER waits on a brittle side-quest>`
+5. **When the Whole Rebuild / Project Stops**:
+   - `<End-to-end win condition over multiple real runs + User Playtest Sign-Off>`

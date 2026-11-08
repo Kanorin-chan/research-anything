@@ -57,11 +57,23 @@ Never inspect only the crash line or the function the user accused. Call the Ski
 
 ---
 
-## Phase 3: Formulate 3–5 Ranked Falsifiable Hypotheses
+## Phase 3: Formulate 3–5 Ranked Falsifiable Hypotheses & Lock a Hard Stop Rule
 
-Before changing any logic, write **3–5 ranked root-cause hypotheses**. Single-hypothesis debugging anchors on the first plausible guess.
-- Every hypothesis must state an explicit **falsifiable prediction**:
-  > *"If `<Upstream Node C mutating state X at Hop -2>` is the root cause, then `<observing state_delta at Hop -2>` will show `<exact corruption>`, and `<replacing Pipe C>` will make the symptom at Hop 0 disappear while keeping `BC-001` intact."*
+Before changing any logic, write **3–5 ranked root-cause hypotheses** AND register a **Hard Stop Rule & "If It Never Works" Pivot Plan** (`ra_gate.py stop-rule`) so you never enter an open-ended `fail -> fix -> retest` loop:
+1. **Every hypothesis must state an explicit falsifiable prediction**:
+   > *"If `<Upstream Node C mutating state X at Hop -2>` is the root cause, then `<observing state_delta at Hop -2>` will show `<exact corruption>`, and `<replacing Pipe C>` will make the symptom at Hop 0 disappear while keeping `BC-001` intact."*
+2. **Lock the Stop Rule, Success Criteria & "If It Never Works" Pivot (`ra_gate.py stop-rule`)**:
+   - **Never loop `fail -> tweak threshold -> retest` without a written stop rule, and NEVER spawn optimization subagents for a heuristic that hasn't passed worst-case/full-load unseen tests.**
+   ```bash
+   python "~/.gemini/skills/research-anything/scripts/ra_gate.py" stop-rule \
+     --workspace "." \
+     --component "<component_slug>" \
+     --purpose "<What it is for + what is ALREADY reliable vs. the only weak part>" \
+     --success-criteria "<Accuracy on full/crowded unseen load, false-positive vs. false-negative cost, speed budget>" \
+     --max-rounds 2 \
+     --if-never-works "<1. Live ground-truth read (e.g. tap/query card); 2. End-of-run native summary; 3. Lean on already-reliable metrics>"
+   ```
+   - After each failed unseen test round, run `ra_gate.py stop-rule --component "<component_slug>" --record-failure`. When `failed_rounds == max_rounds`, **STOP tweaking the heuristic and execute the `"If It Never Works"` pivot immediately**.
 
 ---
 

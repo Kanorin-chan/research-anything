@@ -1,7 +1,7 @@
-# RA — Research Anything (`research-anything`) v1.5.1
+# RA — Research Anything (`research-anything`) v1.6.0
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
-[![Version: 1.5.1](https://img.shields.io/badge/Version-1.5.1-orange.svg)](#)
+[![Version: 1.6.0](https://img.shields.io/badge/Version-1.6.0-orange.svg)](#)
 [![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![Zero Dependencies](https://img.shields.io/badge/Dependencies-None%20(Stdlib)-brightgreen.svg)](#)
 [![Platforms](https://img.shields.io/badge/Platforms-OpenCode%20%7C%20Claude%20Code%20%7C%20Codex%20%7C%20Antigravity%20%7C%20Gemini%20CLI-purple.svg)](#installation-30-second-setup)
@@ -129,7 +129,7 @@ Every skill in this repo splits on one axis: **who can invoke it**.
 
 ## Why Standard AI Agents Fail at Real Engineering & R&D (And How RA Fixes It)
 
-| Failure Mode | What Standard AI Agents Do | How **RA (`research-anything`) v1.5.1** Solves It |
+| Failure Mode | What Standard AI Agents Do | How **RA (`research-anything`) v1.6.0** Solves It |
 | :--- | :--- | :--- |
 | **1. 1-Hop Symptom Blindness & Innocent-Function Mutation** | User says *"Function A is broken!"* and the AI blindly mutates `Function A`, breaking working code when the real bug was `Function C` 2 hops upstream (`Symptom != Culprit`). | **`ra-workflow-map` & `ra-systemic-debug` (`ra_gate.py map-context`)**: Traces `-N` to `+N` hops in `WORKFLOW_MAP.md`, proves culprit vs. innocent victim, and locks working functions as `PROTECTED_WORKING`. |
 | **2. Whack-a-Mole Ping-Pong Regressions** | Fixes Bug B by wiping shared state, which silently breaks Behavior A that depended on that state. | **Existing Behavioral Contracts (`BC-xxx`)**: Locks all existing working guarantees (`BC-001`, `BC-002`...) in `WORKFLOW_MAP.md` and verifies every contract in real-environment `.log` traces. |
@@ -250,6 +250,12 @@ python scripts/ra_gate.py decide --workspace . --what "..." --why "..." --altern
 python scripts/ra_gate.py directive --workspace . --quote "<user's exact words>" --source "chat 2026-11-08"
 python scripts/ra_gate.py board --workspace .                        # live lab board
 python scripts/ra_gate.py resume --workspace .                       # pick an existing run back up
+
+# Safety harness (v1.6): other agents, the delete door, OpenCode rules
+python scripts/ra_gate.py allow-agent --workspace . --agent "opencode:llamacpp/qwen3.8-flash-next"   --quote "to use opencode qwen 3.8 flash as one of your subagent" --source "chat 2026-11-11"   --answers research/answers/before-other-agent_1.md        # grants -> research/AGENT_PERMISSIONS.json
+python scripts/ra_gate.py revoke-agent --workspace . --agent "opencode:llamacpp/qwen3.8-flash-next"
+python scripts/ra_gate.py opencode-rules --workspace .       # retryable refresh of .opencode/opencode.jsonc deny rules
+python scripts/ra_gate.py remove --workspace . --path research/sandbox/H001_x/old.py   --answers research/answers/before-delete_1.md              # moves to research/.trash/<stamp>/ + MANIFEST.json
 ```
 
 ### 2. `ra_context_harness.py` — Multi-Platform `/fork` Controller, Baton & Handoff Engine
@@ -259,17 +265,17 @@ python scripts/ra_context_harness.py create --workspace . \
   --id "SNAP_WORKFLOW" --tier "WORKFLOW_SLICE" \
   --files "bot_pipeline.py" --summary "Compiled -2 to +2 hop workflow map and BC-001/BC-002 contracts"
 
-# Fork the shared snapshot to Subagent_A (supports --platform auto|opencode|claude|codex|agy)
+# Fork the shared snapshot to Subagent_A, then dispatch the brief with your own harness's native sub-agent tool
+# (other harnesses and CLI forms need `ra_gate.py allow-agent` with the user's words)
 python scripts/ra_context_harness.py fork --workspace . \
-  --snapshots "SNAP_WORKFLOW" --subagent "Subagent_A" \
-  --task-type "REAL_RD" --platform "codex" \
+  --snapshots "SNAP_WORKFLOW" --subagent "Subagent_A" --task-type "REAL_RD" \
   --task "Build isolated prototype in research/sandbox/H001_retry_fix/ and wire RALogger"
 
-# Return the 1-concurrency baton after Subagent_A writes its report (auto-evicts hash-drifted snapshots)
-python scripts/ra_context_harness.py return-baton --workspace . \
-  --subagent "Subagent_A" --report-file "research/context_snapshots/reports/REPORT_Subagent_A.md"
+# Return the 1-concurrency baton once Subagent_A's report has its `## Handover answers` (auto-evicts hash-drifted snapshots)
+python scripts/ra_context_harness.py return-baton --workspace . --subagent "Subagent_A" --status COMPLETED \
+  --report-file "research/context_snapshots/reports/REPORT_Subagent_A.md"
 
-# Write a portable cross-harness handoff document (Claude <-> Codex <-> OpenCode <-> AGY)
+# Write a portable session handoff document (for when the user switches harness or directory)
 python scripts/ra_context_harness.py handoff --workspace . \
   --focus "Verify edge-case retry sequences" \
   --summary "Mapped workflow and isolated func_c ledger clear bug" \
@@ -311,6 +317,38 @@ python scripts/ra_crawler.py skill --workspace . --query "game-development"
 python scripts/ra_crawler.py paper --workspace . --query "monotonic state lattice"
 python scripts/ra_crawler.py data --workspace . --query "json-test-suite"
 ```
+
+---
+
+## Safety Harness (v1.6)
+
+- **Identity**: records hold the agent's real `harness:model`; `--agent` is only a claim (a warning shows when they differ).
+- **Other agents**: your own harness's native sub-agent tool is free only on your own model (no `model=` override). Other models, CLI forms (`claude -p`, `opencode run`, even your own harness's) and other harnesses need `ra_gate.py allow-agent` with the user's exact words, naming that agent. A grant for one model covers only that model; a harness-wide grant (`--agent opencode`) needs words saying any model is fine.
+- **Delete door**: `ra_gate.py remove` moves to `research/.trash/` with a manifest; its answers must name every path it removes. The Claude Code hook blocks shell deletes (also behind `timeout`, `nice`, `env`, `sudo`, `stdbuf`, `nohup`, `time`, `builtin`, `command`), `git checkout .` / `git rm` / `git restore`, moves of a protected record or out of the workspace, other agent CLIs and encoded commands. The OpenCode forge writes deny rules to `.opencode/opencode.jsonc`.
+- **Templates**: `resources/injections/*.md`, shown at remind and answer levels. Answer gates sit on review, return-baton, graduate, allow-agent and remove. Each answers file approves one gate only. A worker dispatched with the native tool must still answer the handover questions (in its report, or under `## Handover answers (<worker>)` in the review).
+
+### What the OpenCode rules do not cover
+
+OpenCode has no pre-tool hook, so its lane is glob rules only (best-effort). Known gaps:
+
+- **Moves**: only moves naming a protected record are denied (`mv *DECISIONS.md*`, `research/graveyard`, ...). `mv x ../x.bak`, `Move-Item x C:\tmp` of any other file, copy-then-delete, `robocopy /MOV` and `xcopy` pass.
+- **Wrappers**: prefixes other than `timeout`, `nice`, `env`, `stdbuf`, `nohup` and `sudo` (and behind those only `rm` / `rmdir`); `xargs sh -c`, `watch`, `Start-Process`, `& { }` blocks, `Invoke-Expression "..."` and `-EncodedCommand`.
+- **Inside a shell string** (`bash -c`, `cmd /c`, `pwsh -c`) a delete word or agent CLI is caught only where it starts a word, after a space or a quote: `bash -c "x;rm y"` passes.
+- **Interpreters** other than Python, Node and Bun one-liners (`perl -e unlink`, `ruby -e`, `php -r`), and deletes written into a script file that is then run.
+- **Discovery** by listing install folders (`ls ~/AppData/Roaming/npm`) has no rule, and `type <cli>` is not denied (`type` is `Get-Content` in PowerShell). The Claude hook blocks both.
+- **`git checkout <path>`** without `--` passes (a bare name may be a branch).
+- **Sub-agent model**: OpenCode's native `subagent` tool takes any `model=`, and neither a permission action nor an agent's configured `model` pins it (verified live on 2.2.7: an agent configured with one model still ran the model passed in). RA can only detect it: `status`, `board` and `resume` print `[RA] UNAPPROVED MODEL USED: <model> in sub-session <id>` for any sub-session on a model that is neither yours nor granted, and log it once in `LAB_LOG.md`.
+- **Model catalogue**: the Code Mode `tools.opencode.models` call is denied (action `opencode_models`, verified live), and so are `opencode models`, `opencode providers` and `opencode auth`. Reading OpenCode's own config files with the read tool is not.
+- **Move one-liners**: `shutil.move`, `os.rename` / `os.replace` and Node `renameSync` inside `python -c` / `node -e` are denied; `from shutil import move; move(a, b)`, an aliased module and a script file pass.
+- **Env prefixes**: OpenCode keeps `X=1` in front of the command (verified live), so `X=1 rm x` and `X=1 <agent cli>` get their own deny rules; `RA_WORKER=<name> <cli> ... -m <granted model>` (the form `fork` prints) is allowed.
+- **Granted models**: an `allow-agent` grant naming a model allows only direct launches that pass it (`-m <model>`, `--model "<model>"`); a shell-wrapped launch (`bash -c "<cli> ... -m <model>"`) stays denied. The glob matches the model string anywhere in the command, so a prompt containing `-m <granted model>` (`... run "do -m <model> now"`) passes and runs the default model; the Claude hook reads only the first `-m`.
+- **Shared model words**: a grant quote is checked word by word, so one distinguishing word covers every model that has it ("opencode gpt" covers any gpt model).
+- **Hook move calls**: the Claude hook classifies `shutil.move`, `os.rename` and `os.replace` one-liners, not `Path(...).rename(...)` or `from shutil import move`.
+- **Over-blocks**: `git restore --staged x`, a path whose last part is exactly an agent name (`ls src/claude`), a delete word starting a word inside a shell string (`bash -c "echo rm me"`), and any `=` before a separate `rm` or agent-CLI word (`make A=1 rm x`, `npm test --x=1 claude`) are denied. Searches and commits (`grep`, `egrep`, `rg`, `git grep`, `git log`, `git commit`, `findstr`, `Select-String`, `sls`) are allowed last, so `grep --include=*.md opencode` and `git commit -m "a=b rm x"` pass; `rg --pre`, `git grep -O` / `--open-files-in-pager` and command substitution (`$(` or a backtick) inside those heads are denied last, so they cannot run a denied program. `git log --ext-diff` / `--textconv` and `git commit` hooks can run configured programs, and RA does not deny them.
+
+### Changelog
+
+- **1.6.0**: Safety harness. Real-identity resolution, `allow-agent` / `revoke-agent` / `opencode-rules`, the `remove` delete door with `.trash`, Claude Code hook blocks (shell deletes, agent CLIs, encoded commands; PowerShell matchers), OpenCode deny rules, injection templates with answer gates. The platform command catalogue is no longer advertised to agents. Claude Code workers are told apart from the manager by their own transcript. The OpenCode lane is best-effort: see "What the OpenCode rules do not cover" above. A grant's quote must name the agent (harness and model); a model grant covers that model only. OpenCode identity falls back to the newest assistant message when the session has no model column. CLI workers carry `RA_WORKER`. Forge writes the delete door into `AGENTS.md`.
 
 ---
 

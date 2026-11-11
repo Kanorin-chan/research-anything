@@ -13,11 +13,12 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # ra_common lives next to this script; `python -I` does not put the script dir on sys.path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -28,6 +29,18 @@ from ra_common import (  # noqa: E402
     HASH_ALGO,
     RETIRED_STATUSES,
     approach_key,
+    answers_reuse,
+    answers_section,
+    check_answers,
+    handover_problems,
+    handover_settled,
+    next_answers_file,
+    record_answers_used,
+    worker_report_rel,
+    _inside,
+    classify_delete_path,
+    render_injection,
+    render_review_meeting,
     can_reach,
     canonical_spec,
     ceiling_block,
@@ -39,6 +52,16 @@ from ra_common import (  # noqa: E402
     find_ambiguous,
     fingerprint_files,
     fmt_score,
+    RA_VERSION,
+    grant_agent,
+    grant_scope,
+    canonical_harness,
+    granted_agents,
+    protected_list,
+    quote_names_agent,
+    quote_names_harness,
+    revoke_agent,
+    unapproved_models,
     grant_manager_edit,
     hash_file,
     hash_protected_node,
@@ -57,6 +80,7 @@ from ra_common import (  # noqa: E402
     sb_get,
     sb_lines,
     sb_lock_instructions,
+    resolve_identity,
     sb_summary,
     spec_path,
     unseen_target_met,
@@ -184,6 +208,25 @@ def read_md(path: Path) -> str:
     return path.read_text(encoding="utf-8-sig")
 
 
+def answers_problem(workspace: Path, ans: Optional[Path], moment: str) -> str:
+    """'' when an --answers file is accepted; else why not (missing, unanswered, already used) and which file to write."""
+    nxt = next_answers_file(workspace, moment)
+    if ans is None or not ans.is_file():
+        return f"--answers file missing; write {nxt} first."
+    problems = check_answers(ans.read_text(encoding="utf-8-sig", errors="replace"), moment)
+    if problems:
+        return "answers not accepted: " + "; ".join(problems)
+    used = answers_reuse(workspace, ans)
+    return f"{used}; an answers file approves one gate only: write {nxt}." if used else ""
+
+
+def names_path(text: str, rel: str) -> bool:
+    """The text names this workspace-relative path itself; a longer name or a child path does not count."""
+    flags = re.IGNORECASE if os.name == "nt" else 0
+    pat = rf"(?<![\w.-]){re.escape(rel.rstrip('/'))}(?![\w-]|\.\w|/\w)"
+    return re.search(pat, text.replace("\\", "/"), flags) is not None
+
+
 def gate_error(msg: str, code: int = 2) -> None:
     print(msg, file=sys.stderr)
     sys.exit(code)
@@ -253,7 +296,35 @@ def get_state_path(workspace: Path) -> Path:
     return get_research_dir(workspace) / ".ra_state.json"
 
 
-def ensure_initialized(workspace: Path, agent_id: str = "PRIMARY_AGENT") -> Dict[str, Any]:
+def agent_of(claimed: Optional[str]) -> Tuple[str, Optional[str]]:
+    """(resolved agent, warning or None). The claim is never used as the identity."""
+    resolved = resolve_identity()["agent"]
+    claim = (claimed or "").strip()
+    if claim and claim != "PRIMARY_AGENT" and claim != resolved:
+        return resolved, f"[RA] You wrote --agent {claim}, but you are {resolved}. Records use {resolved}."
+    return resolved, None
+
+
+def _agent(args: argparse.Namespace) -> str:
+    """Resolved identity for this command; warns once when the --agent claim differs."""
+    if not hasattr(args, "_agent_resolved"):
+        claim = (getattr(args, "agent", None) or "").strip()
+        resolved, warning = agent_of(claim)
+        if warning:
+            sys.stderr.buffer.write((warning + "\n").encode("utf-8", "replace"))
+            sys.stderr.buffer.flush()
+        args._agent_resolved = resolved
+        args._agent_claimed = claim if warning else ""
+    return args._agent_resolved
+
+
+def _claimed(args: argparse.Namespace) -> Dict[str, str]:
+    _agent(args)
+    return {"agent_claimed": args._agent_claimed} if args._agent_claimed else {}
+
+
+def ensure_initialized(workspace: Path, agent_id: Optional[str] = None, claimed: Optional[str] = None) -> Dict[str, Any]:
+    agent_id = agent_id or resolve_identity()["agent"]
     rdir = get_research_dir(workspace)
     templates_dir = get_skill_root() / "resources" / "templates"
     for subdir in ["hypotheses", "sandbox", "graveyard", "library"]:
@@ -279,7 +350,7 @@ def ensure_initialized(workspace: Path, agent_id: str = "PRIMARY_AGENT") -> Dict
     state_path = get_state_path(workspace)
     if not state_path.exists():
         state = {
-            "version": "1.5.0",
+            "version": RA_VERSION,
             "created_at": ts,
             "updated_at": ts,
             "current_stage": "STAGE_0_INTAKE_AND_SYNC",
@@ -299,6 +370,7 @@ def ensure_initialized(workspace: Path, agent_id: str = "PRIMARY_AGENT") -> Dict
                 {
                     "timestamp": ts,
                     "agent": agent_id,
+                    **({"agent_claimed": claimed} if claimed else {}),
                     "event": "INIT",
                     "details": "Initialized RA research structure.",
                 }
@@ -612,13 +684,50 @@ def print_context_refresh(workspace: Path, state: Dict[str, Any]) -> None:
 def cmd_init(args: argparse.Namespace) -> None:
     workspace = Path(args.workspace).resolve()
     rdir = get_research_dir(workspace)
-    agent_id = args.agent or "PRIMARY_AGENT"
-    state = ensure_initialized(workspace, agent_id=agent_id)
+    agent_id = _agent(args)
+    state = ensure_initialized(workspace, agent_id=agent_id, claimed=_claimed(args).get("agent_claimed"))
     if args.project_name and state.get("project_name") != args.project_name.strip():
         state["project_name"] = args.project_name.strip()
         save_state(workspace, state)
     print(f"[RA GATE] Initialized research repository at: {rdir}")
     print_context_refresh(workspace, state)
+    _session_start(workspace, state)
+
+
+def _inject(moment: str, stream: Any = None, **facts: Any) -> None:
+    """Print an injection template as UTF-8 (survives a cp932 console)."""
+    stream = stream or sys.stdout
+    stream.flush()
+    stream.buffer.write((render_injection(moment, **facts).rstrip("\n") + "\n").encode("utf-8", "replace"))
+    stream.buffer.flush()
+
+
+def _session_start(workspace: Path, state: Dict[str, Any]) -> None:
+    _inject("session-start", workspace=workspace.as_posix(), identity=resolve_identity()["agent"],
+            stage=state.get("current_stage", "STAGE_0_INTAKE_AND_SYNC"))
+
+
+def check_sub_agent_models(workspace: Path) -> None:
+    """OpenCode can't restrict `subagent model=`, so flag sub-sessions on a model nobody granted (LAB_LOG once each)."""
+    hits = unapproved_models(workspace)
+    if not hits:
+        return
+    lines = ["!" * 78] + [f"[RA] UNAPPROVED MODEL USED: {m} in sub-session {sid}" for m, sid in hits]
+    lines += ["     A sub-agent on another model is another agent. The user never granted it. Tell the user now;",
+              "     don't use its output. Grant only with their words: ra_gate.py allow-agent --agent opencode:<model> ...",
+              "!" * 78]
+    sys.stdout.flush()
+    sys.stdout.buffer.write(("\n".join(lines) + "\n").encode("utf-8", "replace"))
+    sys.stdout.buffer.flush()
+    rdir = get_research_dir(workspace)
+    lab_log = rdir / "LAB_LOG.md"
+    if not lab_log.exists():
+        return
+    logged = read_md(lab_log)
+    for m, sid in hits:
+        if f"sub-session `{sid}`" not in logged:
+            append_lab_log_row(rdir, now_iso(), f"| `-` | `-` | `{resolve_identity()['agent']}` | `UNAPPROVED MODEL` | "
+                                                f"`{m}` ran in sub-session `{sid}` without a user grant | `-` |")
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -632,6 +741,8 @@ def cmd_status(args: argparse.Namespace) -> None:
     state = load_state(workspace)
     if not args.scoreboard:
         print_context_refresh(workspace, state)
+        _session_start(workspace, state)
+        check_sub_agent_models(workspace)
         return
     hyp = (args.hypothesis or "").strip() or state.get("active_hypothesis")
     if not hyp:
@@ -643,6 +754,7 @@ def cmd_status(args: argparse.Namespace) -> None:
         for line in sb_lock_instructions(state, hyp):
             print(f"    {line}")
     print("=" * 78)
+    check_sub_agent_models(workspace)
 
 
 def cmd_check_question(args: argparse.Namespace) -> None:
@@ -727,7 +839,7 @@ def cmd_map_context(args: argparse.Namespace) -> None:
     rdir = get_research_dir(workspace)
     wmap_path = rdir / "WORKFLOW_MAP.md"
 
-    agent_id = args.agent or "PRIMARY_AGENT"
+    agent_id = _agent(args)
     ts = now_iso()
 
     # Validate everything first: a refusal must not leave a half-applied revoke behind.
@@ -823,7 +935,7 @@ def cmd_map_context(args: argparse.Namespace) -> None:
             protected.remove(rnode)
         protected_hashes.pop(rnode, None)
         state.setdefault("revoked_protected_history", []).append(
-            {"node": rnode, "revoked_by": agent_id, "revoked_at": ts, "reason": reason}
+            {"node": rnode, "revoked_by": agent_id, **_claimed(args), "revoked_at": ts, "reason": reason}
         )
         append_self_learning(
             rdir,
@@ -852,6 +964,7 @@ def cmd_map_context(args: argparse.Namespace) -> None:
     state["protected_node_hashes"] = protected_hashes
     state["context_map_snapshot"] = {
         "agent": agent_id,
+        **_claimed(args),
         "timestamp": ts,
         "tracked_files": tracked,
     }
@@ -871,6 +984,7 @@ def cmd_map_context(args: argparse.Namespace) -> None:
         {
             "timestamp": ts,
             "agent": agent_id,
+            **_claimed(args),
             "event": "MAP_CONTEXT",
             "tracked_files": list(tracked.keys()),
             "protected_nodes": protected,
@@ -980,7 +1094,7 @@ def cmd_new_hypothesis(args: argparse.Namespace) -> None:
 
     block_on_integrity(workspace, state, "new-hypothesis")
 
-    agent_id = args.agent or "PRIMARY_AGENT"
+    agent_id = _agent(args)
     ts = now_iso()
     fals_count = state.get("consecutive_falsifications", 0)
     approval = (args.user_approved or "").strip()
@@ -1055,7 +1169,7 @@ def cmd_new_hypothesis(args: argparse.Namespace) -> None:
     state["visual_audit_passed"] = False
     state["log_audit_passed"] = False
     state.setdefault("history", []).append(
-        {"timestamp": ts, "agent": agent_id, "event": "NEW_HYPOTHESIS", "hypothesis": full_id, "parent": parent_id}
+        {"timestamp": ts, "agent": agent_id, **_claimed(args), "event": "NEW_HYPOTHESIS", "hypothesis": full_id, "parent": parent_id}
     )
     save_state(workspace, state)
     print(f"[RA GATE] Created Hypothesis `{full_id}` and quarantined sandbox `research/sandbox/{full_id}/`.")
@@ -1253,6 +1367,8 @@ def cmd_advance(args: argparse.Namespace) -> None:
     save_state(workspace, state)
     print(f"[RA GATE] Advanced `{active_hyp}` to {state['current_stage']}.")
     print_context_refresh(workspace, state)
+    if state["current_stage"] == "STAGE_3_SANDBOX_PROTOTYPE":
+        _inject("before-build", workspace=workspace.as_posix(), approach=active_hyp)
 
 
 def append_self_learning(
@@ -1347,7 +1463,7 @@ def cmd_conclude(args: argparse.Namespace) -> None:
         for v in verify_integrity(workspace, state):
             print(f"[RA GATE] WARNING (still archiving the sandbox): {v}", file=sys.stderr)
 
-    agent_id = args.agent or "PRIMARY_AGENT"
+    agent_id = _agent(args)
     ts = now_iso()
     hyp_dir = safe_research_path(rdir, "hypotheses", active_hyp)
     sandbox_dir = safe_research_path(rdir, "sandbox", active_hyp)
@@ -1433,6 +1549,17 @@ def cmd_graduate(args: argparse.Namespace) -> None:
             f"          ({problem})",
             1,
         )
+    ans = Path(args.answers) if args.answers else None
+    why = answers_problem(workspace, ans, "before-graduation")
+    if why:
+        nxt = next_answers_file(workspace, "before-graduation")
+        sys.stderr.buffer.write((
+            f"[RA GATE] BLOCKED: graduate: {why}\n"
+            f"  TO FIX, in one try: write {nxt} answering every numbered question below, then re-run:\n"
+            f"  ra_gate.py graduate --workspace . --user-approved \"{approval}\" --answers {nxt}\n"
+        ).encode("utf-8", "replace"))
+        _inject("before-graduation", sys.stdout, approach=active_hyp, workspace=workspace.as_posix())
+        sys.exit(1)
     block_on_integrity(workspace, state, "graduate")
     stale = [tool for flag, tool in PASS_FLAGS.items() if not state.get(flag)]
     if stale:
@@ -1442,7 +1569,7 @@ def cmd_graduate(args: argparse.Namespace) -> None:
             1,
         )
 
-    agent_id = args.agent or "PRIMARY_AGENT"
+    agent_id = _agent(args)
     ts = now_iso()
     lib_note = safe_research_path(rdir, "library", f"GRADUATED_{active_hyp}.md")
     report_path = safe_research_path(rdir, "hypotheses", active_hyp) / "REPORT.md"
@@ -1464,7 +1591,7 @@ def cmd_graduate(args: argparse.Namespace) -> None:
     )
 
     state.setdefault("graduations", []).append(
-        {"hypothesis": active_hyp, "timestamp": ts, "agent": agent_id, "user_approved": approval}
+        {"hypothesis": active_hyp, "timestamp": ts, "agent": agent_id, **_claimed(args), "user_approved": approval}
     )
     state["current_stage"] = "STAGE_0_INTAKE_AND_SYNC"
     state["active_hypothesis"] = None
@@ -1472,6 +1599,7 @@ def cmd_graduate(args: argparse.Namespace) -> None:
     state["visual_audit_passed"] = False
     state["log_audit_passed"] = False
     save_state(workspace, state)
+    record_answers_used(workspace, ans, "before-graduation")
     print(f"[RA GATE] Graduated `{active_hyp}` into `research/library/GRADUATED_{active_hyp}.md`!")
     print_context_refresh(workspace, state)
 
@@ -1529,11 +1657,11 @@ def cmd_unseal(args: argparse.Namespace) -> None:
     if problem:
         gate_error(f"[RA GATE] BLOCKED: unseal needs a real justification. {problem}")
 
-    agent_id = args.agent or "PRIMARY_AGENT"
+    agent_id = _agent(args)
     reason = args.reason.strip()
     meta = sealed.pop(key)
     state.setdefault("unsealed_history", []).append(
-        {"file": key, "sha256": meta.get("sha256"), "unsealed_at": now_iso(), "agent": agent_id, "reason": reason}
+        {"file": key, "sha256": meta.get("sha256"), "unsealed_at": now_iso(), "agent": agent_id, **_claimed(args), "reason": reason}
     )
     append_self_learning(
         rdir,
@@ -1554,7 +1682,7 @@ def cmd_learn(args: argparse.Namespace) -> None:
     append_self_learning(
         rdir,
         args.hypothesis or "GENERAL",
-        args.agent or "PRIMARY_AGENT",
+        _agent(args),
         args.issue,
         args.workflow,
         args.found,
@@ -1594,7 +1722,7 @@ def cmd_stop_rule(args: argparse.Namespace) -> None:
             append_self_learning(
                 rdir,
                 state.get("active_hypothesis") or comp,
-                args.agent or "PRIMARY_AGENT",
+                _agent(args),
                 f"Component `{comp}` reached hard Stop Rule ({f_rounds}/{m_rounds} failed unseen rounds).",
                 "Avoided infinite `fail -> fix -> retest` rabbit hole on a brittle heuristic.",
                 f"Triggered `If It Never Works` Pivot Plan for `{comp}`: {sr.get('if_never_works')}",
@@ -1693,7 +1821,7 @@ def cmd_stop_rule(args: argparse.Namespace) -> None:
         append_self_learning(
             rdir,
             state.get("active_hypothesis") or comp,
-            args.agent or "PRIMARY_AGENT",
+            _agent(args),
             f"Stop Rule for `{comp}` reset at {old.get('failed_rounds', 0)}/{old.get('max_rounds', 2)} failed rounds "
             f"(status {old.get('status', 'ACTIVE')}).",
             "The failure budget was restarted explicitly instead of by silent re-registration.",
@@ -1819,7 +1947,7 @@ def cmd_re_evaluate(args: argparse.Namespace) -> None:
     append_self_learning(
         rdir,
         state.get("active_hypothesis") or comp,
-        args.agent or "PRIMARY_AGENT",
+        _agent(args),
         f"Previous calculation on `{comp}` failed: {why_failed}",
         f"Replaced trial-and-error retry with new calculation: {new_calc}",
         f"Deterministic separation proof: {why_diff}",
@@ -1941,7 +2069,7 @@ def cmd_cold_review(args: argparse.Namespace) -> None:
     if verdict != "SWITCH" and nxt:
         gate_error(f"[RA GATE] REFUSED: `--next-approach` only applies to SWITCH; the review's last verdict is {verdict}.")
     ap = sb["approaches"].setdefault(locked, {"rounds": [], "status": "PLATEAUED"})
-    agent_id = args.agent or "PRIMARY_AGENT"
+    agent_id = _agent(args)
     ts = now_iso()
     n = len(sb["cold_reviews"]) + 1
     moved_to = ""
@@ -2024,7 +2152,7 @@ def cmd_cold_review(args: argparse.Namespace) -> None:
         f"{_table_cell(str(lock.get('reason')))}" + (f" -> `{nxt}`" if nxt else "") + f" | `{rel}` |",
     )
     state.setdefault("history", []).append(
-        {"timestamp": ts, "agent": agent_id, "event": "COLD_REVIEW", "hypothesis": hyp, "verdict": verdict, "file": rel}
+        {"timestamp": ts, "agent": agent_id, **_claimed(args), "event": "COLD_REVIEW", "hypothesis": hyp, "verdict": verdict, "file": rel}
     )
     save_state(workspace, state)
 
@@ -2067,7 +2195,7 @@ def cmd_decide(args: argparse.Namespace) -> None:
     ts = now_iso()
     n = existing.count("\n## D-") + 1
     hyp = state.get("active_hypothesis") or "GENERAL"
-    entry = f"\n## D-{n:03d} - {ts[:10]} ({hyp})\n- **When / Agent**: `{ts}` / `{args.agent or 'PRIMARY_AGENT'}`\n" + body
+    entry = f"\n## D-{n:03d} - {ts[:10]} ({hyp})\n- **When / Agent**: `{ts}` / `{_agent(args)}`\n" + body
     rdir.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         if not path.exists() or path.stat().st_size == 0:
@@ -2075,6 +2203,96 @@ def cmd_decide(args: argparse.Namespace) -> None:
         f.write(entry)
     print(f"[RA GATE] Recorded D-{n:03d} in `research/DECISIONS.md`: {what}")
     print("          An AI decision is a reversible suggestion, not law. If the user said it, record it with `directive`.")
+
+
+def cmd_remove(args: argparse.Namespace) -> None:
+    """The one delete door: checked, then moved to research/.trash/ (never really deleted)."""
+    workspace = Path(args.workspace).resolve()
+    rdir = get_research_dir(workspace)
+    raws = list(args.path or [])
+    zones = [classify_delete_path(workspace, r) for r in raws]
+    shown = ", ".join(z[1] for z in zones) or "(none)"
+
+    def refuse(why: str) -> None:
+        sys.stderr.buffer.write(f"[RA GATE BLOCKED] remove: {why}\n".encode("utf-8", "replace"))
+        sys.stdout.buffer.write((render_injection("before-delete", targets=shown, workspace=workspace.as_posix()) + "\n").encode("utf-8", "replace"))
+        sys.stdout.buffer.flush()
+        sys.stderr.buffer.flush()
+        sys.exit(1)
+
+    ident = resolve_identity()
+    if ident.get("is_subagent"):
+        who = f" (you are worker `{ident['worker']}`)" if ident.get("worker") else ""
+        refuse(f"workers cannot remove{who}; list it in your report; the manager removes it.")
+    if not raws:
+        refuse("no --path given.")
+    quote = (args.user_quote or "").strip()
+    for (zone, resolved), raw in zip(zones, raws):
+        if zone == "protected":
+            refuse(f"{resolved} is a protected record; it is never removed, even with a quote.")
+        if zone == "outside":
+            refuse(f"{resolved} is outside the workspace; never removed.")
+        if zone == "workspace" and len(quote) < 8:
+            refuse(f"{resolved} is in the workspace but outside research/; needs --user-quote with the user's exact words (8+ chars).")
+        if not os.path.lexists(resolved):
+            refuse(f"{resolved} does not exist.")
+    ans = Path(args.answers) if args.answers else None
+    why = answers_problem(workspace, ans, "before-delete")
+    if why:
+        refuse(why)
+    ws_real = os.path.realpath(str(workspace))
+    text = ans.read_text(encoding="utf-8-sig", errors="replace")
+    rels = [_inside(r.replace("/", os.sep), ws_real) or r for _, r in zones]
+    unnamed = list(dict.fromkeys(r for r in rels if not names_path(text, r)))
+    if unnamed:
+        refuse(f"the answers do not name {', '.join(unnamed)}; question 1 must list every path you remove, "
+               "workspace-relative, exactly as here.")
+
+    ts = dt.datetime.now()
+    stamp = ts.strftime("%Y%m%d-%H%M%S")
+    trash = rdir / ".trash" / stamp
+    n = 2
+    while trash.exists():
+        trash = rdir / ".trash" / f"{stamp}-{n}"
+        n += 1
+    agent = _agent(args)
+    # Unique targets only, and drop any nested under another target (the parent's move carries it).
+    items, seen = [], set()
+    for zone, resolved in zones:
+        key = os.path.normcase(resolved).replace("\\", "/")
+        if key not in seen:
+            seen.add(key)
+            items.append((zone, resolved))
+    keys = [os.path.normcase(r).replace("\\", "/").rstrip("/") + "/" for _, r in items]
+    items = [it for i, it in enumerate(items) if not any(i != j and keys[i].startswith(keys[j]) for j in range(len(items)))]
+    entries: List[Dict[str, Any]] = []
+    mpath = trash / "MANIFEST.json"
+    failure = None
+    try:
+        for zone, resolved in items:
+            rel = _inside(resolved.replace("/", os.sep), ws_real)
+            dest = trash / (rel or Path(resolved).name)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(resolved, str(dest))
+            entries.append({"original": resolved, "moved_to": dest.as_posix(), "agent": agent,
+                            "answers_file": str(ans), "user_quote": quote if zone == "workspace" else "",
+                            "time": ts.isoformat(timespec="seconds"), **_claimed(args)})
+    except Exception as exc:  # whatever already moved must still be recorded
+        failure = exc
+    finally:
+        if entries:
+            record_answers_used(workspace, ans, "before-delete")
+            mpath.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
+            lab_log = rdir / "LAB_LOG.md"
+            if lab_log.exists():
+                with lab_log.open("a", encoding="utf-8") as f:
+                    f.write(f"| `{now_iso()}` | `-` | `-` | `{agent}` | `remove` | Moved {len(entries)} item(s) to trash | `{mpath.as_posix()}` |\n")
+    for e in entries:
+        print(f"[RA GATE] Moved {e['original']} -> {e['moved_to']} (recoverable)")
+    if entries:
+        print(f"[RA GATE] Manifest: {mpath.as_posix()}")
+    if failure is not None:
+        gate_error(f"[RA GATE] remove stopped part-way: {failure}. Items listed above were moved and recorded.", 1)
 
 
 def cmd_directive(args: argparse.Namespace) -> None:
@@ -2111,13 +2329,97 @@ def cmd_directive(args: argparse.Namespace) -> None:
     entry = (
         f"\n## U-{n:03d}\n"
         + "".join(f"> {ln}".rstrip() + "\n" for ln in quote.splitlines())
-        + f"- **Source**: {source}\n- **Recorded**: `{now_iso()}` / `{args.agent or 'PRIMARY_AGENT'}`\n"
+        + f"- **Source**: {source}\n- **Recorded**: `{now_iso()}` / `{_agent(args)}`\n"
     )
     with path.open("a", encoding="utf-8") as f:
         if not existing.strip():
             f.write(DIRECTIVES_HEADER + "\n")
         f.write(entry)
     print(f"[RA GATE] Recorded U-{n:03d} in `research/DIRECTIVES.md` (the user's words, verbatim, from {source}).")
+
+
+def refresh_opencode_rules(workspace: Path, agent: str = "") -> bool:
+    """Re-merge the OpenCode rules after a grant change, only where RA already wrote them. False (with a warning) on failure."""
+    import ra_forge
+    if not ra_forge.opencode_rules_present(workspace):
+        return True
+    try:
+        ra_forge.merge_opencode_permissions(workspace, granted_agents(workspace))
+        return True
+    except SystemExit as exc:
+        clis = ra_forge.OPENCODE_HARNESS_CLIS.get(canonical_harness(agent), ())
+        model = agent.partition(":")[2].strip()
+        names = ", ".join(f"`allow {c} *{f' -m {model} *' if model else ''}`" for c in clis) or "an `allow <cli> *` rule"
+        print(f"[RA GATE] WARNING: the OpenCode rules were NOT updated ({exc}).\n"
+              f"          The old rule(s) {names} in `.opencode/opencode.jsonc` may still be live, so this grant change is not enforced there.\n"
+              "          Fix the file (remove comments / bad JSON), then run `ra_gate.py opencode-rules --workspace <dir>` to retry.",
+              file=sys.stderr)
+        return False
+
+
+def cmd_opencode_rules(args: argparse.Namespace) -> None:
+    """Re-sync the OpenCode deny rules with the current grants; safe to run any time."""
+    workspace = Path(args.workspace).resolve()
+    import ra_forge
+    if not ra_forge.opencode_rules_present(workspace):
+        print("[RA GATE] No RA-written OpenCode rules in this project; nothing to refresh (run ra_forge.py first).")
+        return
+    if not refresh_opencode_rules(workspace):
+        sys.exit(1)
+    print("[RA GATE] OpenCode rules re-synced with `research/AGENT_PERMISSIONS.json`.")
+
+
+def cmd_allow_agent(args: argparse.Namespace) -> None:
+    """Record the user's grant for one agent to be used as a worker; the user's quote is required."""
+    workspace = Path(args.workspace).resolve()
+    load_state(workspace, auto_init=True)
+    quote, source = (args.quote or "").strip(), (args.source or "").strip()
+    if len(quote) < 8:
+        gate_error("[RA GATE BLOCKED] allow-agent: `--quote` must be the user's exact words (>= 8 chars). No quote, no grant.", 1)
+    if len(source) < 3:
+        gate_error("[RA GATE BLOCKED] allow-agent: `--source` must say when/where the user said it.", 1)
+    harness_wide = bool(canonical_harness(args.agent)) and not args.agent.partition(":")[2].strip()
+    if harness_wide and quote_names_harness(quote, args.agent) and not quote_names_agent(quote, args.agent):
+        gate_error(
+            f"[RA GATE BLOCKED] allow-agent: a grant for every {canonical_harness(args.agent)} model needs the user's "
+            "words to say so; otherwise ask the user which model.", 1)
+    if not quote_names_agent(quote, args.agent):
+        gate_error(
+            "[RA GATE BLOCKED] allow-agent: the user has not named this agent in their words; ask the user, "
+            "don't grant it yourself.\n"
+            f"  A grant quotes the user naming both the harness and the model of `{args.agent}`. Never pick a model "
+            "yourself, and never list model catalogues to find one.", 1)
+    ans = Path(args.answers) if args.answers else None
+    why = answers_problem(workspace, ans, "before-other-agent")
+    if why:
+        nxt = next_answers_file(workspace, "before-other-agent")
+        sys.stderr.buffer.write((
+            f"[RA GATE BLOCKED] allow-agent: {why}\n"
+            f"  TO FIX, in one try: write {nxt} answering every numbered question below, then re-run:\n"
+            f"  ra_gate.py allow-agent --workspace . --agent {args.agent} --quote \"{quote}\" --source \"{source}\" "
+            f"--answers {nxt}\n"
+        ).encode("utf-8", "replace"))
+        _inject("before-other-agent", sys.stdout, agent=args.agent, identity=resolve_identity()["agent"])
+        sys.exit(1)
+    # --agent here is the grantee, so it is no identity claim: the grantor is whoever runs this.
+    grantor = resolve_identity()["agent"]
+    try:
+        grant_agent(workspace, args.agent, quote, source, granted_by=grantor)
+    except ValueError as exc:
+        gate_error(f"[RA GATE BLOCKED] allow-agent: {exc}", 1)
+    record_answers_used(workspace, ans, "before-other-agent")
+    refresh_opencode_rules(workspace, args.agent)
+    print(f"[RA GATE] Granted `{args.agent}` in `research/AGENT_PERMISSIONS.json` (recorded by `{grantor}`).")
+    for line in grant_scope(args.agent).splitlines():
+        print(f"          {line}")
+
+
+def cmd_revoke_agent(args: argparse.Namespace) -> None:
+    workspace = Path(args.workspace).resolve()
+    if not revoke_agent(workspace, args.agent):
+        gate_error(f"[RA GATE] No active grant for `{args.agent}` in `research/AGENT_PERMISSIONS.json`.", 1)
+    refresh_opencode_rules(workspace, args.agent)
+    print(f"[RA GATE] Revoked `{args.agent}`.")
 
 
 def cmd_ceiling(args: argparse.Namespace) -> None:
@@ -2166,12 +2468,12 @@ def cmd_ceiling(args: argparse.Namespace) -> None:
             f"[RA GATE BLOCKED] Raising `{fam}`'s ceiling from {fmt_score(old.get('estimate'))} past the target needs new "
             "evidence: write the new `--basis` (what you computed or measured since)."
         )
-    agent_id = args.agent or "PRIMARY_AGENT"
+    agent_id = _agent(args)
     ts = now_iso()
     ap = sb["approaches"].setdefault(fam, {"rounds": [], "status": "RACING"})
     if old:
         ap.setdefault("ceiling_history", []).append(old)
-    ap["ceiling"] = {"estimate": est, "basis": basis, "at": ts, "agent": agent_id}
+    ap["ceiling"] = {"estimate": est, "basis": basis, "at": ts, "agent": agent_id, **_claimed(args)}
     if stepping:
         ap["ceiling"]["stepping_stone"] = stepping
     status = ap.get("status", "RACING")
@@ -2180,7 +2482,7 @@ def cmd_ceiling(args: argparse.Namespace) -> None:
     elif status == "CANT_REACH":
         ap["status"] = "RACING"
     state.setdefault("history", []).append(
-        {"timestamp": ts, "agent": agent_id, "event": "CEILING", "hypothesis": hyp, "approach": fam, "estimate": est,
+        {"timestamp": ts, "agent": agent_id, **_claimed(args), "event": "CEILING", "hypothesis": hyp, "approach": fam, "estimate": est,
          "stepping_stone": bool(stepping)}
     )
     save_state(workspace, state)
@@ -2306,15 +2608,40 @@ def cmd_review(args: argparse.Namespace) -> None:
     nexts = [_line_text(m) for m in _NEXT_RE.finditer(text) if len(_line_text(m)) >= 5]
     if not nexts:
         problems.append("it has no `NEXT: <the next step>` line.")
+    ans_body = answers_section(text, "Answers")
+    if not ans_body.strip():
+        problems.append("it has no `## Answers` section answering the review-meeting questions below (1., 2., 3.).")
+    else:
+        problems.extend(f"## Answers: {p}" for p in check_answers(ans_body, "review-meeting"))
+    # A natively dispatched worker skipped return-baton: its handover answers are checked here.
+    unanswered: List[Tuple[str, Dict[str, Any]]] = []
+    for w, entry in pending:
+        rp = workspace / worker_report_rel(w)
+        if handover_settled(entry) or (rp.is_file() and not handover_problems(read_md(rp))):
+            continue
+        sec = answers_section(text, f"Handover answers ({w})")
+        bad = check_answers(sec, "worker-handover") if sec.strip() else []
+        if not sec.strip():
+            problems.append(f"worker `{w}`'s report has no accepted `## Handover answers`: the worker answers the questions "
+                            f"below in {worker_report_rel(w)}, or this review carries them under `## Handover answers ({w})`.")
+        problems.extend(f"## Handover answers ({w}): {p}" for p in bad)
+        if bad or not sec.strip():
+            unanswered.append((w, entry))
     if problems:
         print(f"[RA GATE] REFUSED review `{rel}`:", file=sys.stderr)
         for p in problems:
             print(f"  - {p}", file=sys.stderr)
+        sys.stderr.flush()
+        for w, entry in unanswered:
+            sys.stderr.buffer.write((render_injection("worker-handover", worker=w, task=entry.get("task") or "(see the worker's brief)",
+                                                      workspace=workspace.as_posix()).rstrip("\n") + "\n").encode("utf-8", "replace"))
+        sys.stderr.buffer.write((render_review_meeting(workspace, state).rstrip("\n") + "\n").encode("utf-8", "replace"))
+        sys.stderr.buffer.flush()
         sys.exit(2)
 
     n = len(reviews) + 1
     ts = now_iso()
-    agent_id = args.agent or "PRIMARY_AGENT"
+    agent_id = _agent(args)
     nxt = nexts[-1]
     notes: List[str] = []
     restart = ""
@@ -2357,7 +2684,7 @@ def cmd_review(args: argparse.Namespace) -> None:
         notes.extend(f"`{f}` {verb}" for f, verb, _ in decisions)
     summary = "; ".join(f"{f}: {verb}" for f, verb, _ in decisions)
     state.setdefault("history", []).append(
-        {"timestamp": ts, "agent": agent_id, "event": "REVIEW", "hypothesis": hyp, "n": n, "file": rel, "decisions": summary}
+        {"timestamp": ts, "agent": agent_id, **_claimed(args), "event": "REVIEW", "hypothesis": hyp, "n": n, "file": rel, "decisions": summary}
     )
     save_state(workspace, state)
     for ls in lessons:
@@ -2408,7 +2735,9 @@ def _print_board(workspace: Path, mode: str) -> None:
 
 
 def cmd_board(args: argparse.Namespace) -> None:
-    _print_board(Path(args.workspace).resolve(), "summary" if args.summary else "full")
+    workspace = Path(args.workspace).resolve()
+    _print_board(workspace, "summary" if args.summary else "full")
+    check_sub_agent_models(workspace)
 
 
 def cmd_resume(args: argparse.Namespace) -> None:
@@ -2440,6 +2769,8 @@ def cmd_resume(args: argparse.Namespace) -> None:
     else:
         print("     No hypothesis is open.")
     print("  3. Do the NEXT DECISION now and report afterwards - don't ask what to do.")
+    _session_start(workspace, state)
+    check_sub_agent_models(workspace)
 
 
 def cmd_manager_edit(args: argparse.Namespace) -> None:
@@ -2453,9 +2784,9 @@ def cmd_manager_edit(args: argparse.Namespace) -> None:
     rel = workspace_rel(workspace, (workspace / args.file).resolve())
     if rel is None:
         gate_error(f"[RA GATE] REFUSED: `{args.file}` is outside the workspace.")
-    agent_id = args.agent or "PRIMARY_AGENT"
+    agent_id = _agent(args)
     state.setdefault("history", []).append(
-        {"timestamp": now_iso(), "agent": agent_id, "event": "MANAGER_EDIT_ALLOWED", "file": rel, "user_words": reason}
+        {"timestamp": now_iso(), "agent": agent_id, **_claimed(args), "event": "MANAGER_EDIT_ALLOWED", "file": rel, "user_words": reason}
     )
     save_state(workspace, state)
     shown = grant_manager_edit(workspace, rel, reason, agent_id)
@@ -2544,6 +2875,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_grad = sub.add_parser("graduate", help="Graduate a user-approved PROVEN hypothesis into research/library/")
     p_grad.add_argument("--workspace", default=".", help="Workspace root directory")
     p_grad.add_argument("--user-approved", default="", help="The user's exact sign-off words (>= 10 chars, required)")
+    p_grad.add_argument("--answers", default="", help="research/answers/before-graduation_<n>.md (every question answered)")
     p_grad.add_argument("--agent", default="PRIMARY_AGENT", help="Agent or session ID")
     p_grad.set_defaults(func=cmd_graduate)
 
@@ -2636,6 +2968,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_dec.add_argument("--agent", default="PRIMARY_AGENT", help="Agent or session ID")
     p_dec.set_defaults(func=cmd_decide)
 
+    p_rm = sub.add_parser(
+        "remove", help="The only delete door: checked, then moved to research/.trash/ (recoverable)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="protected records (never removed, even with a quote):\n"
+               + "\n".join(f"  {x.strip()}" for x in protected_list().split(";"))
+               + "\noutside the workspace: always refused. Elsewhere in the workspace: needs --user-quote.",
+    )
+    p_rm.add_argument("--workspace", default=".", help="Workspace root directory")
+    p_rm.add_argument("--path", action="append", required=True, help="Item to remove (repeatable)")
+    p_rm.add_argument("--answers", default="", help="research/answers/before-delete_<n>.md")
+    p_rm.add_argument("--user-quote", default="", help="User's exact words, needed outside research/")
+    p_rm.add_argument("--agent", default="PRIMARY_AGENT", help="Agent or session ID")
+    p_rm.set_defaults(func=cmd_remove)
+
     p_re = sub.add_parser(
         "re-evaluate",
         help="Mandatory First-Principles Re-Evaluation Gate to unlock `ra_log_engine.py run` after a failed attempt (blocks lazy 'let's retry' loops)",
@@ -2667,6 +3013,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_dir.add_argument("--list", action="store_true", help="Print every recorded directive")
     p_dir.add_argument("--agent", default="PRIMARY_AGENT", help="Agent or session ID")
     p_dir.set_defaults(func=cmd_directive)
+
+    p_allow = sub.add_parser("allow-agent", help="Record the user's grant to use another agent as a worker (needs their quote)")
+    p_allow.add_argument("--workspace", default=".", help="Workspace root directory")
+    p_allow.add_argument("--agent", required=True, help="<harness>:<model>, e.g. opencode:llamacpp/qwen3.8-flash-next")
+    p_allow.add_argument("--quote", default=None, help="The user's exact words granting it (>= 8 chars)")
+    p_allow.add_argument("--source", default=None, help="When/where the user said it")
+    p_allow.add_argument("--answers", default="", help="research/answers/before-other-agent_<n>.md (every question answered)")
+    p_allow.set_defaults(func=cmd_allow_agent)
+
+    p_revoke = sub.add_parser("revoke-agent", help="Switch off a granted agent")
+    p_revoke.add_argument("--workspace", default=".", help="Workspace root directory")
+    p_revoke.add_argument("--agent", required=True, help="<harness>:<model> as granted")
+    p_revoke.set_defaults(func=cmd_revoke_agent)
+
+    p_ocr = sub.add_parser("opencode-rules", help="Re-sync the project's OpenCode deny rules with the current agent grants")
+    p_ocr.add_argument("--workspace", default=".", help="Workspace root directory")
+    p_ocr.set_defaults(func=cmd_opencode_rules)
 
     p_ceil = sub.add_parser(
         "ceiling", help="Store an approach family's paper ceiling; one that can't reach the target refuses its runs"

@@ -64,7 +64,7 @@ When your algorithm, neural network, or system design cannot solve a case withou
 Failed experiments leave behind dead variables, half-baked abstractions, and confusing comments that poison future reasoning.
 
 1. **Quarantine Every Hypothesis**: Build and test every hypothesis inside `research/sandbox/Hxxx_<slug>/` (or an isolated git worktree/branch).
-2. **Clean Revert on Falsification**: When `Hxxx` is falsified, move its code and logs to `research/graveyard/Hxxx_<slug>/` and ensure the main project directory remains untouched.
+2. **Clean Revert on Falsification**: When `Hxxx` is falsified, move its code and logs to `research/graveyard/Hxxx_<slug>/` (never delete; if something must go, use `ra_gate.py remove`) and ensure the main project directory remains untouched.
 3. **Never Stack Unproven Hypotheses**: Do not build `H002` on top of dirty, broken leftovers from `H001`. Start `H002` from a clean slate informed by `H001`'s lab report.
 
 ---
@@ -83,4 +83,4 @@ The following are classified as **Illicit Band-Aids** and will fail `ra_cheese_a
 ### Mandatory Pipe-Replacement Protocol
 1. **Symptom $\neq$ Cause (Protect Innocent Functions)**: A leak at `Function A` (line 300) often means the pipe pressure or state producer failed upstream at `Function C` (line 50). Never blindly mutate `Function A` if it is working properly—lock `Function A` as `PROTECTED_WORKING` in `research/WORKFLOW_MAP.md`.
 2. **Trace the Full Multi-Hop Workflow (`Stage 1`)**: Map upstream producers, shared state, and $N$-hop downstream consumers in `research/WORKFLOW_MAP.md` and lock all existing behavioral contracts (`BC-xxx`) so your fix does not trigger whack-a-mole regressions.
-3. **Rip Out & Replace the Pipe**: If the underlying mechanism is flawed, quarantine it, formulate a recovery hypothesis (`Hxxx_fix_<mechanism>`), redesign the upstream mechanism so the invalid state is structurally impossible, and subject it to Stage 4 Adversarial & Regression Break-Testing.
+3. **Rip Out & Replace the Pipe**: If the underlying mechanism is flawed, quarantine it (removals go through `ra_gate.py remove`), formulate a recovery hypothesis (`Hxxx_fix_<mechanism>`), redesign the upstream mechanism so the invalid state is structurally impossible, and subject it to Stage 4 Adversarial & Regression Break-Testing.

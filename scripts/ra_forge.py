@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -550,6 +551,30 @@ def render_harness(scripts_dir: Path) -> str:
     return HARNESS_PY_TEMPLATE.replace("__RA_SCRIPTS_DIR__", repr(scripts_dir.as_posix()), 1)
 
 
+AGENTS_BEGIN = "<!-- RA:BEGIN safety (written by ra_forge.py; re-forging replaces this block) -->"
+AGENTS_END = "<!-- RA:END safety -->"
+
+
+def door_text() -> str:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    import ra_common as rc
+    return rc.delete_door_text((SCRIPTS_DIR / "ra_gate.py").as_posix())
+
+
+def write_agents_md(workspace: Path) -> Path:
+    """Put RA's delete-door section into AGENTS.md: replace an earlier one, keep the user's own text."""
+    path = workspace / "AGENTS.md"
+    block = f"{AGENTS_BEGIN}\n## RA safety: deletes and moves\n\n{door_text()}{AGENTS_END}\n"
+    old = path.read_text(encoding="utf-8-sig") if path.exists() else ""
+    start, end = old.find(AGENTS_BEGIN), old.find(AGENTS_END)
+    if start >= 0 and end > start:
+        new = old[:start] + block + old[end + len(AGENTS_END):].lstrip("\n")
+    else:
+        new = old + ("\n" if old and not old.endswith("\n") else "") + ("\n" if old else "") + block
+    path.write_text(new, encoding="utf-8")
+    return path
+
+
 def build_project_skill_md(
     project_name: str,
     domain: str,
@@ -600,6 +625,8 @@ description: {description}
 ## 2. Installed Domain Skills in Project Arsenal
 {crawled_block}
 
+## Deletes and Moves: One Door
+{door_text()}
 ## 3. Mandatory Verification & Review Agent Protocol
 Before claiming any fix, feature, or hypothesis is ready:
 1. Run the executable project harness:
@@ -708,7 +735,7 @@ def _hook_group(command: str, matcher: str = "") -> Dict[str, Any]:
 def merge_claude_settings_hooks(settings_path: Path, settings: Dict[str, Any]) -> Path:
     """Append RA hooks to the user's own hooks; RA entries from earlier runs are replaced, not duplicated."""
     edit_tools = "Edit|Write|MultiEdit"
-    manager_tools = "Agent|Task|Edit|Write|MultiEdit|NotebookEdit|Bash"
+    manager_tools = "Agent|Task|Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell"
     ra_groups: List[Any] = [
         ("PreToolUse", _hook_group(ra_hook_command("pre-tool"), edit_tools)),
         ("PostToolUse", _hook_group(ra_hook_command("post-tool"), edit_tools)),
@@ -739,6 +766,223 @@ def merge_claude_settings_hooks(settings_path: Path, settings: Dict[str, Any]) -
     return settings_path
 
 
+# Which CLI names each harness grant unblocks.
+OPENCODE_HARNESS_CLIS = {"opencode": ("opencode",), "claude-code": ("claude",), "codex": ("codex",),
+                         "agy": ("agy", "antigravity", "gemini")}
+OPENCODE_RULES_SIDECAR = ".ra_rules.json"
+
+
+def opencode_config_path(workspace: Path) -> Path:
+    return Path(workspace) / ".opencode" / "opencode.jsonc"
+
+
+def _oc_rule(resource: str, effect: str) -> Dict[str, str]:
+    return {"action": "shell", "resource": resource, "effect": effect}
+
+
+# OpenCode globs: `*` crosses `/` and spaces, backslashes are normalised to `/`, and there is no word boundary.
+OPENCODE_PREFIXES = ("timeout", "nice", "env", "stdbuf", "nohup", "sudo")  # run the next command; real executables only
+OPENCODE_PREFIXED_DELETES = ("rm", "rmdir")
+OPENCODE_SHELLS = ("bash", "sh", "zsh", "cmd", "pwsh", "powershell")
+_PS_DELETES = ("remove-item", "rm", "del", "ri", "rd")
+OPENCODE_SHELL_DELETES = {"bash": ("rm", "rmdir"), "sh": ("rm", "rmdir"), "zsh": ("rm", "rmdir"),
+                          "cmd": ("del", "erase", "rd", "rmdir"), "pwsh": _PS_DELETES, "powershell": _PS_DELETES}
+# (interpreter one-liner prefix, calls that delete or move)
+_PY_CALLS = ("rmtree", "remove(", "unlink(", "rmdir(", "shutil.move", "os.rename", "os.replace")
+_JS_CALLS = ("rmSync", "unlinkSync", "rmdirSync", "renameSync")
+OPENCODE_ONE_LINERS = (("py* -*c *", _PY_CALLS), ("node *", _JS_CALLS), ("bun *", _JS_CALLS))
+OPENCODE_MOVES = ("mv", "move", "move-item", "ren")
+OPENCODE_LOOKUPS = ("where", "which", "get-command", "gcm")  # not `type`: in PowerShell it is Get-Content
+# Verified live (2.2.7): `X=1 cmd` keeps the assignment in the resource, so `cmd *` alone misses it.
+OPENCODE_ASSIGN_PREFIXED = ("rm", "rmdir")
+OPENCODE_MODEL_FLAGS = ("-m ", "--model ", "-m=", "--model=")
+# Model catalogues: the Code Mode tool (verified live: denying it removes `tools.opencode.models`) and the CLI.
+OPENCODE_CATALOGUE_DENY = ({"action": "opencode_models", "resource": "*", "effect": "deny"},)
+OPENCODE_CATALOGUE_CLI = ("models", "providers", "auth")
+# Searches and commits whose own argument text trips the leading-`*` denies (`--include=x claude`). They sit near the end
+# and can reopen only patterns that start with `*`. Some heads can run another program (`rg --pre`, `git grep -O`), so
+# OPENCODE_EVERYDAY_DENY follows them as the very last rules.
+OPENCODE_EVERYDAY_HEADS = ("grep", "egrep", "rg", "git grep", "git log", "git commit", "findstr", "Select-String", "sls")
+# Program-running forms of those heads, and command substitution inside any of them (unknown whether OpenCode's scanner
+# splits `$( )`, so this fails closed). Last in the whole list, so the deny wins over the allow above.
+OPENCODE_EVERYDAY_DENY = ("rg * --pre*", "rg --pre*", "git grep * -O*", "git grep -O*",
+                          "git grep * --open-files-in-pager*", "git grep --open-files-in-pager*")
+
+
+def _cased(name: str) -> List[str]:
+    # OpenCode folds case only on Windows; add the PowerShell spelling for the rest.
+    return [name, name.title()] if "-" in name else [name]
+
+
+def _bounded(prefix: str, word: str) -> List[str]:
+    """`<prefix> ... <word> ...` with <word> starting a word (after a space or a quote), so `perform x` is no `rm x`."""
+    return [f"{prefix} * {word} *", f"{prefix} *'{word} *", f'{prefix} *"{word} *']
+
+
+def opencode_cli_forms(cli: str) -> List[str]:
+    """Every launch form of one agent CLI the rules cover: bare, full path, package runners, inside a shell."""
+    forms = [f"{cli} *", f"*/{cli} *", f'*/{cli}"*', f"*/{cli}.exe*", f"*/{cli}.cmd*", f"*/{cli}.ps1*",
+             f"{cli}.exe*", f"{cli}.cmd*", f"{cli}.ps1*", f"npx {cli}*", f"npx -y {cli}*", f"bunx {cli}*", f"pnpx {cli}*"]
+    for sh in OPENCODE_SHELLS:
+        if sh != "zsh":
+            forms += _bounded(sh, cli)
+    return forms
+
+
+def _model_heads(cli: str) -> List[str]:
+    # Direct launches only: a shell-wrapped one (`bash -c "..."`) could hide a second command.
+    return [cli, f"*/{cli}", f"{cli}.exe", f"{cli}.cmd", f"*/{cli}.exe", f"*/{cli}.cmd", f"npx {cli}", f"npx -y {cli}",
+            f"bunx {cli}", f"pnpx {cli}", f"RA_WORKER=* {cli}"]
+
+
+def opencode_model_forms(cli: str, model: str) -> List[str]:
+    """Launch forms of one agent CLI that pass exactly this model (-m/--model, bare or quoted; quotes are kept)."""
+    out = []
+    for head in _model_heads(cli):
+        for flag in OPENCODE_MODEL_FLAGS:
+            out += [f"{head} * {flag}{model} *", f'{head} * {flag}"{model}"*', f"{head} * {flag}'{model}'*"]
+    return out
+
+
+def _grant_allows(grant: str) -> List[Dict[str, str]]:
+    """'opencode' = every form of its CLIs; 'opencode:<model>' = only forms carrying that model."""
+    harness, _, model = grant.partition(":")
+    clis = OPENCODE_HARNESS_CLIS.get(harness, ())
+    forms = [f for c in clis for f in (opencode_model_forms(c, model) if model else opencode_cli_forms(c) + [f"RA_WORKER=* {c} *"])]
+    return [_oc_rule(f, "allow") for f in forms]
+
+
+def _rules_head() -> List[Dict[str, str]]:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    import ra_common as rc
+
+    rules = [_oc_rule(f, "deny") for c in rc.SAFETY_AGENT_CLIS for f in opencode_cli_forms(c)]
+    return rules + [_oc_rule(f"*=* {c} *", "deny") for c in rc.SAFETY_AGENT_CLIS]
+
+
+def _rules_suffix() -> List[Dict[str, str]]:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    import ra_common as rc
+
+    deny = lambda r: _oc_rule(r, "deny")  # noqa: E731
+    rules = [deny(f"{h}{c} {w}*") for c in OPENCODE_HARNESS_CLIS["opencode"] for h in ("", "*/") for w in OPENCODE_CATALOGUE_CLI]
+    rules += [deny(f"{c} *") for n in rc.SAFETY_DELETE_COMMANDS for c in _cased(n)]
+    rules += [deny(f"*=* {c} *") for c in OPENCODE_ASSIGN_PREFIXED]
+    rules += [deny(r) for w in OPENCODE_PREFIXES for c in OPENCODE_PREFIXED_DELETES for r in (f"{w} {c} *", f"{w} * {c} *")]
+    rules += [deny(r) for sh, words in OPENCODE_SHELL_DELETES.items() for n in words for c in _cased(n) for r in _bounded(sh, c)]
+    rules += [deny(r) for r in ("find * -delete*", "find * -exec rm*", "xargs rm*", "xargs * rm*")]
+    rules += [deny(f"{pre}{call}*") for pre, calls in OPENCODE_ONE_LINERS for call in calls]
+    rules += [deny(r) for r in ("git clean *", "git reset --hard*", "git checkout .*", "git checkout -- *",
+                                "git checkout * -- *", "git checkout -f*", "git checkout --force*", "git restore *",
+                                "git switch --discard-changes*", "git switch -f*", "git switch --force*", "git rm *")]
+    rules += [_oc_rule("git rm --cached *", "allow"), _oc_rule("git rm -r --cached *", "allow")]
+    protected = list(rc.PROTECTED_NAMES) + [f"research/{d}" for d in rc.PROTECTED_DIRS] + ["hypotheses/*/REPORT.md"]
+    rules += [deny(f"{m} *{p}*") for n in OPENCODE_MOVES for m in _cased(n) for p in protected]
+    rules += [deny(f"{lk} {c}*") for n in OPENCODE_LOOKUPS for lk in _cased(n) for c in rc.SAFETY_AGENT_CLIS]
+    rules += [deny(f"command -v {c}*") for c in rc.SAFETY_AGENT_CLIS]
+    rules += [dict(r) for r in OPENCODE_CATALOGUE_DENY]
+    rules += [_oc_rule(f"{h} *", "allow") for h in OPENCODE_EVERYDAY_HEADS]
+    rules += [deny(r) for r in OPENCODE_EVERYDAY_DENY]
+    return rules + [deny(r) for h in OPENCODE_EVERYDAY_HEADS for r in (f"{h} *$(*", f"{h} *`*")]
+
+
+def build_opencode_rules(granted: List[str]) -> List[Dict[str, str]]:
+    """RA's rules in order: agent CLIs, one allow block per grant (a harness, or harness:model), catalogues and deletes
+    (so a granted CLI line that also deletes is still denied), then lookups. Last match wins."""
+    rules = _rules_head()
+    for grant in granted:
+        rules += _grant_allows(grant)
+    return rules + _rules_suffix()
+
+
+def _load_opencode_config(path: Path) -> Dict[str, Any]:
+    """Plain-JSON project config; comments or a bad shape abort rather than risk overwriting the user's file."""
+    data = load_json_or_abort(path, "OpenCode config")
+    if not isinstance(data.get("permissions", []), list):
+        raise SystemExit(f"[RA FORGE] ABORTED: `permissions` in `{path}` is not a list. Fix it and re-run; nothing was written.")
+    return data
+
+
+_MODEL_IN_ALLOW = re.compile(r" \* (?:-m|--model)[ =]['\"]?(.+?)['\"]?(?: \*|\*)$")
+
+
+def _is_ra_allow(rule: Any) -> bool:
+    """An allow rule RA writes for some grant (harness-wide, or one model)."""
+    if not isinstance(rule, dict) or rule.get("effect") != "allow" or rule.get("action") != "shell":
+        return False
+    res = str(rule.get("resource", ""))
+    m = _MODEL_IN_ALLOW.search(res)
+    for clis in OPENCODE_HARNESS_CLIS.values():
+        for c in clis:
+            if res in opencode_cli_forms(c) or res == f"RA_WORKER=* {c} *" or (m and res in opencode_model_forms(c, m.group(1))):
+                return True
+    return False
+
+
+def _strip_ra_tail(perms: List[Any]) -> List[Any]:
+    """Drop RA-shaped rule blocks (head, grant allows, suffix) at the end of the list (sidecar lost); repeats cover
+    duplicated blocks."""
+    head, suffix = _rules_head(), _rules_suffix()
+    while len(perms) >= len(head) + len(suffix) and perms[-len(suffix):] == suffix:
+        j = len(perms) - len(suffix)
+        while j > len(head) and _is_ra_allow(perms[j - 1]):
+            j -= 1
+        if perms[j - len(head):j] != head:
+            break
+        perms = perms[:j - len(head)]
+    return perms
+
+
+def opencode_rules_present(workspace: Path) -> bool:
+    """True when RA wrote OpenCode rules here: the sidecar exists, or the config tail holds an RA block."""
+    path = opencode_config_path(workspace)
+    if path.with_name(OPENCODE_RULES_SIDECAR).exists():
+        return True
+    try:
+        perms = json.loads(path.read_text(encoding="utf-8-sig")).get("permissions", [])
+        return isinstance(perms, list) and len(_strip_ra_tail(perms)) != len(perms)
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def merge_opencode_permissions(workspace: Path, granted: List[str]) -> Path:
+    """Write RA's deny rules into <workspace>/.opencode/opencode.jsonc (OpenCode has no pre-tool hook).
+    Verified live on OpenCode 2.2.7: top-level "permissions" is an ordered list of
+    {"action": "shell", "resource": "<glob>", "effect": "deny|allow"}; `opencode debug agents` shows it on every agent.
+    OpenCode rules carry no tag, so RA's exact rules are kept in .opencode/.ra_rules.json and stripped on re-merge."""
+    path = opencode_config_path(workspace)
+    sidecar = path.with_name(OPENCODE_RULES_SIDECAR)
+    data = _load_opencode_config(path)
+    try:
+        old = json.loads(sidecar.read_text(encoding="utf-8")) if sidecar.exists() else []
+    except (OSError, ValueError):
+        old = []
+    old = [r for r in old if isinstance(r, dict)] if isinstance(old, list) else []
+    new = build_opencode_rules(granted)
+    perms = [r for r in data.get("permissions", []) if r not in old]
+    if not old:  # sidecar missing or corrupt: find RA's block by shape so it is not duplicated
+        stripped = _strip_ra_tail(perms)
+        if len(stripped) != len(perms):
+            print(f"[RA FORGE] WARNING: `{sidecar}` was missing; replaced RA's existing rule block in `{path}`.", file=sys.stderr)
+            perms = stripped
+    data["permissions"] = perms + new
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Sidecar first, covering old and new, so a crash before the config write never leaves rules it can't find.
+    _atomic_write_text(sidecar, json.dumps(old + [r for r in new if r not in old], indent=2) + "\n")
+    if path.exists():
+        path.with_name(path.name + ".bak").write_bytes(path.read_bytes())
+    _atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    _atomic_write_text(sidecar, json.dumps(new, indent=2) + "\n")
+    return path
+
+
 def main() -> None:
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
@@ -763,6 +1007,12 @@ def main() -> None:
     state = load_json_or_abort(state_path, "RA state")
     settings_path = workspace / ".claude" / "settings.local.json"
     settings = load_claude_settings(settings_path)
+    oc_path = opencode_config_path(workspace)
+    try:
+        _load_opencode_config(oc_path)
+        oc_problem = ""
+    except SystemExit as exc:  # a commented or broken OpenCode file must not stop the Claude hooks
+        oc_problem = str(exc).replace("[RA FORGE] ABORTED: ", "")
 
     rdir.mkdir(parents=True, exist_ok=True)
 
@@ -816,6 +1066,19 @@ def main() -> None:
 
     # 4. Merge Claude Code Hooks into `.claude/settings.local.json`
     merge_claude_settings_hooks(settings_path, settings)
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    import ra_common
+    if oc_problem:
+        sys.stderr.buffer.write((
+            "!" * 78 + "\n"
+            f"[RA FORGE] WARNING: OpenCode deny rules were NOT written: {oc_problem}\n"
+            f"           On OpenCode nothing blocks shell deletes or other agents in this project until you fix\n"
+            f"           `{oc_path}` (plain JSON, no comments) and re-run ra_forge.py. Everything else was forged.\n"
+            + "!" * 78 + "\n"
+        ).encode("utf-8", "replace"))
+    else:
+        merge_opencode_permissions(workspace, ra_common.granted_agents(workspace))
+    agents_md = write_agents_md(workspace)
 
     # 5. Record in `.ra_state.json`
     if state_path.exists():
@@ -842,6 +1105,10 @@ def main() -> None:
     print(f"     - {claude_agent_path.relative_to(workspace).as_posix()} (Claude Code Subagent)")
     print(f"     - {agy_workflow_path.relative_to(workspace).as_posix()} (Antigravity / Agent Workflow)")
     print(f"     - {prompt_path.relative_to(workspace).as_posix()} (Universal Subagent Prompt)")
+    print("  4. OpenCode deny rules:")
+    print(f"     - {oc_path.relative_to(workspace).as_posix()}" + (" SKIPPED (see the WARNING above)" if oc_problem else ""))
+    print("  5. Delete door for every agent in this folder:")
+    print(f"     - {agents_md.relative_to(workspace).as_posix()} (RA section between markers; your own text kept)")
     print("=" * 78)
 
 

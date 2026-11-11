@@ -2,11 +2,9 @@
 """
 ra_context_harness.py — Multi-Platform Subagent Context Controller, `/fork` Manager & Eviction Harness.
 
-First-Class Platform Support:
-  1. `opencode` (OpenCode CLI: `opencode run --session <id> --fork` & `-f FORK_<subagent>.md`)
-  2. `claude`   (Claude Code: `claude --resume <id> --fork-session`, `/fork`, & `Task` subagent tool)
-  3. `codex`    (OpenAI Codex CLI: `codex exec fork <id>` & `codex exec -c sandbox_mode=workspace-write`)
-  4. `agy`      (Antigravity / Gemini: `invoke_subagent(Subagents=[...])`; subagents start with a clean context)
+Supported harnesses: OpenCode, Claude Code, Codex, Antigravity/Gemini.
+Dispatch with your own harness's native sub-agent tool; other harnesses or CLI forms need
+`ra_gate.py allow-agent` with the user's words.
 
 Enforces RA's Lead-Orchestrator & Context-Control Protocol:
   1. Main Agent = Lead Orchestrator / Compiler (delegates execution to Subagents even at 1-concurrency baton-pass).
@@ -35,8 +33,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -98,25 +94,33 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+# ra_common names harnesses "claude-code"; the dispatch builders here say "claude". Mapped only here.
+_PLATFORM_OF = {"opencode": "opencode", "claude-code": "claude", "codex": "codex", "agy": "agy"}
+_HARNESS_OF = {v: k for k, v in _PLATFORM_OF.items()}
+_DISPATCH_LABEL = {"opencode": "opencode", "claude": "claude-code", "codex": "codex", "agy": "agy/gemini"}
+
+
+def current_platform() -> str:
+    """The harness running this script, read from env only; 'unknown' when none is detected."""
+    common = lab()
+    harness = common.resolve_identity()["harness"] if common is not None else "unknown"
+    return _PLATFORM_OF.get(harness, "unknown")
+
+
 def detect_platform(requested: str = "auto") -> str:
+    """An explicit platform name as given, else the current harness. Never looks at PATH."""
     req = requested.lower()
-    if req in ("opencode", "claude", "codex", "agy"):
+    if req in _PLATFORM_OF.values():
         return req
-    if os.environ.get("OPENCODE") or os.environ.get("OPENCODE_SESSION"):
-        return "opencode"
-    if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_ENTRYPOINT"):
-        return "claude"
-    if os.environ.get("CODEX_HOME") or os.environ.get("CODEX_SANDBOX"):
-        return "codex"
-    if os.environ.get("ANTIGRAVITY_CLI") or os.environ.get("GEMINI_CLI"):
-        return "agy"
-    if shutil.which("opencode"):
-        return "opencode"
-    if shutil.which("claude"):
-        return "claude"
-    if shutil.which("codex"):
-        return "codex"
-    return "agy"
+    return current_platform()
+
+
+def emit(text: str, stream: Any = None) -> None:
+    """UTF-8 out even on a cp932 console."""
+    stream = stream or sys.stdout
+    stream.flush()
+    stream.buffer.write((text.rstrip("\n") + "\n").encode("utf-8", "replace"))
+    stream.buffer.flush()
 
 
 def lab() -> Any:
@@ -153,6 +157,7 @@ def load_registry(workspace: Path) -> Dict[str, Any]:
         "completed_subagent_relays": 0,
         "subagent_reports": [],
         "outstanding_forks": {},
+        "session_owners": {},
         "last_gc_at": None,
     }
     if not rp.exists():
@@ -274,27 +279,7 @@ def auto_discover_native_session_id(workspace: Path, platform: str) -> Optional[
         return env_val
 
     if platform == "opencode":
-        exe = shutil.which("opencode")  # npm installs a .cmd shim that bare-name subprocess can't launch
-        if not exe:
-            return None
-        try:
-            proc = subprocess.run(
-                [exe, "session", "list", "--format", "json", "-n", "20"],
-                cwd=str(workspace),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=15.0,  # cold start of the opencode background service takes ~7 s
-            )
-            items = json.loads(proc.stdout) if proc.returncode == 0 and proc.stdout.strip() else []
-        except (OSError, subprocess.SubprocessError, ValueError):
-            return None
-        for item in items if isinstance(items, list) else []:
-            if isinstance(item, dict) and item.get("id") and item.get("directory"):
-                if path_key(item["directory"]) == ws_key:
-                    return str(item["id"])
-        return None
+        return None  # OPENCODE_SESSION_ID or nothing: no PATH lookup, no `opencode session list`
 
     if platform == "codex":
         root = Path.home() / ".codex" / "sessions"
@@ -329,13 +314,14 @@ def build_platform_fork_instructions(
     base_session_id: Optional[str],
     model: Optional[str],
     workspace: Optional[Path] = None,
+    discover_session: bool = True,
 ) -> Dict[str, str]:
     """Generate exact context-forking commands/calls for OpenCode, Claude Code, Codex, and Antigravity/Gemini."""
     oc_model_flag = f'--model "{model}" ' if model else ""
     codex_model_flag = f'-m "{model}" ' if model else ""
 
     # A session id only means something to the platform that owns it; other platforms get a fresh subagent.
-    session = base_session_id or (auto_discover_native_session_id(workspace, platform) if workspace else None)
+    session = base_session_id or (auto_discover_native_session_id(workspace, platform) if workspace and discover_session else None)
     oc_session = session if platform == "opencode" else None
     claude_session = session if platform == "claude" else None
     codex_session = session if platform == "codex" else None
@@ -484,11 +470,75 @@ def lab_brief(common: Any, workspace: Path) -> str:
     return "\n".join(out) + "\n"
 
 
+def handover_questions(common: Any, workspace: Path, worker: str, task: str, rel_report: str) -> str:
+    """The worker-handover questions for the end of a fork brief; a worker that never sees them can't answer them."""
+    if common is None:
+        return ""
+    return (
+        "\n### Handover questions\n"
+        f"Your report `{rel_report}` MUST answer every numbered question below under a heading "
+        "`## Handover answers`. The manager will not accept the report without it.\n\n"
+        + common.render_injection("worker-handover", worker=worker, task=task, workspace=workspace.as_posix())
+    )
+
+
+def door_brief(common: Any) -> str:
+    """Where a denied rm/mv sends the worker: the manager's `ra_gate.py remove`."""
+    if common is None:
+        return ""
+    return "\n### Deletes and moves\n" + common.delete_door_text((Path(__file__).resolve().parent / "ra_gate.py").as_posix())
+
+
+def cli_models(common: Any, workspace: Path, p: str, requested: Optional[str]) -> List[Optional[str]]:
+    """Models to print a granted CLI line for on platform p: [] = none; None = no -m (a harness-wide grant)."""
+    if common is None or p not in _HARNESS_OF:
+        return []
+    harness = _HARNESS_OF[p]
+    if requested:
+        return [requested] if common.is_agent_allowed(workspace, f"{harness}:{requested}", own_harness="") else []
+    grants = common.harness_grant_models(workspace, harness)
+    return [None] if "" in grants else list(grants)
+
+
+def worker_cli_lines(label: str, name: str, cmd: str) -> List[str]:
+    """A CLI worker has no parent session, so RA_WORKER marks it; set for this one command only."""
+    if cmd.split(" ", 1)[0] not in ("opencode", "claude", "codex"):
+        return [f"    [{label:<12}] CLI (granted): {cmd}"]
+    return [f"    [{label:<12}] CLI (granted), bash      : RA_WORKER={name} {cmd}",
+            f"    [{label:<12}] CLI (granted), PowerShell: $env:RA_WORKER='{name}'; try {{ {cmd} }} "
+            "finally { $env:RA_WORKER=$null }"]
+
+
+def native_dispatch(p: str, rel_fork: str, rel_report: str, name: str) -> str:
+    """How to dispatch with this harness's own sub-agent tool (no CLI, so no grant is involved)."""
+    prompt = f"Read {rel_fork}, execute ONLY the bounded task, and write your report to {rel_report}."
+    if p == "claude":
+        return f'Agent tool (subagent_type="general-purpose", description="{name}"), prompt: "{prompt}"'
+    if p == "opencode":
+        return f'`subagent` tool with agent="general", description="{name}", prompt="{prompt}"'
+    return "use your harness's own subagent tool; point it at the brief file above."
+
+
 def cmd_fork(args: argparse.Namespace) -> None:
     workspace = Path(args.workspace).resolve()
     sdir = get_snapshots_dir(workspace)
     reg = load_registry(workspace)
     snaps = reg.get("snapshots", {})
+
+    common = lab()
+    ident = common.resolve_identity() if common is not None else {"agent": "unknown", "harness": "unknown", "session": ""}
+    own = current_platform()
+    platform = detect_platform(args.platform)
+    if platform != own and not cli_models(common, workspace, platform, args.model):
+        grants = common.harness_grant_models(workspace, _HARNESS_OF.get(platform, platform)) if common else []
+        why = (f"is granted only for model(s) {', '.join(grants)}, not `--model {args.model}`" if grants and args.model
+               else "needs the user's written grant; none is recorded")
+        emit(f"[RA CONTEXT HARNESS BLOCKED] `--platform {platform}` {why}.\n"
+             "  Ask the user. Then: ra_gate.py allow-agent --agent <harness:model> --quote \"<their exact words>\" --source \"...\"\n",
+             sys.stderr)
+        if common is not None:
+            emit(common.render_injection("before-other-agent", agent=platform, identity=ident["agent"]), sys.stderr)
+        sys.exit(1)
 
     # 1-Concurrency Baton Check: Do not allow overlapping subagents unless --parallel is explicitly passed
     active_baton = reg.get("active_baton", "MAIN_ORCHESTRATOR")
@@ -502,7 +552,6 @@ def cmd_fork(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    common = lab()
     pending = common.review_pending(workspace) if common is not None else []
     if pending:
         n = len(common.lab_reviews(workspace)) + 1
@@ -538,7 +587,6 @@ def cmd_fork(args: argparse.Namespace) -> None:
         task_desc = "\n".join(f"- {t.strip()}" for t in raw_task if t.strip()) if len(raw_task) > 1 else raw_task[0].strip()
     else:
         task_desc = str(raw_task).strip()
-    platform = detect_platform(args.platform)
 
     # Enforce Task-Sizing Gate: Real R&D tasks must be 1 atomic task per subagent
     if task_type == "REAL_RD":
@@ -583,6 +631,18 @@ def cmd_fork(args: argparse.Namespace) -> None:
     base_session_id: Optional[str] = args.base_session or next(
         (snaps[sid]["base_session_id"] for sid in requested_ids if snaps[sid].get("base_session_id")), None
     )
+    # A session that is not the manager's own belongs to the worker that ran in it (the 2026-11-11 Qwen case).
+    owners = reg["session_owners"]
+    if base_session_id and base_session_id != ident["session"]:
+        owner = owners.get(base_session_id)
+        if owner and owner != subagent_name:
+            emit(
+                f"[RA CONTEXT HARNESS BLOCKED] Session `{base_session_id}` already belongs to worker `{owner}`.\n"
+                f"  `{subagent_name}` is a different worker: one fresh worker per task. Drop --base-session, or fork "
+                f"from your own session.",
+                sys.stderr,
+            )
+            sys.exit(1)
     compiled_sections: List[str] = []
     for sid in requested_ids:
         snap_file = workspace / snaps[sid]["file"]
@@ -595,10 +655,17 @@ def cmd_fork(args: argparse.Namespace) -> None:
     rel_report = report_file.relative_to(workspace).as_posix()
 
     # Unresolved form keeps a short (8.3) cwd, which Claude Code may have used for its project folder.
-    dispatch_cmds = build_platform_fork_instructions(
-        platform, subagent_name, rel_fork, rel_report, base_session_id, args.model,
-        workspace=Path(os.path.abspath(args.workspace)),
-    )
+    # Dispatch lines: this harness, plus any the user granted. Nothing else is printed.
+    shown = [p for p in dict.fromkeys([own, platform] + [_PLATFORM_OF[h] for h in (common.granted_harnesses(workspace) if common else [])])
+             if p in _HARNESS_OF]
+    # Granted CLI lines carry the granted model's -m: a bare launch runs the default model, which nobody granted.
+    cli_lines = [
+        (p, build_platform_fork_instructions(
+            p, subagent_name, rel_fork, rel_report, base_session_id, model,
+            workspace=Path(os.path.abspath(args.workspace)), discover_session=(p == platform),
+        )[p])
+        for p in shown for model in cli_models(common, workspace, p, args.model)
+    ]
 
     # IMPORTANT HARDWARE KV-CACHE PREFIX OPTIMIZATION:
     # Section 1 (Token 0..N) MUST be 100% byte-identical across Subagent_A, Subagent_B, etc.
@@ -617,14 +684,16 @@ def cmd_fork(args: argparse.Namespace) -> None:
         f"## 2. Ephemeral Subagent Task Suffix — `{subagent_name}`\n\n"
         f"- **Subagent Identifier**: `{subagent_name}`\n"
         f"- **Forked Timestamp**: `{now_iso()}`\n"
-        f"- **Target Platform**: `{platform}` (`opencode` | `claude` | `codex` | `agy`)\n"
+        f"- **Target Platform**: `{platform}`\n"
         f"- **Concurrency / Baton Mode**: `1-CONCURRENCY BATON PASS` (Main Agent is IDLE waiting for your report)\n"
         f"- **Task Classification**: `{task_type}`\n"
         f"- **Inherited Context Snapshots**: {', '.join(f'`{s}`' for s in requested_ids)}\n"
         f"- **Required Report Output Path**: `{rel_report}`\n\n"
         f"### Bounded Task Assignment\n"
         f"{task_desc}\n"
+        + door_brief(common)
         + lab_brief(common, workspace)
+        + handover_questions(common, workspace, subagent_name, task_desc, rel_report)
     )
     fork_file.write_text(fork_packet, encoding="utf-8")
 
@@ -643,7 +712,10 @@ def cmd_fork(args: argparse.Namespace) -> None:
         "snapshots": requested_ids,
         "platform": platform,
         "task_type": task_type,
+        "task": task_desc[:300],
     }
+    if base_session_id and base_session_id != ident["session"]:
+        owners[base_session_id] = subagent_name
     reg["active_baton"] = f"SUBAGENT:{subagent_name}"
     reg["total_forks_dispatched"] = reg.get("total_forks_dispatched", 0) + 1
     save_registry(workspace, reg)
@@ -653,22 +725,28 @@ def cmd_fork(args: argparse.Namespace) -> None:
     print("=" * 78)
     print(f"  Forked Brief File   : {rel_fork} (Token 0..N Prefix-Cache Aligned)")
     print(f"  Subagent Report Out : {rel_report}")
-    print(f"  Native Session Fork : {dispatch_cmds['discovered_session_id']}")
+    # No session id here: a native sub-agent tool would reuse it (the 2026-11-11 case); granted CLI lines carry their own.
+    print("  Worker Session      : fresh (the brief file carries the context)")
     print(f"  Inherited Snapshots : {', '.join(requested_ids)}")
     print(f"  Task Classification : {task_type}")
     print(f"  Active Execution    : BATON PASSED TO `{subagent_name}` (Main Agent waits for report)")
     print("-" * 78)
-    print("  MULTI-PLATFORM SUBAGENT DISPATCH COMMANDS:")
-    print(f"    [opencode]    : {dispatch_cmds['opencode']}")
-    print(f"    [claude-code] : {dispatch_cmds['claude']}")
-    print(f"    [codex]       : {dispatch_cmds['codex']}")
-    print(f"    [agy/gemini]  : {dispatch_cmds['agy']}")
+    print("  SUBAGENT DISPATCH (native tool on your own model; CLI forms only for agents the user granted):")
+    if own == "unknown":
+        print("    [native]      : use your harness's own subagent tool; point it at the brief file above.")
+    if own in shown:
+        print(f"    [{_DISPATCH_LABEL[own]:<12}]: {native_dispatch(own, rel_fork, rel_report, subagent_name)}")
+    for p, cmd in cli_lines:
+        for line in worker_cli_lines(_DISPATCH_LABEL[p], subagent_name, cmd):
+            emit(line)
     print("-" * 78)
     print(
         f"  WHEN `{subagent_name}` FINISHES: Run `ra_context_harness.py return-baton --subagent {subagent_name} "
         f"--status COMPLETED --report-file {rel_report}` (or --status FAILED)"
     )
     print("=" * 78)
+    if common is not None:
+        emit(common.render_injection("worker-dispatch", task=task_desc, worker=subagent_name, identity=ident["agent"]))
     footer = common.render_board(workspace, "summary") if common is not None else ""
     if footer:
         print(footer)
@@ -699,6 +777,24 @@ def cmd_return_baton(args: argparse.Namespace) -> None:
     else:
         report_path = sdir / "reports" / f"REPORT_{subagent_name}.md"
     report_summary = (args.summary or "").strip()
+
+    common = lab()
+    if status == "COMPLETED" and common is not None:
+        shown = report_path.read_text(encoding="utf-8-sig", errors="replace") if report_path.exists() else report_summary
+        problems = common.handover_problems(shown)
+        if problems:
+            rel_rp = report_path.relative_to(workspace).as_posix() if workspace in report_path.parents else str(report_path)
+            emit(f"[RA CONTEXT HARNESS BLOCKED] `{subagent_name}`'s report is not accepted yet:\n"
+                 + "\n".join(f"  - {p}" for p in problems)
+                 + f"\n  TO FIX, in one try: open `{rel_rp}` and add the heading `## Handover answers` with every numbered answer below.\n"
+                 f"  Who writes it: the worker `{subagent_name}`. If the worker is gone, re-dispatch it, or the manager answers on its\n"
+                 "  behalf from the worker's own evidence (logs, files) and marks each answer `(written by the manager)`.\n"
+                 f"  Then re-run: ra_context_harness.py return-baton --workspace . --subagent {subagent_name} "
+                 f"--status COMPLETED --report-file {rel_rp}", sys.stderr)
+            emit(common.render_injection("worker-handover", worker=subagent_name,
+                                         task=outstanding[subagent_name].get("task") or "(task not recorded)",
+                                         workspace=workspace.as_posix()), sys.stderr)
+            sys.exit(1)
 
     if report_path.exists():
         body = report_path.read_text(encoding="utf-8", errors="replace").strip()
@@ -759,7 +855,6 @@ def cmd_return_baton(args: argparse.Namespace) -> None:
     print("    1. Assume the subagent may have drifted or missed a constraint — verify its diff/output directly.")
     print("    2. Run `python research/harness/project_harness.py check-all` (if forged) or `ra_cheese_audit.py`.")
     print("=" * 78)
-    common = lab()
     if common is None or not common.state_file(workspace).is_file():
         return
     common.mark_worker_finished(workspace, subagent_name, "return-baton")
@@ -767,11 +862,11 @@ def cmd_return_baton(args: argparse.Namespace) -> None:
     if board:
         print(board)
     n = len(common.lab_reviews(workspace)) + 1
-    print(f"  REVIEW MEETING before the next fork - answer in research/reviews/REVIEW_{n}.md:")
-    for i, q in enumerate(common.REVIEW_QUESTIONS, 1):
-        print(f"    {i}. {q}")
-    print("  It must name every approach still racing, quote a scoreboard number, and carry")
-    print("  `DECISION: <family>: KEEP|SWITCH|DROP|RESTART`, `LESSON: <text>` and `NEXT: <text>` lines. Then:")
+    print(f"  REVIEW MEETING before the next fork - write research/reviews/REVIEW_{n}.md:")
+    emit(common.render_review_meeting(workspace))
+    print("  It must name every approach still racing, quote a scoreboard number, carry")
+    print("  `DECISION: <family>: KEEP|SWITCH|DROP|RESTART`, `LESSON: <text>` and `NEXT: <text>` lines,")
+    print("  and a `## Answers` section answering the numbered questions above. Then:")
     print(f"    ra_gate.py review --file research/reviews/REVIEW_{n}.md")
 
 
@@ -966,7 +1061,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_create.add_argument(
         "--base-session",
         default=None,
-        help="Optional native session ID for `opencode run --session <id> --fork` or `claude --resume <id> --fork-session`",
+        help="Optional native session ID of the parent session, to fork from",
     )
     p_create.add_argument("--max-reuses", type=positive_int, default=None, help="Override max fork reuse count before eviction (> 0)")
     p_create.add_argument("--ttl-minutes", type=positive_int, default=None, help="Override TTL in minutes before eviction (> 0)")
@@ -1001,7 +1096,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--platform",
         default="auto",
         choices=list(SUPPORTED_PLATFORMS),
-        help="Target agent platform (`auto`, `opencode`, `claude`, `codex`, `agy`)",
+        help="`auto` = this harness. Another platform needs the user's grant (ra_gate.py allow-agent).",
     )
     p_fork.add_argument(
         "--base-session",

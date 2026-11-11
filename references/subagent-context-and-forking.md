@@ -59,13 +59,7 @@ Suppose `Subagent A` and `Subagent B` are both working on tasks inside a **Larav
 - Instead of `Subagent A` reading 25 files AND `Subagent B` re-reading the same 25 files:
   1. **Read Once $\rightarrow$ Create Shared Snapshot**:
      - Compile the shared snapshot once (`laravel_base` + `auth_workflow_slice`) via `ra_context_harness.py create`.
-  2. **Fork into Named Subagents Across All 3 Supported Harnesses (`opencode`, `claude`, `agy`)**:
-     - **`opencode` (OpenCode CLI)**:
-       `opencode run --session "<base_session_id>" --fork --title "Subagent_A" --auto -f "research/context_snapshots/forks/FORK_Subagent_A.md" "..."`
-     - **`claude` (Claude Code)**:
-       `claude --resume "<base_session_id>" --fork-session --permission-mode acceptEdits -p "..."` OR `Agent(subagent_type="general-purpose", description="Subagent_A", prompt="Read research/context_snapshots/forks/FORK_Subagent_A.md ...")`
-     - **`agy` (`Antigravity` / `Gemini`)**:
-       `invoke_subagent(Subagents=[{"TypeName": "self", "Role": "Subagent_A", "Workspace": "inherit", "Prompt": "You start with none of the parent conversation. Read <ws>/research/context_snapshots/forks/FORK_Subagent_A.md ..."}])`
+  2. **Fork into Named Subagents with your own harness's native sub-agent tool** (Claude Code: `Agent`; OpenCode: `subagent`). Point each at its fork packet, e.g. `Read research/context_snapshots/forks/FORK_Subagent_A.md ...`. The native tool runs on your own model only (no `model=`); other models, other harnesses or CLI forms need `ra_gate.py allow-agent` with the user's words naming that agent. RA supports OpenCode, Claude Code, Codex and Antigravity/Gemini.
      - Fork 1 $\rightarrow$ **`Subagent_A`**: Inherits `laravel_base` + `auth_workflow_slice` + **Task A Delta Only**.
      - Fork 2 $\rightarrow$ **`Subagent_B`**: Inherits `laravel_base` + `auth_workflow_slice` + **Task B Delta Only**.
   3. **Hard Gate in `ra_gate.py`**:

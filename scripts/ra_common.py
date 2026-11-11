@@ -31,9 +31,10 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 HASH_ALGO = "ra_common.v1"
+RA_VERSION = "1.6.0"
 
 PYTHON_SUFFIXES = {".py", ".pyw", ".pyi"}
 # Block = lines indented under the declaration (plus a closing `end`).
@@ -981,7 +982,8 @@ def write_state(workspace: Path, state: Dict[str, Any]) -> None:
 # Lab state (state["lab"]): pending reviews, review meetings, manager-edit allowances, call counter
 # ---------------------------------------------------------------------------
 
-_LAB_FIELDS = (("pending_reviews", dict), ("reviews", list), ("manager_edit_allow", dict), ("main_tool_calls", int))
+_LAB_FIELDS = (("pending_reviews", dict), ("reviews", list), ("manager_edit_allow", dict), ("main_tool_calls", int),
+               ("answers_used", list))
 
 
 def _lab_of(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -1036,8 +1038,9 @@ def pending_reviews_detail(workspace: Path) -> List[Tuple[str, Dict[str, Any]]]:
         return []
 
 
-def mark_worker_finished(workspace: Path, worker: str, source: str) -> None:
-    """Record that a worker finished and its report awaits review. Idempotent per worker + second."""
+def mark_worker_finished(workspace: Path, worker: str, source: str, handover: bool = False, task: str = "") -> None:
+    """Record that a worker finished and its report awaits review. Idempotent per worker + second.
+    handover=True: the report this event carried answered the worker-handover questions."""
     name = str(worker or "").strip() or "unknown-worker"
     src = str(source or "").strip() or "unknown"
     t = _sb_now()
@@ -1046,11 +1049,16 @@ def mark_worker_finished(workspace: Path, worker: str, source: str) -> None:
         entry = lab["pending_reviews"].get(name)
         if not isinstance(entry, dict):
             entry = lab["pending_reviews"][name] = {"since": t, "events": []}
+        changed = False
+        if handover and entry.get("handover") != "ok":
+            entry["handover"], changed = "ok", True
+        if task and not entry.get("task"):
+            entry["task"], changed = task, True
         events = entry.setdefault("events", [])
         for ev in events:
             if ev.get("t") == t:
                 if src in ev.setdefault("sources", []):
-                    return None, False
+                    return None, changed
                 ev["sources"].append(src)
                 return None, True
         events.append({"t": t, "sources": [src]})
@@ -1058,6 +1066,24 @@ def mark_worker_finished(workspace: Path, worker: str, source: str) -> None:
         return None, True
 
     _lab_update(workspace, fn, None)
+
+
+def worker_report_rel(worker: str) -> str:
+    """The report file a forked worker writes (same slug rule as ra_context_harness.slugify)."""
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(worker).strip()).strip("_") or "snap"
+    return f"research/context_snapshots/reports/REPORT_{slug}.md"
+
+
+def handover_problems(text: str) -> List[str]:
+    """Problems with a report's `## Handover answers` section; [] when every worker-handover question is answered."""
+    body = answers_section(text or "", "Handover answers")
+    return check_answers(body, "worker-handover") if body.strip() else ["the report has no `## Handover answers` section"]
+
+
+def handover_settled(entry: Dict[str, Any]) -> bool:
+    """A finished worker whose handover answers were already accepted (in its result, or at return-baton)."""
+    return entry.get("handover") == "ok" or any(
+        "return-baton" in (ev.get("sources") or []) for ev in entry.get("events") or [] if isinstance(ev, dict))
 
 
 def clear_reviews(workspace: Path, workers: List[str]) -> None:
@@ -1126,6 +1152,56 @@ def consume_manager_edit(workspace: Path, rel_path: str) -> bool:
         return True, True
 
     return bool(_lab_update(workspace, fn, False))
+
+
+def _answers_digest(path: Path) -> str:
+    text = Path(path).read_text(encoding="utf-8-sig", errors="replace").replace("\r\n", "\n").strip()
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def answers_reuse(workspace: Path, path: Path) -> Optional[str]:
+    """Why this answers file can't approve another gate (its path or its exact text was used before); None if fresh."""
+    try:
+        key, digest = os.path.normcase(os.path.realpath(str(path))), _answers_digest(path)
+        state = read_state(workspace)
+        used = _lab_of(state)["answers_used"] if state else []
+    except (OSError, ValueError):
+        return None
+    for u in used:
+        if isinstance(u, dict) and (u.get("key") == key or u.get("sha256") == digest):
+            same = "this file" if u.get("key") == key else f"the same text ({u.get('file')})"
+            return f"{same} was already used for `{u.get('moment')}` at {u.get('at')}"
+    return None
+
+
+def record_answers_used(workspace: Path, path: Path, moment: str) -> None:
+    """Spend an answers file: it can't approve a later gate."""
+    try:
+        entry = {"file": _path_key(workspace, str(path))[1], "key": os.path.normcase(os.path.realpath(str(path))),
+                 "sha256": _answers_digest(path), "moment": moment, "at": _sb_now()}
+    except (OSError, ValueError):
+        return
+
+    def fn(lab: Dict[str, Any]) -> Tuple[None, bool]:
+        lab["answers_used"].append(entry)
+        return None, True
+
+    _lab_update(workspace, fn, None)
+
+
+def next_answers_file(workspace: Path, moment: str) -> str:
+    """research/answers/<moment>_<n>.md with n one past every answers file on disk or already used."""
+    pat = re.compile(rf"^{re.escape(moment)}_(\d+)\.md$", re.IGNORECASE)
+    names: List[str] = []
+    try:
+        names += os.listdir(Path(workspace) / "research" / "answers")
+    except OSError:
+        pass
+    state = read_state(workspace)
+    if state:
+        names += [Path(str(u.get("file", ""))).name for u in _lab_of(state)["answers_used"] if isinstance(u, dict)]
+    n = max((int(m.group(1)) for m in map(pat.match, names) if m), default=0) + 1
+    return f"research/answers/{moment}_{n}.md"
 
 
 def record_main_tool_call(workspace: Path) -> int:
@@ -1488,3 +1564,777 @@ def render_board(workspace: Path, mode: str = "full") -> str:
         return _board(workspace, mode)
     except Exception:
         return ""
+
+
+# ---------------------------------------------------------------------------
+# Injection templates (v1.6 safety harness)
+# ---------------------------------------------------------------------------
+
+INJECTION_DIR = Path(__file__).resolve().parent.parent / "resources" / "injections"
+_PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_QUESTION_RE = re.compile(r"^\s*(\d+)[.)]\s+(.*\S)\s*$")
+_BARE_ANSWERS = {"yes", "no", "ok", "done", "na", "none", "sure", "correct"}
+MIN_ANSWER_CHARS = 12
+
+
+def load_injection(moment: str) -> Dict[str, Any]:
+    """Parse resources/injections/<moment>.md (minimal key: value / [a, b] frontmatter)."""
+    if not re.fullmatch(r"[a-z0-9-]+", moment):
+        raise ValueError(f"bad injection moment: {moment!r}")
+    text = (INJECTION_DIR / f"{moment}.md").read_text(encoding="utf-8").replace("\r\n", "\n")
+    meta: Dict[str, Any] = {}
+    body = text
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 3)
+        if end != -1:
+            for line in text[4:end].split("\n"):
+                key, sep, val = line.partition(":")
+                if not sep:
+                    continue
+                val = val.strip()
+                if val.startswith("[") and val.endswith("]"):
+                    meta[key.strip()] = [p.strip() for p in val[1:-1].split(",") if p.strip()]
+                else:
+                    meta[key.strip()] = val
+            body = text[end + 5:]
+    questions = [m.group(2) for m in map(_QUESTION_RE.match, body.split("\n")) if m]
+    return {
+        "moment": meta.get("moment", moment),
+        "level": meta.get("level", "remind"),
+        "placeholders": list(meta.get("placeholders", [])),
+        "questions": questions,
+        "body": body,
+    }
+
+
+def render_injection(moment: str, **facts: Any) -> str:
+    """Template body with {name} filled from facts; a missing fact prints {unknown: name}."""
+    body = load_injection(moment)["body"]
+    return _PLACEHOLDER_RE.sub(
+        lambda m: str(facts[m.group(1)]) if m.group(1) in facts and facts[m.group(1)] is not None
+        else "{unknown: " + m.group(1) + "}",
+        body,
+    )
+
+
+def check_answers(text: str, moment: str) -> List[str]:
+    """Problems in an answers text for a moment's numbered questions; [] when all are answered."""
+    count = len(load_injection(moment)["questions"])
+    answers: Dict[int, List[str]] = {}
+    current: Optional[int] = None
+    for line in text.replace("\r\n", "\n").split("\n"):
+        m = re.match(r"^\s*(\d+)[.)](?:\s+(.*)|\s*)$", line)
+        if m and 1 <= int(m.group(1)) <= count:
+            current = int(m.group(1))
+            answers.setdefault(current, []).append(m.group(2) or "")
+        elif current is not None:
+            answers[current].append(line)
+    problems: List[str] = []
+    for n in range(1, count + 1):
+        if n not in answers:
+            problems.append(f"question {n}: missing (write '{n}.' then your answer)")
+            continue
+        ans = " ".join(answers[n]).strip()
+        if re.sub(r"[\W_]+", "", ans).lower() in _BARE_ANSWERS:
+            problems.append(f"question {n}: bare '{ans}' is not an answer; give a reason or a fact")
+        elif len(ans) < MIN_ANSWER_CHARS:
+            problems.append(f"question {n}: too short ({len(ans)} chars, need {MIN_ANSWER_CHARS}); give a reason or a fact")
+    return problems
+
+
+def answers_section(text: str, heading: str) -> str:
+    """Body under a `## <heading>` line up to the next `## ` heading; "" when the heading is missing."""
+    text = text.replace("\r\n", "\n")
+    m = re.search(rf"^##(?!#)[ \t]*{re.escape(heading)}[ \t]*:?[ \t]*$", text, re.IGNORECASE | re.MULTILINE)
+    if not m:
+        return ""
+    rest = text[m.end():]
+    end = re.search(r"^##(?!#)\s", rest, re.MULTILINE)
+    return rest[: end.start()] if end else rest
+
+
+_VERDICT_RE = re.compile(r"(?:Final|Current) Verdict\*{0,2}:?\*{0,2}\s*`?([A-Z_]+)`?")
+
+
+def _report_conclusion(text: str) -> str:
+    """First line of REPORT.md's 'Exact Root Cause' entry (inline or the next line); "" while it is a placeholder."""
+    lines = text.replace("\r\n", "\n").split("\n")
+    for i, ln in enumerate(lines):
+        if "Exact Root Cause" not in ln:
+            continue
+        inline = re.sub(r"^.*?Exact Root Cause[^:]*:\**", "", ln).strip(" *_`-")
+        cand = inline or next((x.strip(" *_`-") for x in lines[i + 1:] if x.strip()), "")
+        return "" if not cand or cand.startswith("<") else cand[:120]
+    return ""
+
+
+def graveyard_facts(workspace: Path, state: Optional[Dict[str, Any]] = None) -> str:
+    """One line per archived hypothesis, from research/graveyard/*/REPORT.md and the scoreboard only."""
+    gdir = Path(workspace).resolve() / "research" / "graveyard"
+    state = state if state is not None else (read_state(workspace) or {})
+    lines: List[str] = []
+    try:
+        dirs = sorted(d for d in gdir.iterdir() if d.is_dir() and (d / "REPORT.md").is_file())
+    except OSError:
+        dirs = []
+    for d in dirs:
+        hyp = d.name.split("__", 1)[0]
+        text = (d / "REPORT.md").read_text(encoding="utf-8-sig", errors="replace")
+        vm = _VERDICT_RE.search(text)
+        verdict = vm.group(1) if vm and vm.group(1) != "PENDING" else "FALSIFIED"
+        found = metric_rule(state, hyp)
+        sr = found[1] if found else None
+        scores: List[Tuple[str, float]] = []
+        for fam, ap in sb_get(state, hyp, create=False)["approaches"].items():
+            scores += [(fam, r["score"]) for r in (ap or {}).get("rounds", []) if r.get("score") is not None]
+        if scores:
+            fam, best = (min if _lower(sr) else max)(scores, key=lambda t: t[1])
+            who, shown = fam, fmt_score(best)
+        else:
+            who, shown = hyp, "no score"
+        lines.append(f"{who}: best {shown}, {verdict}, {_report_conclusion(text) or 'no conclusion written'}")
+    return "\n   ".join(lines) if lines else "none yet"
+
+
+def render_review_meeting(workspace: Path, state: Optional[Dict[str, Any]] = None) -> str:
+    """The review-meeting template, once per approach still in the race, with live board facts."""
+    state = state if state is not None else (read_state(workspace) or {})
+    hyp = state.get("active_hypothesis") or None
+    found = metric_rule(state, hyp) if hyp else None
+    sr = found[1] if found else None
+    active = _approach_rows(state, hyp, sr)[0] if hyp else []
+    grave = graveyard_facts(workspace, state)
+    target = fmt_score(sr.get("target")) if sr and sr.get("target") is not None else "-"
+    facts = [{"approach": r["family"], "rounds": r["rounds"], "best": fmt_score(r["best"])} for r in active]
+    facts = facts or [{"approach": "(no approach on the board yet)", "rounds": 0, "best": "-"}]
+    text = render_injection("review-meeting", target=target, graveyard_facts=grave, **facts[0])
+    if len(facts) > 1:
+        rows = "\n".join(f"- `{f['approach']}`: {f['rounds']} rounds, best {f['best']}, target {target}" for f in facts)
+        text = f"Approaches still in the race (the numbered answers below cover each of them):\n{rows}\n{text}"
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Identity: who is running this script. The model's `--agent` text is only a claim.
+# ---------------------------------------------------------------------------
+
+IDENTITY_TAIL_CAP = 8 * 1024 * 1024
+_HARNESS_ORDER = ("opencode", "claude-code", "codex", "agy")
+_PROC_NAMES = {"opencode": ("opencode",), "claude-code": ("claude",), "codex": ("codex",), "agy": ("gemini", "agy", "antigravity")}
+
+
+def _env_harnesses(env: Mapping[str, str]) -> List[str]:
+    found = []
+    if env.get("OPENCODE") == "1":
+        found.append("opencode")
+    if env.get("CLAUDECODE") == "1":
+        found.append("claude-code")
+    if env.get("CODEX_HOME") or env.get("CODEX_SANDBOX"):
+        found.append("codex")
+    if env.get("ANTIGRAVITY_CLI") or env.get("GEMINI_CLI"):
+        found.append("agy")
+    return found
+
+
+def _home(env: Mapping[str, str]) -> Path:
+    return Path(env.get("USERPROFILE") or env.get("HOME") or os.path.expanduser("~"))
+
+
+def _process_table() -> Dict[int, Tuple[int, str]]:
+    """pid -> (ppid, 'name cmdline'). Empty when the table can't be read."""
+    import subprocess
+    table: Dict[int, Tuple[int, str]] = {}
+    try:
+        if os.name == "nt":
+            ps = ("Get-CimInstance Win32_Process | ForEach-Object { "
+                  "\"$($_.ProcessId)|$($_.ParentProcessId)|$($_.Name)|$($_.CommandLine)\" }")
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, timeout=8).stdout
+            for line in out.decode("utf-8", "replace").splitlines():
+                parts = line.strip().split("|", 3)
+                if len(parts) >= 3 and parts[0].isdigit() and parts[1].isdigit():
+                    table[int(parts[0])] = (int(parts[1]), (parts[2] + " " + (parts[3] if len(parts) > 3 else "")).lower())
+        else:
+            out = subprocess.run(["ps", "-eo", "pid=,ppid=,args="], capture_output=True, timeout=5).stdout
+            for line in out.decode("utf-8", "replace").splitlines():
+                parts = line.split(None, 2)
+                if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                    table[int(parts[0])] = (int(parts[1]), (parts[2] if len(parts) > 2 else "").lower())
+    except Exception:
+        return {}
+    return table
+
+
+def _proc_matches(desc: str, harness: str) -> bool:
+    # Only the executable and its first arguments: a project path may contain "claude".
+    toks = [os.path.basename(t.strip('"').replace("\\", "/")) for t in desc.split()[:3]]
+    return any(t.startswith(n) for t in toks for n in _PROC_NAMES[harness])
+
+
+def _ancestor_harness(candidates: List[str]) -> Optional[str]:
+    """The candidate whose CLI process is the nearest ancestor of this process, or None."""
+    table = _process_table()
+    pid, seen = os.getpid(), set()
+    while pid in table and pid not in seen:
+        seen.add(pid)
+        pid = table[pid][0]
+        desc = table.get(pid, (0, ""))[1]
+        for h in candidates:
+            if _proc_matches(desc, h):
+                return h
+    return None
+
+
+def _opencode_db(env: Mapping[str, str]) -> Any:
+    """Read-only connection to opencode.db, or None."""
+    import sqlite3
+    base = Path(env["XDG_DATA_HOME"]) if env.get("XDG_DATA_HOME") else _home(env) / ".local" / "share"
+    db = base / "opencode" / "opencode.db"
+    if not db.is_file():
+        return None
+    try:
+        return sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=1)
+    except Exception:
+        return None
+
+
+def _model_json(raw: Any) -> Optional[str]:
+    """'provider/model' from a {"id","providerID"} JSON value, or None."""
+    try:
+        m = json.loads(raw) if isinstance(raw, (str, bytes)) else (raw or {})
+        mid, prov = m.get("id"), m.get("providerID")
+    except Exception:
+        return None
+    return f"{prov or 'unknown'}/{mid}" if mid else None
+
+
+def _session_model(con: Any, table: str, sid: str, column_value: Any) -> Optional[str]:
+    """The session's model column, else its newest assistant message's model (NULL unless started with -m)."""
+    model = _model_json(column_value)
+    if model or table != "session_v2":
+        return model
+    for order in ("seq desc", "rowid desc"):
+        try:
+            row = con.execute(f"select data from session_message where session_id=? and type='assistant' order by {order} limit 1",
+                              (sid,)).fetchone()
+        except Exception:
+            continue
+        try:
+            return _model_json(json.loads(row[0]).get("model")) if row else None
+        except Exception:
+            return None
+    return None
+
+
+def _opencode_model(env: Mapping[str, str]) -> Tuple[Optional[str], bool]:
+    """(provider/model or None, is_subagent). Never raises."""
+    sid = env.get("OPENCODE_SESSION_ID")
+    con = _opencode_db(env) if sid else None
+    if con is None:
+        return None, False
+    try:
+        for table in ("session_v2", "session"):
+            try:
+                row = con.execute(f"select model, parent_id from {table} where id=?", (sid,)).fetchone()
+            except Exception:
+                continue
+            if not row:
+                continue
+            return _session_model(con, table, sid, row[0]), bool(row[1])
+    except Exception:
+        pass
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+    return None, False
+
+
+OPENCODE_CHILD_CAP = 200
+
+
+def opencode_child_models(env: Optional[Mapping[str, str]] = None) -> List[Tuple[str, str]]:
+    """(session id, provider/model) of every sub-session under the current OpenCode session. Never raises."""
+    env = os.environ if env is None else env
+    sid = env.get("OPENCODE_SESSION_ID")
+    con = _opencode_db(env) if sid and env.get("OPENCODE") == "1" else None
+    if con is None:
+        return []
+    out: List[Tuple[str, str]] = []
+    try:
+        todo, seen = [sid], {sid}
+        while todo and len(seen) < OPENCODE_CHILD_CAP:
+            parent = todo.pop(0)
+            for kid, raw in con.execute("select id, model from session_v2 where parent_id=? order by rowid", (parent,)).fetchall():
+                if kid in seen:
+                    continue
+                seen.add(kid)
+                todo.append(kid)
+                out.append((kid, _session_model(con, "session_v2", kid, raw) or "unknown"))
+    except Exception:
+        pass
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+    return out
+
+
+def _claude_transcript(env: Mapping[str, str], payload: Dict[str, Any]) -> Tuple[Optional[Path], bool]:
+    """(the caller's transcript, is it a worker's). A worker's shell carries the parent's session id and no agent id
+    (Claude Code 2.1.322), so without a hook payload the newest of <sid>.jsonl and <sid>/subagents/agent-*.jsonl is
+    the caller: with one worker at a time, that is the one running."""
+    tp, aid = payload.get("agent_transcript_path") or payload.get("transcript_path"), payload.get("agent_id")
+    if tp:
+        path = Path(_native(str(tp)))
+        if aid and not payload.get("agent_transcript_path"):
+            worker = path.with_suffix("") / "subagents" / f"agent-{aid}.jsonl"
+            path = worker if worker.is_file() else path
+        return path, bool(aid)
+    sid = env.get("CLAUDE_CODE_SESSION_ID") or str(payload.get("session_id") or "")
+    if not sid:
+        return None, False
+    root = Path(env["CLAUDE_CONFIG_DIR"]) if env.get("CLAUDE_CONFIG_DIR") else _home(env) / ".claude"
+    best: Optional[Tuple[float, Path, bool]] = None
+    try:
+        for main in (root / "projects").glob(f"*/{sid}.jsonl"):
+            for p, worker in [(main, False)] + [(w, True) for w in main.with_suffix("").glob("subagents/agent-*.jsonl")]:
+                try:
+                    m = p.stat().st_mtime
+                except OSError:
+                    continue
+                if best is None or m > best[0]:
+                    best = (m, p, worker)
+    except OSError:
+        pass
+    return (best[1], best[2]) if best else (None, False)
+
+
+def _claude_model_from_transcript(env: Mapping[str, str], payload: Dict[str, Any]) -> Optional[str]:
+    return _model_in_transcript(_claude_transcript(env, payload)[0])
+
+
+def _model_in_transcript(path: Optional[Path]) -> Optional[str]:
+    """The last assistant message.model in the tail of a transcript."""
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - IDENTITY_TAIL_CAP))
+            data = f.read()
+    except OSError:
+        return None
+    for raw in reversed(data.split(b"\n")):
+        if b'"assistant"' not in raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            continue  # first line of the tail may be cut mid-record
+        if not isinstance(obj, dict) or obj.get("type") != "assistant":
+            continue
+        model = (obj.get("message") or {}).get("model")
+        if model and not str(model).startswith("<"):
+            return str(model)
+    return None
+
+
+def resolve_identity(env: Optional[Mapping[str, str]] = None, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Work out which harness and model is running. Never raises; unreadable parts are 'unknown'."""
+    env = os.environ if env is None else env
+    payload = payload or {}
+    found = _env_harnesses(env)
+    # A CLI worker RA dispatched has no parent session; the printed command marks it.
+    worker = (env.get("RA_WORKER") or "").strip()
+    nested = ""
+    if len(found) > 1:
+        near = _ancestor_harness(found)
+        harness = near or found[0]
+        nested = "" if near else "nested-guess"
+    elif found:
+        harness = found[0]
+    else:
+        return {"agent": "unknown", "harness": "unknown", "model": "unknown", "session": "", "source": "none",
+                "is_subagent": bool(worker), "worker": worker}
+
+    model: Optional[str] = None
+    source, session, sub = "env", "", False
+    try:
+        if harness == "opencode":
+            session = env.get("OPENCODE_SESSION_ID", "")
+            model, sub = _opencode_model(env)
+            source = "opencode-db" if model else "env"
+        elif harness == "claude-code":
+            session = env.get("CLAUDE_CODE_SESSION_ID") or str(payload.get("session_id") or "")
+            path, sub = _claude_transcript(env, payload)
+            sub = sub or bool(payload.get("agent_id"))
+            if payload.get("model"):
+                model, source = str(payload["model"]), "payload"
+            else:
+                model = _model_in_transcript(path)
+                source = "transcript" if model else "env"
+        else:
+            model = env.get("RA_AGENT_MODEL") or env.get("CODEX_MODEL" if harness == "codex" else "GEMINI_MODEL") or None
+    except Exception:
+        model = None
+    model = model or "unknown"
+    return {"agent": f"{harness}:{model}", "harness": harness, "model": model, "session": session,
+            "source": nested or source, "is_subagent": sub or bool(worker), "worker": worker}
+
+
+# ---------------------------------------------------------------------------
+# Agent permissions: only the user can let one agent use another.
+# ---------------------------------------------------------------------------
+
+HARNESS_NAMES = ("opencode", "claude-code", "codex", "agy")
+_HARNESS_ALIASES = {"claude": "claude-code", "claudecode": "claude-code", "gemini": "agy", "antigravity": "agy"}
+
+
+def canonical_harness(name: str) -> str:
+    """'claude' / 'Claude-Code:opus' -> 'claude-code'; '' when it names no known harness."""
+    head = (name or "").strip().lower().split(":", 1)[0]
+    head = _HARNESS_ALIASES.get(head, head)
+    return head if head in HARNESS_NAMES else ""
+
+
+def _canonical_agent(agent: str) -> str:
+    """Grant key: canonical harness plus the model part as written ('' model = any model)."""
+    head, _, model = (agent or "").strip().partition(":")
+    h = canonical_harness(head)
+    return (f"{h}:{model.strip()}" if model.strip() else h) if h else ""
+
+
+def permissions_path(workspace: Path) -> Path:
+    return Path(workspace) / "research" / "AGENT_PERMISSIONS.json"
+
+
+def load_permissions(workspace: Path) -> Dict[str, Any]:
+    """{'allow': [...]}; a missing or unreadable file means no grants."""
+    try:
+        data = json.loads(permissions_path(workspace).read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("allow"), list):
+            data["allow"] = [g for g in data["allow"] if isinstance(g, dict)]
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"allow": []}
+
+
+def _save_permissions(workspace: Path, data: Dict[str, Any]) -> None:
+    path = permissions_path(workspace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+# Words a user says when naming each harness.
+_HARNESS_WORDS = {"opencode": ("opencode",), "claude-code": ("claude",), "codex": ("codex",),
+                  "agy": ("agy", "antigravity", "gemini")}
+# Model-id parts that name a tier or size, not a model: "use the next one" must not grant qwen3.8-flash-next.
+_GENERIC_MODEL_WORDS = {
+    "pro", "flash", "next", "free", "mini", "max", "plus", "lite", "turbo", "preview", "latest", "instruct", "chat",
+    "base", "large", "small", "medium", "nano", "fast", "thinking", "exp", "beta", "alpha", "high", "low", "default",
+    "new", "model", "ultra", "air", "online", "reasoning", "vision", "coder", "code", "the", "and",
+}
+
+
+def _name_tokens(text: str) -> List[str]:
+    """Lower-case words, split at letter/digit boundaries too ("qwen3.8" -> qwen, 3, 8)."""
+    return re.findall(r"[a-z]+|\d+", (text or "").lower())
+
+
+_ANY_WORDS = {"any", "all", "every", "whatever"}
+
+
+def quote_says_any_model(quote: str) -> bool:
+    """The words grant every model: "any"/"all"/"every"/"whatever", then "model(s)" within 3 words."""
+    toks = _name_tokens(quote)
+    return any(t in _ANY_WORDS and any(x in ("model", "models") for x in toks[i + 1:i + 4]) for i, t in enumerate(toks))
+
+
+def quote_names_harness(quote: str, agent: str) -> bool:
+    """The user's words name this agent's harness."""
+    harness = _canonical_agent(agent).partition(":")[0]
+    if not harness:
+        return False
+    words = set(_name_tokens(quote))
+    squashed = re.sub(r"[^a-z0-9]", "", (quote or "").lower())
+    hwords = _HARNESS_WORDS.get(harness, ())
+    return any(w in words or (len(w) >= 6 and w in squashed) for w in hwords + (harness.replace("-", ""),))
+
+
+def quote_names_agent(quote: str, agent: str) -> bool:
+    """The user's words name this agent: its harness, and either a word of the model id or, for a grant
+    covering every model of the harness, words saying so."""
+    key = _canonical_agent(agent)
+    if not key or not quote_names_harness(quote, key):
+        return False
+    words = set(_name_tokens(quote))
+    model = key.partition(":")[2]
+    if not model:
+        return quote_says_any_model(quote)
+    mtoks = _name_tokens(model.rsplit("/", 1)[-1])
+    long = [t for t in mtoks if len(t) >= 3]
+    all_h = {w for ws in _HARNESS_WORDS.values() for w in ws}
+    named = [t for t in long if t not in _GENERIC_MODEL_WORDS and t not in all_h]
+    named = named or [t for t in long if t not in _GENERIC_MODEL_WORDS]
+    if any(t in words for t in named):
+        return True
+    # No distinguishing word: every word of the id must be there ("flash next", or "y" for a model called y).
+    return bool(long or mtoks) and all(t in words for t in (long or mtoks))
+
+
+def grant_agent(workspace: Path, agent: str, quote: str, source: str, granted_by: str = "") -> None:
+    key = _canonical_agent(agent)
+    if not key:
+        raise ValueError(f"unknown agent {agent!r}; use <harness>:<model> with harness one of {', '.join(HARNESS_NAMES)}")
+    data = load_permissions(workspace)
+    data["allow"] = [g for g in data["allow"] if _canonical_agent(str(g.get("agent", ""))) != key]
+    data["allow"].append({"agent": key, "use": True, "quote": quote, "source": source,
+                          **({"granted_by": granted_by} if granted_by else {}),
+                          "granted": dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")})
+    _save_permissions(workspace, data)
+
+
+def grant_scope(agent: str) -> str:
+    """What a grant for this agent lets through, in plain words."""
+    key = _canonical_agent(agent)
+    harness, _, model = key.partition(":")
+    cli = _HARNESS_WORDS.get(harness, (harness,))[0]
+    if not model:
+        return (f"Covers: every {harness} model, through the native sub-agent tool and any `{cli}` CLI launch, "
+                f"including `{cli}` without -m (its default model).")
+    return (f"Covers: the native sub-agent tool with model={model}, and `{cli}` CLI launches that pass "
+            f"-m {model} (or --model {model}).\n"
+            f"Not covered: any other {harness} model, and `{cli}` without -m (its default model could be anything).")
+
+
+def revoke_agent(workspace: Path, agent: str) -> bool:
+    """Switch an active grant off (kept for the record). False when there was none."""
+    key = _canonical_agent(agent)
+    data = load_permissions(workspace)
+    hit = False
+    for g in data["allow"]:
+        if g.get("use") and _canonical_agent(str(g.get("agent", ""))) == key:
+            g["use"] = False
+            g["revoked"] = dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+            hit = True
+    if hit:
+        _save_permissions(workspace, data)
+    return hit
+
+
+def granted_harnesses(workspace: Path) -> List[str]:
+    """Canonical harness names with at least one active grant, in file order."""
+    seen: List[str] = []
+    for g in load_permissions(workspace)["allow"]:
+        h = canonical_harness(str(g.get("agent", "")))
+        if g.get("use") and h and h not in seen:
+            seen.append(h)
+    return seen
+
+
+def granted_agents(workspace: Path) -> List[str]:
+    """Canonical keys of the active grants ('opencode' = every model, 'opencode:<model>' = that model), file order."""
+    seen: List[str] = []
+    for g in load_permissions(workspace)["allow"]:
+        k = _canonical_agent(str(g.get("agent", "")))
+        if g.get("use") and k and k not in seen:
+            seen.append(k)
+    return seen
+
+
+def harness_grant_models(workspace: Path, harness: str) -> List[str]:
+    """Models granted for one harness; '' stands for a harness-wide grant."""
+    h = canonical_harness(harness)
+    return [k.partition(":")[2] for k in granted_agents(workspace) if h and k.partition(":")[0] == h]
+
+
+def is_agent_allowed(workspace: Path, agent_or_harness: str, own_harness: Optional[str] = None) -> bool:
+    """True for the current harness's own sub-agents, or when an active user grant covers the agent.
+    A bare harness (a CLI launch with no model flag) needs a harness-wide grant: its default model could be anything.
+    own_harness="" means grants only (the hook never walks processes to find the harness)."""
+    key = _canonical_agent(agent_or_harness)
+    if not key:
+        return False
+    harness, _, model = key.partition(":")
+    if own_harness is None:
+        own_harness = resolve_identity()["harness"]
+    if own_harness and harness == own_harness:
+        return True
+    models = [m.casefold() for m in harness_grant_models(workspace, harness)]
+    return "" in models or (bool(model) and model.casefold() in models)
+
+
+def unapproved_models(workspace: Path, env: Optional[Mapping[str, str]] = None) -> List[Tuple[str, str]]:
+    """(provider/model, sub-session id) for each OpenCode sub-session on a model that is neither ours nor granted."""
+    env = os.environ if env is None else env
+    kids = opencode_child_models(env)
+    if not kids:
+        return []
+    own = resolve_identity(env)
+    if own["harness"] != "opencode":
+        return []  # another harness nested in an OpenCode session: those sub-sessions aren't ours
+    own_model = own["model"].casefold()
+    # "unknown" = no model column and no reply yet: a native sub-agent inherits ours.
+    return [(m, sid) for sid, m in kids if m != "unknown" and m.casefold() != own_model
+            and not is_agent_allowed(workspace, f"opencode:{m}", own_harness="")]
+
+
+# ---------------------------------------------------------------------------
+# Shell safety patterns, shared by the Claude hook (ra_hooks) and the OpenCode deny rules (ra_forge).
+# ---------------------------------------------------------------------------
+
+SAFETY_AGENT_CLIS = ("claude", "opencode", "codex", "agy", "antigravity", "gemini")
+# Commands whose first token deletes; git/find/python one-liners are matched in ra_hooks.shell_safety.
+SAFETY_DELETE_COMMANDS = ("rm", "rmdir", "unlink", "del", "erase", "rd", "remove-item", "ri")
+SAFETY_LOOKUP_COMMANDS = ("where", "which", "type", "get-command", "gcm")
+SAFETY_LISTING_COMMANDS = ("ls", "dir", "get-childitem", "gci")
+# Path parts that mean "looking for installed agent CLIs".
+SAFETY_AGENT_PATH_HINTS = ("appdata/roaming/npm", "node_modules/@anthropic-ai", "/.codex", "/.config/opencode", "/.local/share/opencode",
+                           "/.gemini/antigravity")
+# Same, as a regex for the per-name install dirs under Programs.
+SAFETY_AGENT_PATH_REGEX = r"appdata/local/programs/[^/]*(antigravity|gemini)"
+
+# ---------------------------------------------------------------------------
+# Path classification for the delete door.
+# ---------------------------------------------------------------------------
+
+_WIN = os.name == "nt"
+
+
+def _native(p: str) -> str:
+    # Git Bash may hand over /c/Users/... ; Python on Windows needs C:/Users/...
+    if _WIN and re.match(r"^/[A-Za-z]/", p):
+        return p[1].upper() + ":" + p[2:]
+    return p
+
+
+def _inside(p: str, base: str) -> Optional[str]:
+    try:
+        rel = os.path.relpath(os.path.normcase(p), os.path.normcase(base))
+    except ValueError:  # different drive
+        return None
+    if rel == os.curdir or rel.startswith(os.pardir):
+        return None
+    # Keep the caller's casing for the reported path.
+    return p[len(base):].lstrip("\\/").replace("\\", "/")
+
+
+def _long_path(p: str) -> str:
+    """Expand 8.3 short names; the longest existing prefix is expanded, the rest kept as typed."""
+    if not _WIN:
+        return p
+    try:
+        import ctypes
+
+        fn = ctypes.windll.kernel32.GetLongPathNameW
+        cur, tail = p, []
+        while cur:
+            buf = ctypes.create_unicode_buffer(32768)
+            if fn(cur, buf, 32768):
+                return os.path.join(buf.value, *reversed(tail)) if tail else buf.value
+            head, name = os.path.split(cur)
+            if head == cur or not name:
+                break
+            tail.append(name)
+            cur = head
+    except Exception:
+        pass
+    return p
+
+
+PROTECTED_NAMES = ("DIRECTIVES.md", "DECISIONS.md", "LAB_LOG.md", "INVARIANTS.md", "VISION_AND_MISSION.md",
+                   "AGENT_PERMISSIONS.json", ".ra_state.json")
+PROTECTED_DIRS = ("graveyard", "reviews", ".trash", "answers")
+
+
+def protected_list() -> str:
+    """The records `remove` never takes, for help text and the docs."""
+    return ("research/ itself; research/" + ", research/".join(PROTECTED_NAMES) + "; "
+            + ", ".join(f"research/{d}/" for d in PROTECTED_DIRS)
+            + "; research/hypotheses/<H>/REPORT.md (and any folder holding one)")
+
+
+# The delete door, for every place a denied rm/mv can land (fork brief, forged skill, AGENTS.md).
+DELETE_DOOR_LINES = (
+    "Deletes and moves of RA records and sandbox items go through the manager's `ra_gate.py remove` "
+    "(it moves them to research/.trash/ with a manifest).",
+    "A worker never deletes or moves them: list each path in your report, and the manager runs `remove`.",
+    "\"Permission denied\" on rm, mv, Remove-Item or a python/node one-liner means: use that door, not another command.",
+    "Retiring an approach into research/graveyard/ is `ra_gate.py conclude` or `cold-review`, never a hand move.",
+)
+
+
+def delete_door_text(gate: str = "ra_gate.py") -> str:
+    """The door lines as a markdown list, plus the exact command."""
+    lines = [f"- {ln}" for ln in DELETE_DOOR_LINES]
+    lines.append(f"- The command: `python \"{gate}\" remove --path <path> --answers research/answers/before-delete_<n>.md`.")
+    return "\n".join(lines) + "\n"
+
+
+def _resolve_real(raw: str, base: str) -> str:
+    p = _native(raw.strip().strip("\"'").strip())
+    p = os.path.expanduser(p)
+    if not os.path.isabs(p):
+        p = os.path.join(base, p)
+    # On POSIX `link/..` means the link target's parent, so realpath must see the raw `..`.
+    return _long_path(os.path.realpath(os.path.normpath(os.path.abspath(p)) if _WIN else p))
+
+
+def _fold(x: str) -> str:
+    return x.lower() if _WIN else x
+
+
+def _zone_of_parts(parts: List[str]) -> str:
+    """Zone of one workspace-relative path (already split); protected wins inside research/."""
+    low = [_fold(x) for x in parts]
+    if low[0] != _fold("research"):
+        return "workspace"
+    inner = low[1:]
+    if not inner:
+        return "protected"  # research/ itself
+    names = [_fold(n) for n in PROTECTED_NAMES]
+    if (len(inner) == 1 and inner[0] in names) or inner[0] in PROTECTED_DIRS:
+        return "protected"
+    if len(inner) == 3 and inner[0] == "hypotheses" and inner[2] == _fold("REPORT.md"):
+        return "protected"
+    return "research"
+
+
+def _plain_dir(p: str) -> bool:
+    return os.path.isdir(p) and not os.path.islink(p) and not getattr(os.path, "isjunction", lambda _: False)(p)
+
+
+def _has_protected_child(real: str, parts: List[str]) -> bool:
+    """Only research/hypotheses and research/hypotheses/<H> can hold a protected record (a REPORT.md): no tree walk."""
+    low = [_fold(x) for x in parts]
+    if low[:2] != [_fold("research"), _fold("hypotheses")] or len(low) > 3 or not _plain_dir(real):
+        return False
+    report = _fold("REPORT.md")
+    try:
+        if len(low) == 3:
+            return any(_fold(n) == report for n in os.listdir(real))
+        return any(_plain_dir(os.path.join(real, d)) and any(_fold(n) == report for n in os.listdir(os.path.join(real, d)))
+                   for d in os.listdir(real))
+    except OSError:
+        return False
+
+
+def classify_delete_path(workspace: Path, raw: str, cwd: Optional[str] = None,
+                         check_children: bool = True) -> Tuple[str, str]:
+    """(zone, resolved posix path); zone is research | protected | workspace | outside.
+    check_children=False skips looking inside a directory for a protected record (display-only callers)."""
+    ws = _long_path(os.path.realpath(str(workspace)))
+    real = _resolve_real(raw, _native(cwd) if cwd else ws)
+    posix = real.replace("\\", "/")
+    rel = _inside(real, ws)
+    if rel is None:
+        return "outside", posix
+    parts = rel.split("/")
+    zone = _zone_of_parts(parts)
+    if zone == "research" and check_children and _has_protected_child(real, parts):
+        return "protected", posix  # a directory holding a protected record is itself protected
+    return zone, posix

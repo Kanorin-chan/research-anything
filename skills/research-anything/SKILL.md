@@ -14,7 +14,7 @@ description: >-
   novel mechanisms or building R&D projects where standard boilerplate fails.
 metadata:
   short_name: RA
-  version: "1.5.1"
+  version: "1.6.0"
 hooks:
   SessionStart:
     - hooks:
@@ -29,7 +29,7 @@ hooks:
           timeout: 10
           command: 'p=$(command -v python || command -v python3) || exit 0; for d in "$CLAUDE_PLUGIN_ROOT" "$CLAUDE_SKILL_DIR" "$CLAUDE_PROJECT_DIR/.claude/skills/research-anything" "$HOME/.claude/skills/research-anything"; do [ -f "$d/scripts/ra_hooks.py" ] && exec "$p" -I "$d/scripts/ra_hooks.py" prompt; done; exit 0'
   PreToolUse:
-    - matcher: "Agent|Task|Edit|Write|MultiEdit|NotebookEdit|Bash"
+    - matcher: "Agent|Task|Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell"
       hooks:
         - type: command
           shell: bash
@@ -140,12 +140,8 @@ To keep the manager's context from bloating and decaying during deep R&D:
 3. **Prevent Long-Context Subagents (Task-Sizing Rule)**:
    - **Real R&D / Logic / Bug-Fix Tasks (`REAL_RD`)**: Strictly **1 atomic task per subagent** (never dump 7 tasks onto 1 subagent).
    - **Small Surface Tweaks (`TRIVIAL_BATCH`)**: Small cosmetic/surface tasks (*change CSS, swap icon, update text/labels*) can be batched together in a single subagent run.
-4. **Read Once $\rightarrow$ Fork Many (`/fork` Shared Context Snapshots Across `opencode`, `claude`, `codex`, and `agy`)**:
-   - First-class platform support is built into `ra_context_harness.py` (`--platform auto|opencode|claude|codex|agy`):
-     - **`opencode`**: Generates `opencode run --session <id> --fork --title "<subagent>"` or standalone `-f research/context_snapshots/forks/FORK_<subagent>.md` dispatches.
-     - **`claude` (`claude-code`)**: Generates `claude --resume <id> --fork-session --permission-mode acceptEdits -p` and native `Agent(subagent_type="general-purpose", ...)` dispatches.
-     - **`codex`**: Generates `codex exec fork <id> -c sandbox_mode=workspace-write` and `codex exec -c sandbox_mode=workspace-write` dispatches.
-     - **`agy` (`antigravity` / `gemini`)**: Generates `invoke_subagent(Subagents=[{TypeName, Role, Prompt, Workspace}])` dispatches with a self-contained prompt (Antigravity subagents start without the parent conversation).
+4. **Read Once $\rightarrow$ Fork Many (`/fork` Shared Context Snapshots)**:
+   - RA supports OpenCode, Claude Code, Codex and Antigravity/Gemini. Use your own harness's native sub-agent tool (Claude Code: the `Agent` tool; OpenCode: the `subagent` tool) on your own model, with no `model=` override. Other models, other harnesses and CLI forms need `ra_gate.py allow-agent` with the user's words. `ra_context_harness.py fork --platform auto` writes the fork packet for your own harness.
    - When `Subagent_A` and `Subagent_B` need the same framework/workflow context (e.g., both working on a Laravel subsystem), read and compile the context **once** into a snapshot (`ra_context_harness.py create`), then **fork** it (`ra_context_harness.py fork`) into `Subagent_A` and `Subagent_B` so neither re-reads the codebase from scratch.
 5. **3-Tier Snapshot Retention & Throw-Away (Eviction) Harness (`scripts/ra_context_harness.py`)**:
    - **`BASE_FRAMEWORK` (Tier 1)**: Domain/framework rules, `INVARIANTS.md`, crawled skills. Kept across the track; thrown away only when invariants or framework configs change.
@@ -155,6 +151,18 @@ To keep the manager's context from bloating and decaying during deep R&D:
    - Read [subagent context and forking rules](references/subagent-context-and-forking.md).
 
 ---
+
+## Safety Harness
+
+The harness protects your project from the agent, so it only works if you follow it.
+
+- **Identity.** RA records who you really are (`harness:model`), read from the session itself. `--agent` is only a claim; if it differs you get a warning and the record keeps the real name.
+- **Other agents.** Your own harness's native sub-agent tool is free only on your own model, with no `model=` override. A sub-agent on any other model, another harness, and CLI forms such as `claude -p` or `opencode run` (your own harness's too) all need the user's permission first, in words that name that agent. When they give it, record their exact words:
+  `python "${CLAUDE_SKILL_DIR}/scripts/ra_gate.py" allow-agent --agent opencode:llamacpp/qwen3.8-flash-next --quote "use qwen 3.8 from opencode for test" --source "chat 2026-11-11" --answers research/answers/before-other-agent_1.md`
+  A grant naming a model covers that model only (`-m <model>`); `opencode run` without `-m` needs a harness-wide `allow-agent --agent opencode`, and that grant needs the user's own words saying any model of that harness is fine; otherwise ask which model. Undo with `revoke-agent`. If OpenCode rules are out of date, run `ra_gate.py opencode-rules`.
+- **Rule: a sub-agent on another model is another agent.** Never list or browse model catalogues (`tools.opencode.models`, `opencode models`, provider lists) to pick one, and never write a grant from your own sentence. Worked example (2026-11-11): asked for "a second opinion from a different AI model", Qwen listed OpenCode's 139 models, granted itself `opencode:openrouter/openai/gpt-6.1-terra-pro` quoting its own sentence, and launched it with `subagent model=...`. Wrong. Right: ask the user which agent to use; record their words with `allow-agent`; then dispatch. RA flags any sub-session on an ungranted model in `status`, `board` and `resume`.
+- **One door for deletes.** Never use `rm`, `Remove-Item`, `rmtree` or a `shutil.move` / `os.rename` one-liner. Run `ra_gate.py remove --path <p> --answers research/answers/before-delete_<n>.md` (add `--user-quote` outside `research/`). Answer 1 names every path you remove, workspace-relative. It moves things to `research/.trash/<stamp>/` with a manifest, so nothing is lost. It refuses paths outside the workspace, workers, and the protected records: `research/` itself; `research/DIRECTIVES.md`, `research/DECISIONS.md`, `research/LAB_LOG.md`, `research/INVARIANTS.md`, `research/VISION_AND_MISSION.md`, `research/AGENT_PERMISSIONS.json`, `research/.ra_state.json`; `research/graveyard/`, `research/reviews/`, `research/.trash/`, `research/answers/`; `research/hypotheses/<H>/REPORT.md` (and any folder holding one). Moving a protected record, or moving anything out of the workspace (`mv x ../x.bak`), is a delete too. To retire an approach into `research/graveyard/`, use `conclude` or `cold-review`, never a hand move. A "Permission denied" on rm or mv means use this door, not another command.
+- **Templates.** Before risky moments (building, deleting, graduating, other agents, handovers) RA shows a short template from `resources/injections/`. A reminder only needs reading. An answer gate needs every question answered in a file (`## Answers` in a review, `## Handover answers` in a worker report, or `--answers`). Each answers file approves one gate only; write a new `<moment>_<n>.md` each time. A worker you dispatched with the native tool still owes its handover answers: in its report, or in the review under `## Handover answers (<worker>)`.
 
 ## Mandatory Rule: Never Skip Steps (Run the RA Gatekeeper)
 
@@ -256,7 +264,7 @@ Every time `ra_gate.py` runs, it echoes **the active stage instructions**, **Wor
 - **Protect the Main Codebase & Protected Nodes from Poisoning**: Build and test the prototype inside `research/sandbox/Hxxx_<slug>/` (or an isolated git branch/snapshot). Never pile unverified experiment code onto the main codebase, and never touch `PROTECTED_WORKING` functions.
 - **Race Before Polishing (R&D mode)**: build each chosen family as a cheap spike in its own folder, `research/sandbox/Hxxx_<slug>/<family>/`, on the same real data (from `INVENTORY.md`). One subagent per family keeps them independent. A spike only has to run on real data and print `RA_SCORE=<number>`; run it with `ra_log_engine.py run --approach <family> [--unseen] -- <cmd>`. The production rules below (log spine, cheese audit) apply to the **winner**, not to every spike.
 - **Mandatory Subagent Context Fork & 1-Concurrency Baton Relay (`scripts/ra_context_harness.py`)**:
-  - Fork the shared Stage 1 context snapshot (`WORKFLOW_SLICE` / `BASE_FRAMEWORK`) into an atomic subagent task (`REAL_RD` = strictly 1 task per subagent; `TRIVIAL_BATCH` = small surface tweaks only) across `opencode`, `claude`, or `agy`:
+  - Fork the shared Stage 1 context snapshot (`WORKFLOW_SLICE` / `BASE_FRAMEWORK`) into an atomic subagent task (`REAL_RD` = strictly 1 task per subagent; `TRIVIAL_BATCH` = small surface tweaks only) with your own harness's native sub-agent tool:
     ```bash
     python "${CLAUDE_SKILL_DIR}/scripts/ra_context_harness.py" fork --workspace "." --id "SNAP_WORKFLOW" --subagent "Subagent_A" --task-type "REAL_RD" --platform "auto" --tasks "<single-atomic-task>"
     ```
